@@ -72,7 +72,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Timer,
-  Monitor
+  Monitor // Added missing import
 } from 'lucide-react';
 
 // --- Firebase Configuration & Initialization ---
@@ -144,8 +144,14 @@ const getStartOf = (period) => {
     start.setDate(diff);
   } else if (period === 'month') {
     start.setDate(1);
+  } else if (period === 'alltime') {
+    return new Date(0); 
   }
   return start;
+};
+
+const formatCurrency = (amount) => {
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount || 0);
 };
 
 // --- Main Component ---
@@ -160,17 +166,14 @@ export default function VisaTrackApp() {
   const [searchTerm, setSearchTerm] = useState('');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   
-  // Theme State
   const [darkMode, setDarkMode] = useState(() => {
     const saved = localStorage.getItem('visaTrackDarkMode');
     return saved === 'true';
   });
 
-  // Notification State
   const [showNotifications, setShowNotifications] = useState(false);
   const [hasCheckedIn, setHasCheckedIn] = useState(false); 
   
-  // Modal States
   const [modalOpen, setModalOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [noteModalOpen, setNoteModalOpen] = useState(false);
@@ -180,7 +183,6 @@ export default function VisaTrackApp() {
   const [selectedAction, setSelectedAction] = useState(null);
   const [fileToDelete, setFileToDelete] = useState(null);
 
-  // --- Auth & Data Fetching ---
   useEffect(() => {
     const initAuth = async () => {
       try {
@@ -194,7 +196,6 @@ export default function VisaTrackApp() {
       }
     };
     initAuth();
-
     const unsubscribe = onAuthStateChanged(auth, (u) => {
       setUser(u);
       const savedUser = localStorage.getItem('visaTrackUser');
@@ -209,13 +210,9 @@ export default function VisaTrackApp() {
 
   useEffect(() => {
     if (!user) return;
-    
     const qFiles = collection(db, 'artifacts', appId, 'public', 'data', 'visa_files');
     const unsubFiles = onSnapshot(qFiles, (snapshot) => {
-      const filesData = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
+      const filesData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       filesData.sort((a, b) => {
         const timeA = a.updatedAt?.seconds || 0;
         const timeB = b.updatedAt?.seconds || 0;
@@ -224,30 +221,17 @@ export default function VisaTrackApp() {
       setFiles(filesData);
       setLoading(false);
     });
-
     const destRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'destinations');
     const unsubDest = onSnapshot(destRef, (docSnap) => {
-      if (docSnap.exists()) {
-        setDestinations(docSnap.data().items || []);
-      } else {
-        setDestinations(['Canada', 'UK', 'USA', 'Schengen Area', 'Australia', 'Dubai']);
-      }
+      if (docSnap.exists()) setDestinations(docSnap.data().items || []);
+      else setDestinations(['Canada', 'UK', 'USA', 'Schengen Area', 'Australia', 'Dubai']);
     });
-
     const qUsers = collection(db, 'artifacts', appId, 'public', 'data', 'agency_users');
     const unsubUsers = onSnapshot(qUsers, (snapshot) => {
-      const usersList = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
+      const usersList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setAllUsers(usersList);
     });
-
-    return () => {
-      unsubFiles();
-      unsubDest();
-      unsubUsers();
-    };
+    return () => { unsubFiles(); unsubDest(); unsubUsers(); };
   }, [user]);
 
   const myTasks = useMemo(() => {
@@ -257,35 +241,24 @@ export default function VisaTrackApp() {
 
   useEffect(() => {
     if (appUser && !loading && !hasCheckedIn) {
-        if (myTasks.length > 0) {
-            setShowNotifications(true);
-        }
+        if (myTasks.length > 0) setShowNotifications(true);
         setHasCheckedIn(true);
     }
   }, [appUser, loading, hasCheckedIn, myTasks.length]);
 
-  // --- Actions ---
   const handleLogin = async (userProfile) => {
     const isTrustedDevice = localStorage.getItem('vt_trusted_device') === 'true';
-    
-    // 1. SECURITY CHECK: Block non-admins on untrusted devices
     if (userProfile.role !== ROLES.ADMIN && !isTrustedDevice) {
         alert("Security Restriction: You must log in from an authorized office computer.");
         return;
     }
-
-    // 2. Allow Login
     setAppUser(userProfile);
     localStorage.setItem('visaTrackUser', JSON.stringify(userProfile));
     setHasCheckedIn(false);
-
-    // 3. RECORD ATTENDANCE (Only if trusted device)
-    // This means Admins logging in from home won't pollute attendance logs
     if (isTrustedDevice) {
         try {
             const now = new Date();
             const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-            
             const docRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'), {
             userId: userProfile.id,
             userName: userProfile.name,
@@ -295,48 +268,39 @@ export default function VisaTrackApp() {
             logoutTime: null
             });
             localStorage.setItem('currentAttendanceId', docRef.id);
-        } catch (e) {
-            console.error("Error recording attendance:", e);
-        }
+        } catch (e) { console.error("Error recording attendance:", e); }
     }
   };
 
   const handleLogout = async () => {
-    // Record Logout Attendance if session exists
     const attId = localStorage.getItem('currentAttendanceId');
     if (attId) {
         try {
             const ref = doc(db, 'artifacts', appId, 'public', 'data', 'attendance', attId);
             await updateDoc(ref, { logoutTime: serverTimestamp() });
-        } catch(e) {
-            console.error("Error updating logout:", e);
-        }
+        } catch(e) { console.error("Error updating logout:", e); }
         localStorage.removeItem('currentAttendanceId');
     }
-
     setAppUser(null);
     localStorage.removeItem('visaTrackUser');
     setActiveTab('dashboard'); 
     setHasCheckedIn(false);
   };
 
-  const toggleDarkMode = () => {
-    setDarkMode(!darkMode);
-  };
+  const toggleDarkMode = () => setDarkMode(!darkMode);
 
   const addNewFile = async (data) => {
     if (!appUser) return;
     const fileId = `VT-${Math.floor(10000 + Math.random() * 90000)}`;
-    
     const isNewSale = appUser.role !== ROLES.PROCESSING;
-    
     const newFile = {
       fileId: fileId,
       applicantName: data.applicantName,
       passportNo: data.passportNo,
       contactNo: data.contactNo,
       destination: data.destination,
-      serviceCharge: data.serviceCharge || '',
+      serviceCharge: Number(data.serviceCharge) || 0,
+      cost: Number(data.cost) || 0,
       reminderDate: data.reminderDate || null, 
       isNewSale: isNewSale, 
       status: 'RECEIVED_SALES',
@@ -356,10 +320,7 @@ export default function VisaTrackApp() {
     setActiveTab('dashboard');
   };
 
-  const requestDeleteFile = (fileId) => {
-    setFileToDelete(fileId);
-    setDeleteConfirmOpen(true);
-  };
+  const requestDeleteFile = (fileId) => { setFileToDelete(fileId); setDeleteConfirmOpen(true); };
 
   const confirmDeleteFile = async () => {
     if (!fileToDelete) return;
@@ -367,34 +328,20 @@ export default function VisaTrackApp() {
       await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', fileToDelete));
       setDeleteConfirmOpen(false);
       setFileToDelete(null);
-    } catch (err) {
-      console.error("Error deleting file:", err);
-    }
+    } catch (err) { console.error("Error deleting file:", err); }
   };
 
-  const openUpdateModal = (file, action) => {
-    setSelectedFile(file);
-    setSelectedAction(action);
-    setModalOpen(true);
-  };
+  const openUpdateModal = (file, action) => { setSelectedFile(file); setSelectedAction(action); setModalOpen(true); };
+  const openNoteModal = (file) => { setSelectedFile(file); setNoteModalOpen(true); };
+  const openEditModal = (file) => { setSelectedFile(file); setEditModalOpen(true); };
 
-  const openNoteModal = (file) => {
-    setSelectedFile(file);
-    setNoteModalOpen(true);
-  };
-
-  const openEditModal = (file) => {
-    setSelectedFile(file);
-    setEditModalOpen(true);
-  };
-
-  const handleStatusUpdate = async (note, result = null, newAssignee = null, reminderDate = null) => {
+  const handleStatusUpdate = async (note, result = null, newAssignee = null, reminderDate = null, cost = null) => {
     if (!appUser || !selectedFile || !selectedAction) return;
-
     let actionText = `Updated status to ${STATUS[selectedAction].label}`;
     if (result) actionText = `Result Received: ${RESULTS[result].label}`;
     if (newAssignee) actionText += ` (Assigned to: ${newAssignee})`;
     if (reminderDate) actionText += ` (Reminder set: ${reminderDate})`;
+    if (cost) actionText += ` (Cost Updated: ${cost})`;
 
     const newHistoryItem = {
       action: note ? `${actionText} - Note: ${note}` : actionText,
@@ -405,11 +352,8 @@ export default function VisaTrackApp() {
     };
 
     let nextAssignee = selectedFile.assignedTo;
-    if (newAssignee) {
-      nextAssignee = newAssignee;
-    } else if (selectedAction === 'HANDOVER_PROCESSING' && (!selectedFile.assignedTo || selectedFile.assignedTo === appUser.name)) {
-      nextAssignee = 'Processing Team'; 
-    }
+    if (newAssignee) nextAssignee = newAssignee;
+    else if (selectedAction === 'HANDOVER_PROCESSING' && (!selectedFile.assignedTo || selectedFile.assignedTo === appUser.name)) nextAssignee = 'Processing Team'; 
 
     const updateData = {
       status: selectedAction,
@@ -420,6 +364,7 @@ export default function VisaTrackApp() {
 
     if (result) updateData.visaResult = result;
     if (reminderDate) updateData.reminderDate = reminderDate;
+    if (cost) updateData.cost = Number(cost);
 
     const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id);
     await updateDoc(fileRef, updateData);
@@ -428,40 +373,29 @@ export default function VisaTrackApp() {
 
   const handleAddNote = async (note) => {
     if (!appUser || !selectedFile || !note.trim()) return;
-    
     const newHistoryItem = {
       action: `Note Added: ${note}`,
       status: selectedFile.status,
       performedBy: appUser.name,
       timestamp: Date.now()
     };
-
     const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id);
-    await updateDoc(fileRef, {
-      updatedAt: serverTimestamp(),
-      history: [newHistoryItem, ...selectedFile.history]
-    });
+    await updateDoc(fileRef, { updatedAt: serverTimestamp(), history: [newHistoryItem, ...selectedFile.history] });
     setNoteModalOpen(false);
   };
 
   const handleEditFile = async (data) => {
     if (!appUser || !selectedFile) return;
-    
     const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id);
-    await updateDoc(fileRef, {
-      ...data,
-      updatedAt: serverTimestamp()
-    });
+    await updateDoc(fileRef, { ...data, updatedAt: serverTimestamp() });
     setEditModalOpen(false);
   };
 
-  // --- UI Helpers for Dynamic Classes ---
   const containerClass = darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-800';
   const borderClass = darkMode ? 'border-slate-800' : 'border-slate-200';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
   const textSub = darkMode ? 'text-slate-400' : 'text-slate-500';
 
-  // --- Render ---
   if (!user || loading) return (
     <div className={`min-h-screen flex items-center justify-center ${darkMode ? 'bg-slate-950 text-slate-400' : 'bg-slate-50 text-slate-500'}`}>
       <div className="flex flex-col items-center gap-4">
@@ -628,6 +562,7 @@ export default function VisaTrackApp() {
           newStatus={selectedAction}
           allUsers={allUsers}
           darkMode={darkMode}
+          userRole={appUser.role}
         />
       )}
 
@@ -1474,15 +1409,19 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
   );
 }
 
-function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUsers, darkMode }) {
+function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUsers, darkMode, userRole }) {
     const [note, setNote] = useState('');
     const [result, setResult] = useState(null); 
     const [assignee, setAssignee] = useState(''); 
-    const [reminderDate, setReminderDate] = useState(''); // Optional Reminder
+    const [reminderDate, setReminderDate] = useState(''); 
+    const [cost, setCost] = useState(''); // New Cost Field
   
     if (!isOpen) return null;
   
     const isDone = newStatus === 'DONE';
+    const isSubmitted = newStatus === 'SUBMITTED';
+    const isAdminOrProcessor = userRole === ROLES.ADMIN || userRole === ROLES.PROCESSING;
+
     const cardClass = darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900';
     const inputClass = darkMode 
       ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
@@ -1493,7 +1432,7 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
          alert("Please select a result (Approved or Rejected)");
          return;
        }
-       onConfirm(note, result, assignee, reminderDate);
+       onConfirm(note, result, assignee, reminderDate, cost);
     };
   
     return (
@@ -1522,6 +1461,23 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
                       <span className="font-bold text-sm">Rejected</span>
                    </button>
                 </div>
+             )}
+
+             {/* Cost Input (Only for Submission & Admin/Processor) */}
+             {isSubmitted && isAdminOrProcessor && (
+                 <div>
+                    <label className="block text-sm font-medium mb-2 opacity-80">Finalize File Cost (Optional)</label>
+                    <div className="relative">
+                       <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                       <input
+                          type="number"
+                          className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                          placeholder="Enter actual cost incurred..."
+                          value={cost}
+                          onChange={(e) => setCost(e.target.value)}
+                       />
+                    </div>
+                 </div>
              )}
 
              {/* Assign To Dropdown */}
@@ -1814,6 +1770,11 @@ function StatisticalReports({ files, currentUser, darkMode }) {
         destinations: {},
         totalActions: 0
       },
+      finances: {
+        revenue: 0,
+        cost: 0,
+        profit: 0
+      },
       notes: [],
       attendance: []
     };
@@ -1823,6 +1784,16 @@ function StatisticalReports({ files, currentUser, darkMode }) {
         if (!['DONE', 'RECEIVED_SALES'].includes(file.status)) {
           reportData.processing.inProcess++;
         }
+      }
+
+      // Financial & Sales Calculations based on creation time
+      const fileCreationDate = file.createdAt?.toDate ? file.createdAt.toDate() : new Date(file.createdAt?.seconds * 1000 || 0);
+      
+      if (fileCreationDate >= start) {
+         if (file.isNewSale === true) {
+            reportData.finances.revenue += Number(file.serviceCharge || 0);
+            reportData.finances.cost += Number(file.cost || 0);
+         }
       }
 
       file.history.forEach(entry => {
@@ -1863,6 +1834,8 @@ function StatisticalReports({ files, currentUser, darkMode }) {
         }
       });
     });
+    
+    reportData.finances.profit = reportData.finances.revenue - reportData.finances.cost;
 
     reportData.attendance = attendanceData.filter(a => {
         if (!a.date) return false;
@@ -1922,13 +1895,13 @@ function StatisticalReports({ files, currentUser, darkMode }) {
            </select>
 
            <div className={`flex p-1 rounded-lg ${darkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
-             {['today', 'week', 'month'].map(t => (
+             {['today', 'week', 'month', 'alltime'].map(t => (
                <button
                  key={t}
                  onClick={() => setTimeRange(t)}
                  className={`px-3 py-1.5 rounded-md text-sm font-medium capitalize transition-colors ${timeRange === t ? (darkMode ? 'bg-slate-700 text-blue-400 shadow-sm' : 'bg-white text-blue-600 shadow-sm') : 'text-slate-500 hover:text-slate-700'}`}
                >
-                 {t}
+                 {t === 'alltime' ? 'All Time' : t}
                </button>
              ))}
            </div>
@@ -1952,6 +1925,24 @@ function StatisticalReports({ files, currentUser, darkMode }) {
           </div>
           <hr className="my-4"/>
         </div>
+
+        {/* Financial Overview (Admins Only) */}
+        {currentUser.role === ROLES.ADMIN && (
+            <div className="grid grid-cols-3 gap-4 mb-8">
+                <div className={`p-4 rounded-xl border ${darkMode ? 'bg-emerald-900/20 border-emerald-800' : 'bg-emerald-50 border-emerald-100'}`}>
+                    <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-emerald-400' : 'text-emerald-800'}`}>Total Revenue</p>
+                    <p className={`text-2xl font-bold ${darkMode ? 'text-emerald-200' : 'text-emerald-900'}`}>{formatCurrency(stats.finances.revenue)}</p>
+                </div>
+                <div className={`p-4 rounded-xl border ${darkMode ? 'bg-red-900/20 border-red-800' : 'bg-red-50 border-red-100'}`}>
+                    <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-red-400' : 'text-red-800'}`}>Total Cost</p>
+                    <p className={`text-2xl font-bold ${darkMode ? 'text-red-200' : 'text-red-900'}`}>{formatCurrency(stats.finances.cost)}</p>
+                </div>
+                <div className={`p-4 rounded-xl border ${darkMode ? 'bg-blue-900/20 border-blue-800' : 'bg-blue-50 border-blue-100'}`}>
+                    <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-blue-400' : 'text-blue-800'}`}>Net Profit</p>
+                    <p className={`text-2xl font-bold ${darkMode ? 'text-blue-200' : 'text-blue-900'}`}>{formatCurrency(stats.finances.profit)}</p>
+                </div>
+            </div>
+        )}
 
         <div className={`mb-8 p-6 rounded-xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
             <h3 className={`text-lg font-bold mb-4 flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
