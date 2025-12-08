@@ -26,6 +26,8 @@ import {
   arrayRemove,
   Timestamp
 } from 'firebase/firestore';
+import confetti from 'canvas-confetti';
+import { jsPDF } from 'jspdf';
 import { 
   Briefcase, 
   FileText, 
@@ -74,13 +76,23 @@ import {
   Timer,
   Monitor // Added missing import
 } from 'lucide-react';
+//vercel analytics
+import { Analytics } from "@vercel/analytics/react";
+import { SpeedInsights } from "@vercel/speed-insights/react"
 
 // --- Firebase Configuration & Initialization ---
-const firebaseConfig = JSON.parse(__firebase_config);
+const firebaseConfig = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID
+};
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const appId = "app-version-3";
 
 // --- Constants & Enums ---
 const ROLES = {
@@ -154,6 +166,55 @@ const formatCurrency = (amount) => {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount || 0);
 };
 
+// Animation Functions
+const triggerConfetti = () => {
+  confetti({
+    particleCount: 100,
+    spread: 70,
+    origin: { y: 0.6 }
+  });
+};
+
+const triggerConfettiExplosion = () => {
+  const duration = 3 * 1000;
+  const end = Date.now() + duration;
+
+  const frame = () => {
+    confetti({
+      particleCount: 3,
+      angle: Math.random() * 360,
+      spread: Math.random() * 360,
+      origin: { x: Math.random(), y: Math.random() - 0.2 },
+      zIndex: 9999
+    });
+
+    if (Date.now() < end) {
+      requestAnimationFrame(frame);
+    }
+  };
+  
+  frame();
+};
+
+const triggerSadAnimation = () => {
+  // Play a sad tone
+  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const oscillator = audioContext.createOscillator();
+  const gainNode = audioContext.createGain();
+  
+  oscillator.connect(gainNode);
+  gainNode.connect(audioContext.destination);
+  
+  oscillator.frequency.setValueAtTime(200, audioContext.currentTime);
+  oscillator.frequency.exponentialRampToValueAtTime(100, audioContext.currentTime + 0.5);
+  
+  gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+  gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+  
+  oscillator.start(audioContext.currentTime);
+  oscillator.stop(audioContext.currentTime + 0.5);
+};
+
 // --- Main Component ---
 export default function VisaTrackApp() {
   const [user, setUser] = useState(null);
@@ -165,6 +226,8 @@ export default function VisaTrackApp() {
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [trackingMode, setTrackingMode] = useState(false);
+  const [trackingFileId, setTrackingFileId] = useState('');
   
   const [darkMode, setDarkMode] = useState(() => {
     const saved = localStorage.getItem('visaTrackDarkMode');
@@ -178,6 +241,8 @@ export default function VisaTrackApp() {
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [noteModalOpen, setNoteModalOpen] = useState(false);
   const [editModalOpen, setEditModalOpen] = useState(false);
+  const [resultModalOpen, setResultModalOpen] = useState(false);
+  const [resultMessage, setResultMessage] = useState('');
   
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedAction, setSelectedAction] = useState(null);
@@ -196,6 +261,14 @@ export default function VisaTrackApp() {
       }
     };
     initAuth();
+    
+    // Check for tracking mode
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('track')) {
+      setTrackingMode(true);
+      setTrackingFileId(params.get('track') || '');
+    }
+    
     const unsubscribe = onAuthStateChanged(auth, (u) => {
       setUser(u);
       const savedUser = localStorage.getItem('visaTrackUser');
@@ -236,6 +309,15 @@ export default function VisaTrackApp() {
 
   const myTasks = useMemo(() => {
     if (!appUser || files.length === 0) return [];
+    // For Processing Agents: Show files that are assigned to them and either not yet acknowledged, or acknowledged
+    // Files disappear when status becomes SUBMITTED or DONE
+    if (appUser.role === ROLES.PROCESSING) {
+      return files.filter(f => 
+        f.assignedTo === appUser.name && 
+        !['DONE', 'SUBMITTED'].includes(f.status)
+      );
+    }
+    // For others: Show files assigned to them that are not DONE
     return files.filter(f => f.assignedTo === appUser.name && f.status !== 'DONE');
   }, [files, appUser]);
 
@@ -246,6 +328,45 @@ export default function VisaTrackApp() {
     }
   }, [appUser, loading, hasCheckedIn, myTasks.length]);
 
+  // Initialize app - check for existing user session
+  useEffect(() => {
+    const initializeApp = async () => {
+      const storedUser = localStorage.getItem('visaTrackUser');
+      if (storedUser) {
+        const userProfile = JSON.parse(storedUser);
+        setAppUser(userProfile);
+        
+        // Restore attendance session ID if user is on a trusted device
+        const isTrustedDevice = localStorage.getItem('vt_trusted_device') === 'true';
+        if (isTrustedDevice) {
+          try {
+            const now = new Date();
+            const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+            
+            // Look for active session for this user today
+            const q = query(
+              collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
+              where('userName', '==', userProfile.name),
+              where('date', '==', today),
+              where('logoutTime', '==', null)
+            );
+            const existingDocs = await getDocs(q);
+            
+            if (existingDocs.size > 0) {
+              // Restore the active session
+              localStorage.setItem('currentAttendanceId', existingDocs.docs[0].id);
+            } else {
+              // No active session, clear the ID
+              localStorage.removeItem('currentAttendanceId');
+            }
+          } catch (e) { console.error("Error restoring attendance session:", e); }
+        }
+      }
+    };
+    
+    initializeApp();
+  }, []);
+
   const handleLogin = async (userProfile) => {
     const isTrustedDevice = localStorage.getItem('vt_trusted_device') === 'true';
     if (userProfile.role !== ROLES.ADMIN && !isTrustedDevice) {
@@ -255,19 +376,42 @@ export default function VisaTrackApp() {
     setAppUser(userProfile);
     localStorage.setItem('visaTrackUser', JSON.stringify(userProfile));
     setHasCheckedIn(false);
+    
+    // Trigger welcome animation
+    setTimeout(() => {
+      triggerConfetti();
+    }, 300);
+
+    // Record attendance for trusted devices only
     if (isTrustedDevice) {
         try {
             const now = new Date();
             const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-            const docRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'), {
-            userId: userProfile.id,
-            userName: userProfile.name,
-            role: userProfile.role,
-            date: today,
-            loginTime: serverTimestamp(),
-            logoutTime: null
-            });
-            localStorage.setItem('currentAttendanceId', docRef.id);
+            
+            // Check if there's an active session already to prevent duplicate sessions
+            const q = query(
+              collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
+              where('userName', '==', userProfile.name),
+              where('date', '==', today),
+              where('logoutTime', '==', null)
+            );
+            const existingDocs = await getDocs(q);
+            
+            if (existingDocs.size === 0) {
+              // Only create a new attendance record if there's no active session
+              const docRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'), {
+                userId: userProfile.id,
+                userName: userProfile.name,
+                role: userProfile.role,
+                date: today,
+                loginTime: serverTimestamp(),
+                logoutTime: null
+              });
+              localStorage.setItem('currentAttendanceId', docRef.id);
+            } else {
+              // If there's an active session, use that one
+              localStorage.setItem('currentAttendanceId', existingDocs.docs[0].id);
+            }
         } catch (e) { console.error("Error recording attendance:", e); }
     }
   };
@@ -286,6 +430,61 @@ export default function VisaTrackApp() {
     setActiveTab('dashboard'); 
     setHasCheckedIn(false);
   };
+
+  // Handle logout on browser close or shutdown
+  useEffect(() => {
+    const handleBeforeUnload = (e) => {
+      if (appUser && localStorage.getItem('currentAttendanceId')) {
+        // Clear local storage to indicate user logged out
+        // Database will be cleaned up by a separate periodic task or manual cleanup
+        localStorage.removeItem('currentAttendanceId');
+        localStorage.removeItem('visaTrackUser');
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('pagehide', handleBeforeUnload);
+    
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('pagehide', handleBeforeUnload);
+    };
+  }, [appUser]);
+
+  // Periodic cleanup: mark sessions as timed out if they've been idle too long
+  useEffect(() => {
+    const cleanupStaleAttendance = async () => {
+      try {
+        const now = new Date();
+        const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+        
+        // Find sessions that have been open for more than 12 hours (unlikely normal work session)
+        const q = query(
+          collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
+          where('date', '==', today),
+          where('logoutTime', '==', null)
+        );
+        const docs = await getDocs(q);
+        
+        docs.forEach(doc => {
+          const loginTime = doc.data().loginTime?.toDate ? doc.data().loginTime.toDate() : new Date(doc.data().loginTime?.seconds * 1000);
+          const hoursDiff = (now - loginTime) / (1000 * 60 * 60);
+          
+          // If session is older than 12 hours, mark it as ended
+          if (hoursDiff > 12) {
+            updateDoc(doc.ref, { logoutTime: serverTimestamp() }).catch(err => 
+              console.error("Error marking stale session as ended:", err)
+            );
+          }
+        });
+      } catch (e) { console.error("Error in cleanup task:", e); }
+    };
+
+    // Run cleanup every 30 minutes
+    const cleanupInterval = setInterval(cleanupStaleAttendance, 30 * 60 * 1000);
+    
+    return () => clearInterval(cleanupInterval);
+  }, []);
 
   const toggleDarkMode = () => setDarkMode(!darkMode);
 
@@ -308,7 +507,8 @@ export default function VisaTrackApp() {
       createdBy: appUser.name,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
-      visaResult: null, 
+      visaResult: null,
+      acknowledgedByProcessingAgent: false,
       history: [{
         action: 'File Received & Registered',
         status: 'RECEIVED_SALES',
@@ -317,7 +517,15 @@ export default function VisaTrackApp() {
       }]
     };
     await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'visa_files'), newFile);
-    setActiveTab('dashboard');
+    
+    // Trigger new file creation animation
+    triggerConfetti();
+    setResultMessage('🎊 New File Created Successfully! 🎊');
+    setResultModalOpen(true);
+    
+    setTimeout(() => {
+      setActiveTab('dashboard');
+    }, 1500);
   };
 
   const requestDeleteFile = (fileId) => { setFileToDelete(fileId); setDeleteConfirmOpen(true); };
@@ -335,36 +543,99 @@ export default function VisaTrackApp() {
   const openNoteModal = (file) => { setSelectedFile(file); setNoteModalOpen(true); };
   const openEditModal = (file) => { setSelectedFile(file); setEditModalOpen(true); };
 
-  const handleStatusUpdate = async (note, result = null, newAssignee = null, reminderDate = null, cost = null) => {
-    if (!appUser || !selectedFile || !selectedAction) return;
-    let actionText = `Updated status to ${STATUS[selectedAction].label}`;
-    if (result) actionText = `Result Received: ${RESULTS[result].label}`;
-    if (newAssignee) actionText += ` (Assigned to: ${newAssignee})`;
-    if (reminderDate) actionText += ` (Reminder set: ${reminderDate})`;
-    if (cost) actionText += ` (Cost Updated: ${cost})`;
-
-    const newHistoryItem = {
-      action: note ? `${actionText} - Note: ${note}` : actionText,
-      status: selectedAction,
-      result: result,
-      performedBy: appUser.name,
-      timestamp: Date.now()
-    };
-
-    let nextAssignee = selectedFile.assignedTo;
-    if (newAssignee) nextAssignee = newAssignee;
-    else if (selectedAction === 'HANDOVER_PROCESSING' && (!selectedFile.assignedTo || selectedFile.assignedTo === appUser.name)) nextAssignee = 'Processing Team'; 
-
-    const updateData = {
-      status: selectedAction,
+  const handleStatusUpdate = async (note, result = null, newAssignee = null, reminderDate = null, cost = null, acknowledgeProcessing = false) => {
+    if (!appUser || !selectedFile) return;
+    
+    let updateData = {
       updatedAt: serverTimestamp(),
-      assignedTo: nextAssignee,
-      history: [newHistoryItem, ...selectedFile.history]
+      history: []
     };
 
-    if (result) updateData.visaResult = result;
-    if (reminderDate) updateData.reminderDate = reminderDate;
-    if (cost) updateData.cost = Number(cost);
+    // Handle "Send to Processing" action
+    if (selectedAction === 'SEND_TO_PROCESSING' && newAssignee) {
+      const newHistoryItem = {
+        action: `File Sent to Processing - Assigned to: ${newAssignee}${note ? ` - Note: ${note}` : ''}`,
+        status: 'HANDOVER_PROCESSING',
+        performedBy: appUser.name,
+        timestamp: Date.now()
+      };
+      updateData = {
+        ...updateData,
+        status: 'HANDOVER_PROCESSING',
+        assignedTo: newAssignee,
+        acknowledgedByProcessingAgent: false,
+        history: [newHistoryItem, ...selectedFile.history]
+      };
+    }
+    // Handle "Acknowledge Processing" action
+    else if (selectedAction === 'ACKNOWLEDGE_PROCESSING') {
+      const newHistoryItem = {
+        action: `Processing Agent Acknowledged - Started Processing${note ? ` - Note: ${note}` : ''}`,
+        status: 'HANDOVER_PROCESSING',
+        performedBy: appUser.name,
+        timestamp: Date.now()
+      };
+      updateData = {
+        ...updateData,
+        status: 'HANDOVER_PROCESSING',
+        assignedTo: appUser.name,
+        acknowledgedByProcessingAgent: true,
+        history: [newHistoryItem, ...selectedFile.history]
+      };
+    }
+    // Handle regular status updates
+    else if (selectedAction) {
+      let actionText = `Updated status to ${STATUS[selectedAction].label}`;
+      if (result) actionText = `Result Received: ${RESULTS[result].label}`;
+      if (newAssignee) actionText += ` (Assigned to: ${newAssignee})`;
+      if (reminderDate) actionText += ` (Reminder set: ${reminderDate})`;
+      if (cost) actionText += ` (Cost Updated: ${cost})`;
+
+      const newHistoryItem = {
+        action: note ? `${actionText} - Note: ${note}` : actionText,
+        status: selectedAction,
+        result: result,
+        performedBy: appUser.name,
+        timestamp: Date.now()
+      };
+
+      let nextAssignee = selectedFile.assignedTo;
+      if (newAssignee) nextAssignee = newAssignee;
+      else if (selectedAction === 'HANDOVER_PROCESSING' && (!selectedFile.assignedTo || selectedFile.assignedTo === appUser.name)) nextAssignee = 'Processing Team'; 
+
+      updateData = {
+        ...updateData,
+        status: selectedAction,
+        assignedTo: nextAssignee,
+        history: [newHistoryItem, ...selectedFile.history]
+      };
+
+      if (result) {
+        updateData.visaResult = result;
+        // Trigger animations based on result
+        setTimeout(() => {
+          if (result === 'APPROVED') {
+            triggerConfettiExplosion();
+            setResultMessage('🎉 Congratulations! Visa Approved! 🎉');
+          } else if (result === 'REJECTED') {
+            triggerSadAnimation();
+            setResultMessage('😔 The visa application was rejected. Please review and reapply if needed.');
+          }
+          setResultModalOpen(true);
+        }, 300);
+      }
+      
+      // Trigger celebration for SUBMITTED status
+      if (selectedAction === 'SUBMITTED') {
+        setTimeout(() => {
+          triggerConfetti();
+          setResultMessage('✈️ File Successfully Submitted to Embassy! ✈️');
+          setResultModalOpen(true);
+        }, 300);
+      }
+      if (reminderDate) updateData.reminderDate = reminderDate;
+      if (cost) updateData.cost = Number(cost);
+    }
 
     const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id);
     await updateDoc(fileRef, updateData);
@@ -404,6 +675,11 @@ export default function VisaTrackApp() {
       </div>
     </div>
   );
+  
+  // Public Tracking Mode
+  if (trackingMode) {
+    return <PublicTrackingPage fileId={trackingFileId} files={files} loading={loading} darkMode={darkMode} toggleDarkMode={() => setDarkMode(!darkMode)} />;
+  }
   
   if (!appUser) {
     return <LoginScreen onLogin={handleLogin} darkMode={darkMode} toggleDarkMode={toggleDarkMode} />;
@@ -608,6 +884,15 @@ export default function VisaTrackApp() {
           darkMode={darkMode}
         />
       )}
+
+      {resultModalOpen && (
+        <ResultModal
+          isOpen={resultModalOpen}
+          onClose={() => setResultModalOpen(false)}
+          message={resultMessage}
+          darkMode={darkMode}
+        />
+      )}
     </div>
   );
 }
@@ -712,28 +997,27 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
 
   return (
     <div className="space-y-8">
-      {/* Stats Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <div className={`p-6 rounded-xl border flex items-center justify-between ${cardClass}`}>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
+        <div className={`p-4 md:p-6 rounded-xl border flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-0 ${cardClass}`}>
           <div>
-            <p className={`text-sm font-medium ${textSub}`}>Sales Today</p>
-            <p className={`text-3xl font-bold ${textMain}`}>{stats.salesToday}</p>
+            <p className={`text-xs md:text-sm font-medium ${textSub}`}>Sales Today</p>
+            <p className={`text-2xl md:text-3xl font-bold ${textMain}`}>{stats.salesToday}</p>
           </div>
-          <div className={`${darkMode ? 'bg-blue-900/30 text-blue-400' : 'bg-blue-100 text-blue-600'} p-3 rounded-full`}><TrendingUp className="h-6 w-6"/></div>
+          <div className={`${darkMode ? 'bg-blue-900/30 text-blue-400' : 'bg-blue-100 text-blue-600'} p-2 md:p-3 rounded-full w-fit`}><TrendingUp className="h-5 md:h-6 w-5 md:w-6"/></div>
         </div>
-        <div className={`p-6 rounded-xl border flex items-center justify-between ${cardClass}`}>
+        <div className={`p-4 md:p-6 rounded-xl border flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-0 ${cardClass}`}>
           <div>
-            <p className={`text-sm font-medium ${textSub}`}>In Processing</p>
-            <p className={`text-3xl font-bold ${textMain}`}>{stats.inProcess}</p>
+            <p className={`text-xs md:text-sm font-medium ${textSub}`}>In Processing</p>
+            <p className={`text-2xl md:text-3xl font-bold ${textMain}`}>{stats.inProcess}</p>
           </div>
-          <div className={`${darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-100 text-purple-600'} p-3 rounded-full`}><Activity className="h-6 w-6"/></div>
+          <div className={`${darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-100 text-purple-600'} p-2 md:p-3 rounded-full w-fit`}><Activity className="h-5 md:h-6 w-5 md:w-6"/></div>
         </div>
-        <div className={`p-6 rounded-xl border flex items-center justify-between ${cardClass}`}>
+        <div className={`p-4 md:p-6 rounded-xl border flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-0 ${cardClass}`}>
           <div>
-            <p className={`text-sm font-medium ${textSub}`}>Submitted Today</p>
-            <p className={`text-3xl font-bold ${textMain}`}>{stats.submittedToday}</p>
+            <p className={`text-xs md:text-sm font-medium ${textSub}`}>Submitted Today</p>
+            <p className={`text-2xl md:text-3xl font-bold ${textMain}`}>{stats.submittedToday}</p>
           </div>
-          <div className={`${darkMode ? 'bg-indigo-900/30 text-indigo-400' : 'bg-indigo-100 text-indigo-600'} p-3 rounded-full`}><Send className="h-6 w-6"/></div>
+          <div className={`${darkMode ? 'bg-indigo-900/30 text-indigo-400' : 'bg-indigo-100 text-indigo-600'} p-2 md:p-3 rounded-full w-fit`}><Send className="h-5 md:h-6 w-5 md:w-6"/></div>
         </div>
       </div>
 
@@ -891,6 +1175,7 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
     contactNo: '', 
     destination: '',
     serviceCharge: '',
+    cost: '',
     reminderDate: ''
   });
 
@@ -907,15 +1192,15 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
   };
 
   return (
-    <div className={`max-w-2xl mx-auto rounded-xl p-8 border ${cardClass}`}>
-      <h2 className={`text-2xl font-bold mb-6 ${textMain}`}>Register New File</h2>
-      <form onSubmit={handleSubmit} className="space-y-6">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <div className="col-span-2">
+    <div className={`max-w-2xl mx-auto rounded-xl p-4 sm:p-8 border ${cardClass}`}>
+      <h2 className={`text-xl sm:text-2xl font-bold mb-4 sm:mb-6 ${textMain}`}>Register New File</h2>
+      <form onSubmit={handleSubmit} className="space-y-4 sm:space-y-6">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6">
+          <div className="col-span-1 sm:col-span-2">
             <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Applicant Full Name</label>
             <input 
               required
-              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+              className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
               placeholder="As on passport"
               value={formData.applicantName}
               onChange={e => setFormData({...formData, applicantName: e.target.value})}
@@ -925,7 +1210,7 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
             <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Passport Number</label>
             <input 
               required
-              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+              className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
               value={formData.passportNo}
               onChange={e => setFormData({...formData, passportNo: e.target.value})}
             />
@@ -934,7 +1219,7 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
             <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Contact Number</label>
             <input 
               required
-              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+              className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
               placeholder="+880..."
               value={formData.contactNo}
               onChange={e => setFormData({...formData, contactNo: e.target.value})}
@@ -944,7 +1229,7 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
             <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Destination Country</label>
             <select
               required
-              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+              className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
               value={formData.destination}
               onChange={e => setFormData({...formData, destination: e.target.value})}
             >
@@ -958,10 +1243,27 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
               <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
               <input 
                 type="number"
-                className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                min="0"
+                step="0.01"
+                className={`w-full pl-10 pr-3 sm:pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
                 placeholder="0.00"
                 value={formData.serviceCharge}
                 onChange={e => setFormData({...formData, serviceCharge: e.target.value})}
+              />
+            </div>
+          </div>
+          <div>
+            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Cost (Optional)</label>
+            <div className="relative">
+              <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+              <input 
+                type="number"
+                min="0"
+                step="0.01"
+                className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                placeholder="0.00"
+                value={formData.cost}
+                onChange={e => setFormData({...formData, cost: e.target.value})}
               />
             </div>
           </div>
@@ -1258,33 +1560,58 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
 
 function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, onDeleteFile, darkMode }) {
   const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
   const StatusIcon = STATUS[file.status].icon;
   const isOwner = file.assignedTo === user.name || (file.status === 'HANDOVER_PROCESSING' && user.role === ROLES.PROCESSING);
 
+  const generateTrackingLink = () => {
+    const baseUrl = window.location.origin;
+    const trackingUrl = `${baseUrl}?track=${file.fileId}`;
+    
+    navigator.clipboard.writeText(trackingUrl).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(err => {
+      console.error('Failed to copy:', err);
+      alert('Failed to copy link. Please try again.');
+    });
+  };
+
   const getAvailableActions = () => {
     const actions = [];
-    if (file.status === 'RECEIVED_SALES') actions.push('HANDOVER_PROCESSING');
-    if (file.status === 'HANDOVER_PROCESSING') actions.push('HANDOVER_PROCESSING');
+    
+    // Sales Rep can send to processing
+    if (user.role === ROLES.SALES && file.status === 'RECEIVED_SALES') {
+      actions.push({ key: 'SEND_TO_PROCESSING', label: 'Sent to Processing', isSpecial: true });
+    }
+    
+    // Processing Agent can acknowledge
+    if (user.role === ROLES.PROCESSING && file.status === 'HANDOVER_PROCESSING' && !file.acknowledgedByProcessingAgent) {
+      actions.push({ key: 'ACKNOWLEDGE_PROCESSING', label: 'In Processing', isSpecial: true });
+    }
+    
+    if (file.status === 'RECEIVED_SALES') actions.push({ key: 'HANDOVER_PROCESSING', label: STATUS['HANDOVER_PROCESSING'].label });
+    if (file.status === 'HANDOVER_PROCESSING') actions.push({ key: 'HANDOVER_PROCESSING', label: STATUS['HANDOVER_PROCESSING'].label });
     
     // Logic Update: keep In Processing available for Docs Pending
     if (file.status === 'DOCS_PENDING' && user.role === ROLES.PROCESSING) {
-        actions.push('HANDOVER_PROCESSING'); // Back to processing
+        actions.push({ key: 'HANDOVER_PROCESSING', label: STATUS['HANDOVER_PROCESSING'].label }); // Back to processing
     }
 
     if (['HANDOVER_PROCESSING', 'DOCS_PENDING', 'PAYMENT_PENDING', 'SUBMITTED', 'FOLLOW_UP'].includes(file.status) && user.role === ROLES.PROCESSING) {
-       if (file.status !== 'DOCS_PENDING') actions.push('DOCS_PENDING');
-       if (file.status !== 'PAYMENT_PENDING') actions.push('PAYMENT_PENDING');
-       if (file.status !== 'SUBMITTED') actions.push('SUBMITTED');
+       if (file.status !== 'DOCS_PENDING') actions.push({ key: 'DOCS_PENDING', label: STATUS['DOCS_PENDING'].label });
+       if (file.status !== 'PAYMENT_PENDING') actions.push({ key: 'PAYMENT_PENDING', label: STATUS['PAYMENT_PENDING'].label });
+       if (file.status !== 'SUBMITTED') actions.push({ key: 'SUBMITTED', label: STATUS['SUBMITTED'].label });
     }
 
     if (['SUBMITTED', 'FOLLOW_UP'].includes(file.status)) {
-      actions.push('DONE');
-      actions.push('FOLLOW_UP');
+      actions.push({ key: 'DONE', label: STATUS['DONE'].label });
+      actions.push({ key: 'FOLLOW_UP', label: STATUS['FOLLOW_UP'].label });
     }
     
-    if (file.status !== 'DONE' && file.status !== 'FOLLOW_UP') actions.push('FOLLOW_UP');
+    if (file.status !== 'DONE' && file.status !== 'FOLLOW_UP') actions.push({ key: 'FOLLOW_UP', label: STATUS['FOLLOW_UP'].label });
 
-    return [...new Set(actions)];
+    return actions;
   };
 
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
@@ -1308,9 +1635,9 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
                  <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${darkMode ? 'bg-slate-800 text-slate-400 border-slate-700' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>{file.fileId || 'NO-ID'}</span>
               </div>
               
-              <div className={`flex flex-wrap items-center gap-x-4 gap-y-1 text-sm ${textSub}`}>
-                {file.visaResult === 'APPROVED' && <span className={`text-xs px-2 py-0.5 rounded border flex items-center gap-1 ${darkMode ? 'bg-green-900/30 text-green-400 border-green-800' : 'bg-green-100 text-green-700 border-green-200'}`}><ThumbsUp className="h-3 w-3"/> Approved</span>}
-                {file.visaResult === 'REJECTED' && <span className={`text-xs px-2 py-0.5 rounded border flex items-center gap-1 ${darkMode ? 'bg-red-900/30 text-red-400 border-red-800' : 'bg-red-100 text-red-700 border-red-200'}`}><ThumbsDown className="h-3 w-3"/> Rejected</span>}
+            <div className={`flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm ${textSub}`}>
+                {file.visaResult === 'APPROVED' && <span className={`text-[10px] sm:text-xs px-2 py-0.5 rounded border flex items-center gap-1 ${darkMode ? 'bg-green-900/30 text-green-400 border-green-800' : 'bg-green-100 text-green-700 border-green-200'}`}><ThumbsUp className="h-3 w-3"/> Approved</span>}
+                {file.visaResult === 'REJECTED' && <span className={`text-[10px] sm:text-xs px-2 py-0.5 rounded border flex items-center gap-1 ${darkMode ? 'bg-red-900/30 text-red-400 border-red-800' : 'bg-red-100 text-red-700 border-red-200'}`}><ThumbsDown className="h-3 w-3"/> Rejected</span>}
                 
                 <span className="flex items-center gap-1"><User className="h-3 w-3" /> {file.passportNo}</span>
                 <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {file.destination || 'N/A'}</span>
@@ -1329,22 +1656,31 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
           </div>
         </div>
 
-        <div className={`mt-6 pt-4 border-t flex flex-wrap items-center justify-between gap-4 ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
-          <div className="flex items-center gap-2">
+        <div className={`mt-6 pt-4 border-t flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+          <div className="flex flex-wrap items-center gap-1 sm:gap-2">
             <button 
-              onClick={() => setExpanded(!expanded)}
-              className="text-sm font-medium text-blue-600 hover:text-blue-500 mr-2"
+                onClick={() => setExpanded(!expanded)}
+                className="text-xs sm:text-sm font-medium text-blue-600 hover:text-blue-500"
             >
-              {expanded ? 'Hide History' : 'View History'}
+              {expanded ? 'Hide' : 'View'}
+            </button>
+            
+            {/* Tracking Link Button */}
+            <button 
+                onClick={generateTrackingLink}
+                className={`p-1.5 sm:p-2 rounded-lg transition-colors ${copied ? (darkMode ? 'bg-green-900/30 text-green-400' : 'bg-green-100 text-green-700') : (darkMode ? 'text-slate-400 hover:text-blue-500 hover:bg-slate-800' : 'text-slate-400 hover:text-blue-500 hover:bg-slate-100')}`}
+                title={copied ? 'Copied!' : 'Copy tracking link'}
+            >
+                {copied ? <CheckCircle className="h-3.5 w-3.5 sm:h-4 sm:w-4" /> : <Globe className="h-3.5 w-3.5 sm:h-4 sm:w-4" />}
             </button>
             
             {/* Universal Note Button */}
             <button 
                 onClick={() => onOpenNoteModal(file)}
-                className={`p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400 hover:text-blue-500 transition-colors`}
+                className={`p-1.5 sm:p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400 hover:text-blue-500 transition-colors`}
                 title="Add Note"
             >
-                <StickyNote className="h-4 w-4" />
+                <StickyNote className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
             </button>
 
             {/* Admin Edit Button */}
@@ -1352,31 +1688,43 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
               <>
                 <button 
                     onClick={() => onOpenEditModal(file)}
-                    className={`p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400 hover:text-blue-500 transition-colors`}
+                    className={`p-1.5 sm:p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400 hover:text-blue-500 transition-colors`}
                     title="Edit File"
                 >
-                    <Edit2 className="h-4 w-4" />
+                    <Edit2 className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
                 </button>
                 <button 
                     onClick={() => onDeleteFile(file.id)}
-                    className={`p-2 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 text-slate-400 hover:text-red-600 transition-colors`}
+                    className={`p-1.5 sm:p-2 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 text-slate-400 hover:text-red-600 transition-colors`}
                     title="Delete File"
                 >
-                    <Trash2 className="h-4 w-4" />
+                    <Trash2 className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
                 </button>
               </>
             )}
           </div>
 
           {isOwner && file.status !== 'DONE' && (
-            <div className="flex gap-2 overflow-x-auto pb-1">
-              {getAvailableActions().map(actionKey => (
+            <div className="flex flex-wrap gap-1.5 sm:gap-2 w-full sm:w-auto">
+              {getAvailableActions().map(action => (
                 <button
-                  key={actionKey}
-                  onClick={() => onOpenUpdateModal(file, actionKey)}
-                  className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors whitespace-nowrap ${darkMode ? 'bg-slate-800 text-slate-200 hover:bg-blue-600 hover:text-white' : 'bg-slate-100 text-slate-700 hover:bg-blue-600 hover:text-white'}`}
+                  key={action.key}
+                  onClick={() => {
+                    if (action.key === 'SEND_TO_PROCESSING') {
+                      onOpenUpdateModal(file, 'SEND_TO_PROCESSING');
+                    } else if (action.key === 'ACKNOWLEDGE_PROCESSING') {
+                      onOpenUpdateModal(file, 'ACKNOWLEDGE_PROCESSING');
+                    } else {
+                      onOpenUpdateModal(file, action.key);
+                    }
+                  }}
+                  className={`px-2 sm:px-3 py-1 sm:py-1.5 rounded-lg text-xs sm:text-sm font-medium transition-colors whitespace-nowrap ${
+                    action.isSpecial 
+                      ? (darkMode ? 'bg-green-900/30 text-green-300 hover:bg-green-600 hover:text-white' : 'bg-green-100 text-green-700 hover:bg-green-600 hover:text-white')
+                      : (darkMode ? 'bg-slate-800 text-slate-200 hover:bg-blue-600 hover:text-white' : 'bg-slate-100 text-slate-700 hover:bg-blue-600 hover:text-white')
+                  }`}
                 >
-                  Mark {STATUS[actionKey].label}
+                  {action.label}
                 </button>
               ))}
             </div>
@@ -1414,10 +1762,12 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
     const [result, setResult] = useState(null); 
     const [assignee, setAssignee] = useState(''); 
     const [reminderDate, setReminderDate] = useState(''); 
-    const [cost, setCost] = useState(''); // New Cost Field
+    const [cost, setCost] = useState('');
   
     if (!isOpen) return null;
   
+    const isSendToProcessing = newStatus === 'SEND_TO_PROCESSING';
+    const isAcknowledgeProcessing = newStatus === 'ACKNOWLEDGE_PROCESSING';
     const isDone = newStatus === 'DONE';
     const isSubmitted = newStatus === 'SUBMITTED';
     const isAdminOrProcessor = userRole === ROLES.ADMIN || userRole === ROLES.PROCESSING;
@@ -1432,16 +1782,50 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
          alert("Please select a result (Approved or Rejected)");
          return;
        }
-       onConfirm(note, result, assignee, reminderDate, cost);
+       
+       if (isSendToProcessing && !assignee) {
+         alert("Please select a processing agent to assign this file");
+         return;
+       }
+       
+       if (isSendToProcessing) {
+         onConfirm(note, null, assignee, null, null, false);
+       } else if (isAcknowledgeProcessing) {
+         onConfirm(note, null, null, null, null, true);
+       } else {
+         onConfirm(note, result, assignee, reminderDate, cost, false);
+       }
     };
   
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
         <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
-          <h3 className="text-lg font-bold mb-2">Update File Status</h3>
-          <p className="text-sm text-slate-500 mb-6">
-            Marking <b>{file.applicantName}</b> as <span className="font-semibold">{STATUS[newStatus].label}</span>
-          </p>
+          {isSendToProcessing && (
+            <>
+              <h3 className="text-lg font-bold mb-2">Send to Processing</h3>
+              <p className="text-sm text-slate-500 mb-6">
+                Assign <b>{file.applicantName}</b>'s file to a processing agent
+              </p>
+            </>
+          )}
+          
+          {isAcknowledgeProcessing && (
+            <>
+              <h3 className="text-lg font-bold mb-2">Acknowledge Processing</h3>
+              <p className="text-sm text-slate-500 mb-6">
+                Start processing <b>{file.applicantName}</b>'s file. This will move it to your active tasks.
+              </p>
+            </>
+          )}
+          
+          {!isSendToProcessing && !isAcknowledgeProcessing && (
+            <>
+              <h3 className="text-lg font-bold mb-2">Update File Status</h3>
+              <p className="text-sm text-slate-500 mb-6">
+                Marking <b>{file.applicantName}</b> as <span className="font-semibold">{STATUS[newStatus].label}</span>
+              </p>
+            </>
+          )}
   
           <div className="space-y-4">
              {isDone && (
@@ -1463,6 +1847,28 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
                 </div>
              )}
 
+             {/* Send to Processing - Show only Processing Agents dropdown */}
+             {isSendToProcessing && (
+                <div>
+                   <label className="block text-sm font-medium mb-2 opacity-80">Assign to Processing Agent</label>
+                   <div className="relative">
+                      <UserPlus className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                      <select
+                         className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                         value={assignee}
+                         onChange={(e) => setAssignee(e.target.value)}
+                      >
+                         <option value="">Select Agent</option>
+                         {allUsers.filter(u => u.role === ROLES.PROCESSING).map(u => (
+                            <option key={u.id} value={u.fullName || u.username}>
+                               {u.fullName} ({u.role})
+                            </option>
+                         ))}
+                      </select>
+                   </div>
+                </div>
+             )}
+
              {/* Cost Input (Only for Submission & Admin/Processor) */}
              {isSubmitted && isAdminOrProcessor && (
                  <div>
@@ -1480,45 +1886,49 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
                  </div>
              )}
 
-             {/* Assign To Dropdown */}
-             <div>
-                <label className="block text-sm font-medium mb-2 opacity-80">Assign To (Optional)</label>
-                <div className="relative">
-                   <UserPlus className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
-                   <select
-                      className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
-                      value={assignee}
-                      onChange={(e) => setAssignee(e.target.value)}
-                   >
-                      <option value="">Keep current / Default</option>
-                      {allUsers.map(u => (
-                         <option key={u.id} value={u.fullName || u.username}>
-                            {u.fullName} ({u.role})
-                         </option>
-                      ))}
-                   </select>
+             {/* Assign To Dropdown - Only for non-special actions */}
+             {!isSendToProcessing && !isAcknowledgeProcessing && (
+                <div>
+                   <label className="block text-sm font-medium mb-2 opacity-80">Assign To (Optional)</label>
+                   <div className="relative">
+                      <UserPlus className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                      <select
+                         className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                         value={assignee}
+                         onChange={(e) => setAssignee(e.target.value)}
+                      >
+                         <option value="">Keep current / Default</option>
+                         {allUsers.map(u => (
+                            <option key={u.id} value={u.fullName || u.username}>
+                               {u.fullName} ({u.role})
+                            </option>
+                         ))}
+                      </select>
+                   </div>
                 </div>
-             </div>
+             )}
 
-             {/* Reminder Date Option */}
-             <div>
-                <label className="block text-sm font-medium mb-2 opacity-80">Set Reminder (Optional)</label>
-                <div className="relative">
-                   <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
-                   <input
-                      type="date"
-                      className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
-                      value={reminderDate}
-                      onChange={(e) => setReminderDate(e.target.value)}
-                   />
+             {/* Reminder Date Option - Only for non-special actions */}
+             {!isSendToProcessing && !isAcknowledgeProcessing && (
+                <div>
+                   <label className="block text-sm font-medium mb-2 opacity-80">Set Reminder (Optional)</label>
+                   <div className="relative">
+                      <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                      <input
+                         type="date"
+                         className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                         value={reminderDate}
+                         onChange={(e) => setReminderDate(e.target.value)}
+                      />
+                   </div>
                 </div>
-             </div>
+             )}
   
              <div>
                <label className="block text-sm font-medium mb-2 opacity-80">Add Note (Optional)</label>
                <textarea
                  className={`w-full px-4 py-3 border rounded-xl focus:ring-2 focus:ring-blue-500 outline-none text-sm min-h-[100px] ${inputClass}`}
-                 placeholder="Any important details about this update..."
+                 placeholder="Any important details about this action..."
                  value={note}
                  onChange={(e) => setNote(e.target.value)}
                />
@@ -1526,7 +1936,9 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
   
              <div className="flex justify-end gap-3 pt-2">
                <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
-               <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">Confirm Update</button>
+               <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">
+                 {isSendToProcessing ? 'Send to Processing' : isAcknowledgeProcessing ? 'Start Processing' : 'Confirm Update'}
+               </button>
              </div>
           </div>
         </div>
@@ -1571,6 +1983,7 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
         contactNo: file?.contactNo || '',
         destination: file?.destination || '',
         serviceCharge: file?.serviceCharge || '',
+        cost: file?.cost || '',
         reminderDate: file?.reminderDate || ''
     });
 
@@ -1582,6 +1995,7 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                 contactNo: file.contactNo || '',
                 destination: file.destination || '',
                 serviceCharge: file.serviceCharge || '',
+                cost: file.cost || '',
                 reminderDate: file.reminderDate || ''
             });
         }
@@ -1622,12 +2036,30 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                     <div className="grid grid-cols-2 gap-4">
                         <div>
                             <label className="block text-sm font-medium mb-1 opacity-80">Service Charge</label>
-                            <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.serviceCharge} onChange={e => setEditData({...editData, serviceCharge: e.target.value})} />
+                            <input 
+                              type="number"
+                              min="0"
+                              step="0.01"
+                              className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                              value={editData.serviceCharge} 
+                              onChange={e => setEditData({...editData, serviceCharge: e.target.value})} 
+                            />
                         </div>
                         <div>
-                            <label className="block text-sm font-medium mb-1 opacity-80">Reminder Date</label>
-                            <input type="date" className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.reminderDate} onChange={e => setEditData({...editData, reminderDate: e.target.value})} />
+                            <label className="block text-sm font-medium mb-1 opacity-80">Cost</label>
+                            <input 
+                              type="number"
+                              min="0"
+                              step="0.01"
+                              className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                              value={editData.cost} 
+                              onChange={e => setEditData({...editData, cost: e.target.value})} 
+                            />
                         </div>
+                    </div>
+                    <div>
+                        <label className="block text-sm font-medium mb-1 opacity-80">Reminder Date</label>
+                        <input type="date" className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.reminderDate} onChange={e => setEditData({...editData, reminderDate: e.target.value})} />
                     </div>
                 </div>
                 <div className="flex justify-end gap-3 pt-6">
@@ -1657,6 +2089,24 @@ function DeleteConfirmationModal({ isOpen, onClose, onConfirm, darkMode }) {
                     <button onClick={onConfirm} className="flex-1 px-4 py-2 text-white bg-red-600 hover:bg-red-700 rounded-lg font-medium transition-colors">Delete</button>
                 </div>
             </div>
+        </div>
+    </div>
+  );
+}
+
+function ResultModal({ isOpen, onClose, message, darkMode }) {
+  if (!isOpen) return null;
+  
+  useEffect(() => {
+    const timer = setTimeout(onClose, 3000);
+    return () => clearTimeout(timer);
+  }, [isOpen, onClose]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm pointer-events-none">
+        <div className={`rounded-2xl shadow-2xl p-8 max-w-sm w-full animate-in fade-in zoom-in duration-300 text-center ${darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900'}`}>
+            <p className="text-4xl mb-4 animate-bounce">{message}</p>
+            <p className={`text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>This message will close automatically</p>
         </div>
     </div>
   );
@@ -1725,6 +2175,7 @@ function StatisticalReports({ files, currentUser, darkMode }) {
   const [userFilter, setUserFilter] = useState(currentUser.name);
   const [allUsers, setAllUsers] = useState([]);
   const [attendanceData, setAttendanceData] = useState([]);
+  const [customReportOpen, setCustomReportOpen] = useState(false);
 
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-lg';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
@@ -1786,14 +2237,15 @@ function StatisticalReports({ files, currentUser, darkMode }) {
         }
       }
 
-      // Financial & Sales Calculations based on creation time
+      // Financial & Sales Calculations - ALWAYS include all files regardless of userFilter
+      // (Financial overview should show company-wide totals, not filtered by staff member)
       const fileCreationDate = file.createdAt?.toDate ? file.createdAt.toDate() : new Date(file.createdAt?.seconds * 1000 || 0);
       
+      // Revenue and Cost are both based on when file was created (within the selected timeframe)
+      // Include ALL files that have serviceCharge/cost data (regardless of isNewSale flag)
       if (fileCreationDate >= start) {
-         if (file.isNewSale === true) {
-            reportData.finances.revenue += Number(file.serviceCharge || 0);
-            reportData.finances.cost += Number(file.cost || 0);
-         }
+         reportData.finances.revenue += Number(file.serviceCharge || 0);
+         reportData.finances.cost += Number(file.cost || 0);
       }
 
       file.history.forEach(entry => {
@@ -1828,7 +2280,9 @@ function StatisticalReports({ files, currentUser, darkMode }) {
              }
           }
 
-          if (['FOLLOW_UP', 'DOCS_PENDING', 'PAYMENT_PENDING'].includes(entry.status)) {
+          // Only count actual customer communications (FOLLOW_UP, DOCS_PENDING)
+          // PAYMENT_PENDING is internal embassy payment, not customer communication
+          if (['FOLLOW_UP', 'DOCS_PENDING'].includes(entry.status)) {
             reportData.sales.clientComms++;
           }
         }
@@ -1911,6 +2365,13 @@ function StatisticalReports({ files, currentUser, darkMode }) {
              className="flex items-center gap-2 px-4 py-2 bg-slate-800 text-white rounded-lg hover:bg-slate-900"
            >
              <Printer className="h-4 w-4" /> Export PDF
+           </button>
+
+           <button 
+             onClick={() => setCustomReportOpen(true)}
+             className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+           >
+             <FileText className="h-4 w-4" /> Custom Report
            </button>
         </div>
       </div>
@@ -2086,6 +2547,404 @@ function StatisticalReports({ files, currentUser, darkMode }) {
           }
         }
       `}</style>
+
+      {customReportOpen && (
+        <CustomReportModal
+          isOpen={customReportOpen}
+          onClose={() => setCustomReportOpen(false)}
+          files={files}
+          userFilter={userFilter}
+          timeRange={timeRange}
+          darkMode={darkMode}
+          stats={stats}
+          attendanceData={attendanceData}
+          currentUser={currentUser}
+          allUsers={allUsers}
+        />
+      )}
+    </div>
+  );
+}
+
+function CustomReportModal({ isOpen, onClose, files, userFilter, timeRange, darkMode, stats, attendanceData, currentUser, allUsers }) {
+  const [reportType, setReportType] = useState('all');
+
+  const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200';
+  const inputClass = darkMode ? 'bg-slate-950 border-slate-700' : 'bg-white border-slate-300';
+  const isAdmin = currentUser.role === ROLES.ADMIN;
+
+  const generateReport = () => {
+    const doc = new jsPDF();
+    let yPosition = 20;
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const margin = 15;
+    const contentWidth = pageWidth - 2 * margin;
+
+    // Helper function to add section
+    const addSection = (title) => {
+      if (yPosition > 250) {
+        doc.addPage();
+        yPosition = 20;
+      }
+      doc.setFontSize(14);
+      doc.setFont(undefined, 'bold');
+      doc.text(title, margin, yPosition);
+      yPosition += 8;
+      doc.setDrawColor(100, 150, 255);
+      doc.line(margin, yPosition, pageWidth - margin, yPosition);
+      yPosition += 6;
+    };
+
+    // Helper function to add text
+    const addText = (label, value, isBold = false) => {
+      if (yPosition > 270) {
+        doc.addPage();
+        yPosition = 20;
+      }
+      doc.setFontSize(11);
+      doc.setFont(undefined, isBold ? 'bold' : 'normal');
+      doc.text(`${label}: ${value}`, margin, yPosition);
+      yPosition += 6;
+    };
+
+    // Header
+    doc.setFontSize(18);
+    doc.setFont(undefined, 'bold');
+    doc.text('VISA TRACK - REPORT', margin, yPosition);
+    yPosition += 10;
+
+    doc.setFontSize(10);
+    doc.setFont(undefined, 'normal');
+    doc.text(`Period: ${timeRange.toUpperCase()} | Generated: ${new Date().toLocaleString()}`, margin, yPosition);
+    yPosition += 8;
+
+    // Financial Summary (Admin Only)
+    if (isAdmin && (reportType === 'all' || reportType === 'financial')) {
+      addSection('💰 FINANCIAL SUMMARY');
+      addText('Total Revenue', `$${stats.finances.revenue.toFixed(2)}`, true);
+      addText('Total Cost', `$${stats.finances.cost.toFixed(2)}`, true);
+      addText('Net Profit', `$${stats.finances.profit.toFixed(2)}`, true);
+      yPosition += 4;
+    }
+
+    // Sales Report
+    if (reportType === 'all' || reportType === 'sales') {
+      addSection('📈 SALES REPORT');
+      addText('Successful Deals', stats.sales.successfulDeals.toString());
+      addText('Client Communications', stats.sales.clientComms.toString());
+      addText('Total Sales Actions', stats.sales.totalActions.toString());
+      
+      if (Object.keys(stats.sales.destinations).length > 0) {
+        doc.setFontSize(10);
+        doc.setFont(undefined, 'bold');
+        doc.text('Destinations Breakdown:', margin, yPosition);
+        yPosition += 5;
+        
+        Object.entries(stats.sales.destinations).forEach(([dest, count]) => {
+          doc.setFont(undefined, 'normal');
+          doc.text(`  • ${dest}: ${count}`, margin + 5, yPosition);
+          yPosition += 5;
+        });
+      }
+      yPosition += 2;
+    }
+
+    // Processing Report
+    if (reportType === 'all' || reportType === 'processing') {
+      addSection('⚙️ PROCESSING REPORT');
+      addText('In Process', stats.processing.inProcess.toString());
+      addText('Submitted', stats.processing.submittedToday.toString());
+      addText('Docs Pending', stats.processing.docsPendingToday.toString());
+      addText('Completed', stats.processing.completedToday.toString());
+      addText('Approvals', stats.processing.approvals.toString());
+      addText('Rejections', stats.processing.rejections.toString());
+      addText('Total Processing Actions', stats.processing.totalActions.toString());
+      yPosition += 2;
+    }
+
+    // Attendance Log
+    if (reportType === 'all' || reportType === 'attendance') {
+      addSection('📅 ATTENDANCE LOG');
+      
+      if (stats.attendance.length === 0) {
+        doc.setFont(undefined, 'normal');
+        doc.text('No attendance records found.', margin, yPosition);
+        yPosition += 6;
+      } else {
+        stats.attendance.slice(0, 20).forEach(att => {
+          doc.setFont(undefined, 'normal');
+          doc.setFontSize(9);
+          doc.text(`Date: ${att.date}`, margin, yPosition);
+          yPosition += 4;
+          if (userFilter === 'ALL') {
+            doc.text(`Employee: ${att.userName}`, margin + 5, yPosition);
+            yPosition += 4;
+          }
+          const loginTime = att.loginTime ? new Date(att.loginTime?.seconds * 1000).toLocaleTimeString() : 'N/A';
+          const logoutTime = att.logoutTime ? new Date(att.logoutTime?.seconds * 1000).toLocaleTimeString() : 'N/A';
+          doc.text(`Login: ${loginTime}`, margin + 5, yPosition);
+          yPosition += 4;
+          doc.text(`Logout: ${logoutTime}`, margin + 5, yPosition);
+          yPosition += 4;
+          doc.text(`Status: ${att.logoutTime ? 'Completed' : 'Active'}`, margin + 5, yPosition);
+          yPosition += 5;
+        });
+      }
+    }
+
+    // Notes Log (if available)
+    if ((reportType === 'all' || reportType === 'notes') && stats.notes.length > 0) {
+      addSection('📝 NOTES LOG');
+      
+      stats.notes.slice(0, 15).forEach(note => {
+        doc.setFontSize(9);
+        doc.setFont(undefined, 'normal');
+        doc.text(`File: ${note.file}`, margin, yPosition);
+        yPosition += 4;
+        doc.text(`Note: ${note.note}`, margin + 5, yPosition, { maxWidth: contentWidth - 10 });
+        yPosition += 6;
+        doc.text(`Time: ${new Date(note.time).toLocaleString()}`, margin + 5, yPosition);
+        yPosition += 6;
+      });
+    }
+
+    // Download PDF
+    doc.save(`visa-track-${reportType}-report-${Date.now()}.pdf`);
+    onClose();
+  };
+
+  if (!isOpen) return null;
+
+  let reportOptions = [
+    { value: 'all', label: 'Complete Report', icon: '📋' },
+    { value: 'sales', label: 'Sales Report', icon: '📈' },
+    { value: 'processing', label: 'Processing Report', icon: '⚙️' },
+    { value: 'attendance', label: 'Attendance Logs', icon: '📅' },
+    ...(stats.notes.length > 0 ? [{ value: 'notes', label: 'Notes Log', icon: '📝' }] : [])
+  ];
+
+  // Add financial report only for admins
+  if (isAdmin) {
+    reportOptions = [
+      { value: 'all', label: 'Complete Report', icon: '📋' },
+      { value: 'financial', label: 'Financial Summary', icon: '💰' },
+      { value: 'sales', label: 'Sales Report', icon: '📈' },
+      { value: 'processing', label: 'Processing Report', icon: '⚙️' },
+      { value: 'attendance', label: 'Attendance Logs', icon: '📅' },
+      ...(stats.notes.length > 0 ? [{ value: 'notes', label: 'Notes Log', icon: '📝' }] : [])
+    ];
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
+        <h3 className="text-lg font-bold mb-2">Download Report (PDF)</h3>
+        <p className={`text-sm mb-4 ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>
+          Select report type for {userFilter === 'ALL' ? 'all staff' : userFilter} ({timeRange.toUpperCase()})
+        </p>
+        
+        <div className="space-y-2 mb-6 max-h-72 overflow-y-auto">
+          {reportOptions.map(option => (
+            <label key={option.value} className={`flex items-center gap-3 p-3 rounded-lg cursor-pointer border-2 transition-colors ${reportType === option.value ? (darkMode ? 'bg-blue-900/30 border-blue-600' : 'bg-blue-50 border-blue-600') : (darkMode ? 'border-slate-700 hover:bg-slate-800' : 'border-slate-200 hover:bg-slate-50')}`}>
+              <input
+                type="radio"
+                name="reportType"
+                value={option.value}
+                checked={reportType === option.value}
+                onChange={(e) => setReportType(e.target.value)}
+                className="w-4 h-4"
+              />
+              <span className="text-lg">{option.icon}</span>
+              <span className="text-sm font-medium">{option.label}</span>
+            </label>
+          ))}
+        </div>
+
+        <div className="flex justify-end gap-3">
+          <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
+          <button onClick={generateReport} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">Download PDF</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PublicTrackingPage({ fileId, files, loading, darkMode, toggleDarkMode }) {
+  const [foundFile, setFoundFile] = useState(null);
+  const [searchId, setSearchId] = useState(fileId || '');
+  const [searched, setSearched] = useState(!!fileId);
+
+  useEffect(() => {
+    if (fileId) {
+      const file = files.find(f => f.fileId?.toLowerCase() === fileId.toLowerCase());
+      setFoundFile(file || null);
+    }
+  }, [fileId, files]);
+
+  const handleSearch = (e) => {
+    e.preventDefault();
+    const file = files.find(f => f.fileId?.toLowerCase() === searchId.toLowerCase());
+    setFoundFile(file || null);
+    setSearched(true);
+  };
+
+  const getStatusMessage = (status) => {
+    const messages = {
+      RECEIVED_SALES: 'Your application has been received and registered.',
+      HANDOVER_PROCESSING: 'Your file is now being processed by our team.',
+      DOCS_PENDING: 'We are waiting for additional documents from you.',
+      PAYMENT_PENDING: 'Payment is pending for this application.',
+      SUBMITTED: 'Your documents have been submitted to the embassy. Please wait for their response.',
+      FOLLOW_UP: 'We are following up on your application.',
+      DONE: 'Your application has been completed!'
+    };
+    return messages[status] || 'Status unknown';
+  };
+
+  const containerClass = darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900';
+  const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200';
+  const inputClass = darkMode ? 'bg-slate-950 border-slate-700 text-slate-100' : 'bg-white border-slate-300 text-slate-900';
+
+  return (
+    <div className={`min-h-screen font-sans transition-colors duration-200 ${containerClass} p-4 sm:p-6`}>
+      {/* Header */}
+      <div className={`max-w-2xl mx-auto mb-8 p-6 rounded-xl border ${cardClass}`}>
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <div className="bg-blue-600 p-3 rounded-lg shadow-lg shadow-blue-500/20">
+              <FileText className="h-6 w-6 text-white" />
+            </div>
+            <div>
+              <h1 className={`text-2xl font-bold ${darkMode ? 'text-slate-100' : 'text-slate-900'}`}>VisaTrack</h1>
+              <p className={`text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>File Tracking System</p>
+            </div>
+          </div>
+          <button 
+            onClick={toggleDarkMode}
+            className={`p-2 rounded-full transition-colors ${darkMode ? 'text-yellow-400 hover:bg-slate-800' : 'text-slate-400 hover:bg-slate-100'}`}
+          >
+            {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
+          </button>
+        </div>
+        
+        <form onSubmit={handleSearch} className="space-y-4">
+          <div>
+            <label className={`block text-sm font-medium mb-2 ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+              Enter Your VT ID Number
+            </label>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={searchId}
+                onChange={(e) => setSearchId(e.target.value.toUpperCase())}
+                placeholder="e.g., VT-12345"
+                className={`flex-1 px-4 py-3 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+              />
+              <button
+                type="submit"
+                className="px-6 py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-colors"
+              >
+                Track
+              </button>
+            </div>
+            <p className={`text-xs mt-2 ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>
+              Your VT ID was provided when your file was registered.
+            </p>
+          </div>
+        </form>
+      </div>
+
+      {/* Results */}
+      <div className="max-w-2xl mx-auto">
+        {searched && !foundFile ? (
+          <div className={`p-6 rounded-xl border text-center ${darkMode ? 'bg-slate-900/50 border-slate-800' : 'bg-slate-100 border-slate-200'}`}>
+            <AlertCircle className="h-12 w-12 mx-auto mb-3 text-amber-500" />
+            <h2 className="text-lg font-bold mb-2">File Not Found</h2>
+            <p className={darkMode ? 'text-slate-400' : 'text-slate-600'}>
+              No file found with ID: <span className="font-mono font-bold">{searchId}</span>
+            </p>
+            <p className={`text-sm mt-2 ${darkMode ? 'text-slate-500' : 'text-slate-500'}`}>
+              Please check your VT ID and try again.
+            </p>
+          </div>
+        ) : foundFile ? (
+          <div className={`p-6 rounded-xl border space-y-6 ${cardClass}`}>
+            {/* File Info */}
+            <div>
+              <h2 className="text-xl font-bold mb-4">Application Details</h2>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <p className={`text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>VT ID</p>
+                  <p className="text-lg font-mono font-bold text-blue-600">{foundFile.fileId}</p>
+                </div>
+                <div>
+                  <p className={`text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Applicant Name</p>
+                  <p className="text-lg font-semibold">{foundFile.applicantName}</p>
+                </div>
+                <div>
+                  <p className={`text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Destination</p>
+                  <p className="text-lg font-semibold">{foundFile.destination}</p>
+                </div>
+                <div>
+                  <p className={`text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Contact</p>
+                  <p className="text-lg font-semibold">{foundFile.contactNo}</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Current Status */}
+            <div className={`p-4 rounded-lg ${darkMode ? 'bg-slate-800' : 'bg-slate-50'}`}>
+              <h3 className="font-semibold mb-3">Current Status</h3>
+              <div className="flex items-center gap-3 mb-3">
+                {STATUS[foundFile.status]?.icon && React.createElement(STATUS[foundFile.status].icon, {
+                  className: `h-8 w-8 ${STATUS[foundFile.status].color?.split(' ')[1] || 'text-slate-600'}`
+                })}
+                <span className={`px-3 py-1 rounded-full font-medium ${darkMode && STATUS[foundFile.status].darkColor ? STATUS[foundFile.status].darkColor : STATUS[foundFile.status].color}`}>
+                  {STATUS[foundFile.status]?.label}
+                </span>
+              </div>
+              <p className={darkMode ? 'text-slate-300' : 'text-slate-700'}>
+                {getStatusMessage(foundFile.status)}
+              </p>
+            </div>
+
+            {/* Visa Result if applicable */}
+            {foundFile.visaResult && (
+              <div className={`p-4 rounded-lg ${foundFile.visaResult === 'APPROVED' ? (darkMode ? 'bg-green-900/30 border border-green-800' : 'bg-green-50 border border-green-200') : (darkMode ? 'bg-red-900/30 border border-red-800' : 'bg-red-50 border border-red-200')}`}>
+                <div className="flex items-center gap-3 mb-2">
+                  {foundFile.visaResult === 'APPROVED' ? (
+                    <>
+                      <ThumbsUp className="h-6 w-6 text-green-600" />
+                      <span className="font-bold text-green-700 dark:text-green-400">Visa Approved! 🎉</span>
+                    </>
+                  ) : (
+                    <>
+                      <ThumbsDown className="h-6 w-6 text-red-600" />
+                      <span className="font-bold text-red-700 dark:text-red-400">Visa Rejected</span>
+                    </>
+                  )}
+                </div>
+                <p className={darkMode ? 'text-slate-300' : 'text-slate-700'}>
+                  {foundFile.visaResult === 'APPROVED' ? 'Congratulations! Your visa has been approved.' : 'Unfortunately, your visa application was not approved. Please contact us for more information.'}
+                </p>
+              </div>
+            )}
+
+            {/* Registered Date */}
+            <div className={`text-center py-4 border-t ${darkMode ? 'border-slate-700 text-slate-400' : 'border-slate-200 text-slate-500'}`}>
+              <p className="text-sm">
+                File registered on {formatDate(foundFile.createdAt)}
+              </p>
+            </div>
+          </div>
+        ) : null}
+      </div>
+
+      {/* Footer */}
+      <footer className={`max-w-2xl mx-auto mt-12 py-6 text-center text-xs ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>
+        <p>For further assistance, please contact our support team.</p>
+        <p className="mt-2">© MD Rokibul Islam . All rights reserved.</p>
+      </footer>
     </div>
   );
 }
