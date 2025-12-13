@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import logoImage from './assets/logo.jpg';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
@@ -233,12 +234,30 @@ const generateInvoice = async (file, paymentStatus, paidAmount = null) => {
     pdf.setFillColor(...primaryColor);
     pdf.rect(0, 0, pageWidth, 2, 'F');
 
-    // Load and add logo
+    // Load and add logo as data URL for PDF
     try {
-      const logoImg = '/src/assets/logo.jpg';
-      pdf.addImage(logoImg, 'JPEG', 12, 8, 20, 20);
+      const canvas = document.createElement('canvas');
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.src = logoImage;
+      await new Promise((resolve, reject) => {
+        img.onload = () => {
+          try {
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+            const imgData = canvas.toDataURL('image/jpeg');
+            pdf.addImage(imgData, 'JPEG', 12, 8, 20, 20);
+            resolve();
+          } catch (err) {
+            reject(err);
+          }
+        };
+        img.onerror = () => reject(new Error('Logo load failed'));
+      });
     } catch (e) {
-      console.log('Logo not available');
+      console.log('Logo not added to PDF (optional):', e.message);
     }
 
     // Company Header
@@ -1234,7 +1253,7 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
           {/* Logo */}
           <div className="flex-shrink-0">
             <img 
-              src="/src/assets/logo.jpg" 
+              src={logoImage} 
               alt="Company Logo" 
               className="h-20 w-20 md:h-24 md:w-24 rounded-lg object-cover shadow-lg"
             />
