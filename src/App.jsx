@@ -196,6 +196,221 @@ const triggerConfettiExplosion = () => {
   frame();
 };
 
+// Company Details for Invoice
+const COMPANY_INFO = {
+  name: 'ALIF GLOBAL TOURS AND TRAVELS',
+  tradeNum: 'TRAD/DNCC/046978/2023',
+  caabNum: '0015752',
+  logo: '/src/assets/logo.jpg',
+  phone: '+880 1901-467290',
+  email: 'info@alifglobaltoursandtravels.com.bd',
+};
+
+// Invoice Generation Function
+const generateInvoice = async (file, paymentStatus, paidAmount = null) => {
+  try {
+    const pdf = new jsPDF({
+      orientation: 'portrait',
+      unit: 'mm',
+      format: 'a4'
+    });
+
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    let yPos = 10;
+
+    // Color scheme
+    const primaryColor = [52, 122, 197]; // Blue
+    const accentColor = [230, 126, 34]; // Orange
+    const darkGray = [45, 62, 80];
+    const lightGray = [236, 240, 241];
+
+    // Add elegant header background
+    pdf.setFillColor(...lightGray);
+    pdf.rect(0, 0, pageWidth, 45, 'F');
+
+    // Add premium border top
+    pdf.setFillColor(...primaryColor);
+    pdf.rect(0, 0, pageWidth, 2, 'F');
+
+    // Load and add logo
+    try {
+      const logoImg = '/src/assets/logo.jpg';
+      pdf.addImage(logoImg, 'JPEG', 12, 8, 20, 20);
+    } catch (e) {
+      console.log('Logo not available');
+    }
+
+    // Company Header
+    pdf.setFont(undefined, 'bold');
+    pdf.setFontSize(14);
+    pdf.setTextColor(...primaryColor);
+    pdf.text(COMPANY_INFO.name, 35, 13, { align: 'left', maxWidth: 95 });
+
+    // Company details
+    pdf.setFont(undefined, 'normal');
+    pdf.setFontSize(7);
+    pdf.setTextColor(100, 100, 100);
+    pdf.text(`Trade License: ${COMPANY_INFO.tradeNum}`, 35, 19, { align: 'left' });
+    pdf.text(`CAAB No: ${COMPANY_INFO.caabNum}`, 35, 22, { align: 'left' });
+    pdf.text(`Mobile: ${COMPANY_INFO.phone} | Email: ${COMPANY_INFO.email}`, 35, 25, { align: 'left', maxWidth: 100 });
+
+    // Invoice badge on right
+    pdf.setFillColor(...accentColor);
+    pdf.rect(pageWidth - 45, 12, 40, 18, 'F');
+    pdf.setFont(undefined, 'bold');
+    pdf.setFontSize(11);
+    pdf.setTextColor(255, 255, 255);
+    pdf.text('INVOICE', pageWidth - 25, 19, { align: 'center' });
+    pdf.setFontSize(9);
+    pdf.text(file.fileId, pageWidth - 25, 25, { align: 'center' });
+
+    yPos = 52;
+
+    // Invoice Details Section
+    pdf.setFont(undefined, 'bold');
+    pdf.setFontSize(9);
+    pdf.setTextColor(...darkGray);
+    pdf.text('Invoice Details', 15, yPos);
+    yPos += 6;
+
+    pdf.setFont(undefined, 'normal');
+    pdf.setFontSize(8);
+    pdf.setTextColor(80, 80, 80);
+    const today = new Date().toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric'
+    });
+    pdf.text(`Date Issued: ${today}`, 15, yPos);
+    yPos += 5;
+    pdf.text(`Invoice #: ${file.fileId}`, 15, yPos);
+    yPos += 8;
+
+    // Client Information Section
+    pdf.setFillColor(...lightGray);
+    pdf.rect(15, yPos - 3, pageWidth - 30, 0.5, 'F');
+    pdf.setFont(undefined, 'bold');
+    pdf.setFontSize(9);
+    pdf.setTextColor(...primaryColor);
+    pdf.text('Client Information', 15, yPos + 2);
+    yPos += 8;
+
+    pdf.setFont(undefined, 'normal');
+    pdf.setFontSize(8);
+    pdf.setTextColor(60, 60, 60);
+    pdf.text(`Applicant: ${file.applicantName}`, 15, yPos);
+    yPos += 4;
+    pdf.text(`Passport: ${file.passportNo}`, 15, yPos);
+    yPos += 4;
+    pdf.text(`Contact: ${file.contactNo}`, 15, yPos);
+    yPos += 4;
+    pdf.text(`Destination Country: ${file.destination || 'N/A'}`, 15, yPos);
+    yPos += 10;
+
+    // Service Details Section
+    pdf.setFillColor(...lightGray);
+    pdf.rect(15, yPos - 3, pageWidth - 30, 0.5, 'F');
+    pdf.setFont(undefined, 'bold');
+    pdf.setFontSize(9);
+    pdf.setTextColor(...primaryColor);
+    pdf.text('Service Details', 15, yPos + 2);
+    yPos += 8;
+
+    // Service table header
+    pdf.setFillColor(...primaryColor);
+    pdf.rect(15, yPos - 3, pageWidth - 30, 6, 'F');
+    pdf.setFont(undefined, 'bold');
+    pdf.setFontSize(8);
+    pdf.setTextColor(255, 255, 255);
+    pdf.text('Service Description', 18, yPos);
+    pdf.text('Amount', pageWidth - 25, yPos, { align: 'right' });
+    yPos += 8;
+
+    // Service row
+    const serviceCharge = parseFloat(file.serviceCharge || 0);
+    pdf.setFont(undefined, 'normal');
+    pdf.setFontSize(8);
+    pdf.setTextColor(60, 60, 60);
+    const serviceDesc = `${file.destination} Visa Service Processing`;
+    pdf.text(serviceDesc, 18, yPos);
+    pdf.setFont(undefined, 'bold');
+    pdf.setTextColor(...accentColor);
+    pdf.text(`Tk ${serviceCharge.toFixed(2)}`, pageWidth - 25, yPos, { align: 'right' });
+    yPos += 10;
+
+    // Payment Status Section
+    pdf.setFillColor(...lightGray);
+    pdf.rect(15, yPos - 3, pageWidth - 30, 0.5, 'F');
+    pdf.setFont(undefined, 'bold');
+    pdf.setFontSize(9);
+    pdf.setTextColor(...primaryColor);
+    pdf.text('Payment Status', 15, yPos + 2);
+    yPos += 8;
+
+    // Status box
+    let statusColor = [52, 152, 219]; // Blue for unpaid
+    if (paymentStatus === 'Paid') statusColor = [46, 204, 113]; // Green
+    if (paymentStatus === 'Partially Paid') statusColor = [241, 196, 15]; // Yellow
+
+    pdf.setFillColor(...statusColor);
+    pdf.rect(15, yPos - 2, 40, 7, 'F');
+    pdf.setFont(undefined, 'bold');
+    pdf.setFontSize(8);
+    pdf.setTextColor(255, 255, 255);
+    pdf.text(paymentStatus.toUpperCase(), 17, yPos + 2);
+
+    yPos += 10;
+    pdf.setFont(undefined, 'normal');
+    pdf.setFontSize(8);
+    pdf.setTextColor(60, 60, 60);
+
+    if (paymentStatus === 'Partially Paid' && paidAmount !== null) {
+      const remaining = serviceCharge - paidAmount;
+      pdf.text(`Paid Amount: Tk ${parseFloat(paidAmount).toFixed(2)}`, 15, yPos);
+      yPos += 5;
+      pdf.text(`Remaining: Tk ${Math.max(0, remaining).toFixed(2)}`, 15, yPos);
+    } else if (paymentStatus === 'Paid') {
+      pdf.text(`Amount Paid: Tk ${serviceCharge.toFixed(2)}`, 15, yPos);
+    } else if (paymentStatus === 'Unpaid') {
+      pdf.text(`Amount Due: Tk ${serviceCharge.toFixed(2)}`, 15, yPos);
+    }
+
+    // Total amount box at bottom
+    yPos = pageHeight - 35;
+    pdf.setFillColor(...primaryColor);
+    pdf.rect(pageWidth - 55, yPos, 50, 15, 'F');
+    pdf.setFont(undefined, 'bold');
+    pdf.setFontSize(9);
+    pdf.setTextColor(255, 255, 255);
+    pdf.text('Total Amount:', pageWidth - 50, yPos + 4);
+    pdf.setFontSize(14);
+    pdf.text(`Tk ${serviceCharge.toFixed(2)}`, pageWidth - 50, yPos + 11);
+
+    // Footer
+    yPos = pageHeight - 18;
+    pdf.setDrawColor(...primaryColor);
+    pdf.line(15, yPos - 2, pageWidth - 15, yPos - 2);
+    
+    pdf.setFont(undefined, 'normal');
+    pdf.setFontSize(7);
+    pdf.setTextColor(80, 80, 80);
+    pdf.text(`Contact: ${COMPANY_INFO.phone} | ${COMPANY_INFO.email}`, pageWidth / 2, yPos + 2, { align: 'center' });
+    
+    pdf.setFont(undefined, 'italic');
+    pdf.setFontSize(7);
+    pdf.setTextColor(120, 120, 120);
+    pdf.text('Thank you for choosing Alif Global Tours and Travels!', pageWidth / 2, yPos + 5, { align: 'center' });
+    pdf.text(`Generated on ${today} | This is an official invoice`, pageWidth / 2, yPos + 8, { align: 'center' });
+
+    // Save PDF
+    pdf.save(`Invoice_${file.fileId}_${Date.now()}.pdf`);
+  } catch (error) {
+    console.error('Error generating invoice:', error);
+    alert('Failed to generate invoice. Please try again.');
+  }
+};
+
 const triggerSadAnimation = () => {
   // Play a sad tone
   const audioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -243,6 +458,8 @@ export default function VisaTrackApp() {
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [resultModalOpen, setResultModalOpen] = useState(false);
   const [resultMessage, setResultMessage] = useState('');
+  const [invoiceModalOpen, setInvoiceModalOpen] = useState(false);
+  const [invoiceFile, setInvoiceFile] = useState(null);
   
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedAction, setSelectedAction] = useState(null);
@@ -804,6 +1021,7 @@ export default function VisaTrackApp() {
             myTasks={myTasks} 
             onDeleteFile={requestDeleteFile}
             darkMode={darkMode}
+            onOpenInvoiceModal={(f) => { setInvoiceFile(f); setInvoiceModalOpen(true); }}
           />
         )}
         {activeTab === 'pipeline' && <PipelineView files={files} darkMode={darkMode} />}
@@ -815,7 +1033,7 @@ export default function VisaTrackApp() {
             darkMode={darkMode}
           />
         )}
-        {activeTab === 'reports' && <StatisticalReports files={files} currentUser={appUser} darkMode={darkMode} />}
+        {activeTab === 'reports' && <StatisticalReports files={files} currentUser={appUser} darkMode={darkMode} onOpenInvoiceModal={(f) => { setInvoiceFile(f); setInvoiceModalOpen(true); }} />}
         {activeTab === 'admin' && appUser.role === ROLES.ADMIN && (
           <AdminPanel currentUser={appUser} destinations={destinations} darkMode={darkMode} />
         )}
@@ -893,6 +1111,19 @@ export default function VisaTrackApp() {
           darkMode={darkMode}
         />
       )}
+
+      {invoiceModalOpen && (
+        <InvoiceModal
+          isOpen={invoiceModalOpen}
+          onClose={() => {
+            setInvoiceModalOpen(false);
+            setInvoiceFile(null);
+          }}
+          file={invoiceFile}
+          darkMode={darkMode}
+          onGenerateInvoice={generateInvoice}
+        />
+      )}
     </div>
   );
 }
@@ -912,7 +1143,7 @@ function NavButton({ active, onClick, icon: Icon, children, darkMode }) {
   );
 }
 
-function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode }) {
+function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode, onOpenInvoiceModal }) {
   const [destFilter, setDestFilter] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 20;
@@ -997,6 +1228,36 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
 
   return (
     <div className="space-y-8">
+      {/* Company Branding Section */}
+      <div className={`rounded-xl border p-6 md:p-8 ${cardClass}`}>
+        <div className="flex flex-col md:flex-row items-start md:items-center gap-6">
+          {/* Logo */}
+          <div className="flex-shrink-0">
+            <img 
+              src="/src/assets/logo.jpg" 
+              alt="Company Logo" 
+              className="h-20 w-20 md:h-24 md:w-24 rounded-lg object-cover shadow-lg"
+            />
+          </div>
+          
+          {/* Company Info */}
+          <div className="flex-grow">
+            <h2 className={`text-3xl md:text-4xl font-bold ${textMain} mb-2`}>{COMPANY_INFO.name}</h2>
+            <div className={`grid grid-cols-1 md:grid-cols-2 gap-3 ${textSub} text-sm`}>
+              <div>
+                <p className={`font-semibold ${textMain}`}>Trade License</p>
+                <p>{COMPANY_INFO.tradeNum}</p>
+              </div>
+              <div>
+                <p className={`font-semibold ${textMain}`}>CAAB No</p>
+                <p>{COMPANY_INFO.caabNum}</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Stats Cards */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
         <div className={`p-4 md:p-6 rounded-xl border flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-0 ${cardClass}`}>
           <div>
@@ -1071,7 +1332,8 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
                     onOpenNoteModal={onOpenNoteModal}
                     onOpenEditModal={onOpenEditModal}
                     onDeleteFile={onDeleteFile} 
-                    darkMode={darkMode} 
+                    darkMode={darkMode}
+                    onOpenInvoiceModal={onOpenInvoiceModal}
                 />
               ))
             )}
@@ -1238,9 +1500,9 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
             </select>
           </div>
           <div>
-            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Service Charge (Optional)</label>
+            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Service Charge - ৳ (Optional)</label>
             <div className="relative">
-              <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 text-sm font-bold">৳</span>
               <input 
                 type="number"
                 min="0"
@@ -1253,9 +1515,9 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
             </div>
           </div>
           <div>
-            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Cost (Optional)</label>
+            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Cost - ৳ (Optional)</label>
             <div className="relative">
-              <DollarSign className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 text-sm font-bold">৳</span>
               <input 
                 type="number"
                 min="0"
@@ -1558,7 +1820,7 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
   );
 }
 
-function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, onDeleteFile, darkMode }) {
+function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, onDeleteFile, darkMode, onOpenInvoiceModal }) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const StatusIcon = STATUS[file.status].icon;
@@ -1641,7 +1903,7 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
                 
                 <span className="flex items-center gap-1"><User className="h-3 w-3" /> {file.passportNo}</span>
                 <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {file.destination || 'N/A'}</span>
-                {file.serviceCharge && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><DollarSign className="h-3 w-3" /> {file.serviceCharge}</span>}
+                {file.serviceCharge && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold">৳</span> {file.serviceCharge}</span>}
                 <span className="flex items-center gap-1">📞 {file.contactNo}</span>
                 {file.reminderDate && <span className="flex items-center gap-1 text-orange-500"><Clock className="h-3 w-3"/> {formatSimpleDate(file.reminderDate)}</span>}
               </div>
@@ -1681,6 +1943,15 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
                 title="Add Note"
             >
                 <StickyNote className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
+            </button>
+
+            {/* Invoice Button */}
+            <button 
+                onClick={() => onOpenInvoiceModal && onOpenInvoiceModal(file)}
+                className={`p-1.5 sm:p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-400 hover:text-blue-500 transition-colors`}
+                title="Generate Invoice"
+            >
+                <FileText className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
             </button>
 
             {/* Admin Edit Button */}
@@ -2170,7 +2441,7 @@ function NotificationModal({ isOpen, onClose, tasks, onOpenTask, darkMode }) {
   );
 }
 
-function StatisticalReports({ files, currentUser, darkMode }) {
+function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }) {
   const [timeRange, setTimeRange] = useState('today');
   const [userFilter, setUserFilter] = useState(currentUser.name);
   const [allUsers, setAllUsers] = useState([]);
@@ -3147,6 +3418,129 @@ function LoginScreen({ onLogin, darkMode, toggleDarkMode }) {
             <Code2 className="h-3 w-3"/> 
             Developed by <span className={`font-semibold ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>MD Rokibul Islam</span>
            </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Invoice Modal Component
+function InvoiceModal({ isOpen, onClose, file, darkMode, onGenerateInvoice }) {
+  const [paymentStatus, setPaymentStatus] = useState('Unpaid');
+  const [paidAmount, setPaidAmount] = useState('');
+  const [showPaidAmountInput, setShowPaidAmountInput] = useState(false);
+
+  if (!isOpen || !file) return null;
+
+  const handleStatusChange = (status) => {
+    setPaymentStatus(status);
+    setShowPaidAmountInput(status === 'Partially Paid');
+  };
+
+  const handleGenerateInvoice = async () => {
+    if (paymentStatus === 'Partially Paid') {
+      if (!paidAmount || parseFloat(paidAmount) < 0) {
+        alert('Please enter a valid paid amount');
+        return;
+      }
+      await onGenerateInvoice(file, paymentStatus, paidAmount);
+    } else {
+      await onGenerateInvoice(file, paymentStatus);
+    }
+    onClose();
+  };
+
+  const bgClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200';
+  const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
+  const textSub = darkMode ? 'text-slate-400' : 'text-slate-500';
+  const inputClass = darkMode ? 'bg-slate-950 border-slate-700 text-slate-100' : 'bg-white border-slate-300 text-slate-900';
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className={`${bgClass} rounded-xl border max-w-md w-full mx-4 overflow-hidden`}>
+        {/* Header */}
+        <div className={`px-6 py-4 border-b ${darkMode ? 'border-slate-800 bg-slate-800/50' : 'border-slate-100 bg-slate-50'}`}>
+          <h3 className={`text-lg font-bold ${textMain} flex items-center gap-2`}>
+            <FileText className="h-5 w-5" />
+            Generate Invoice
+          </h3>
+          <p className={`text-sm ${textSub} mt-1`}>Invoice #{file.fileId}</p>
+        </div>
+
+        {/* Content */}
+        <div className="px-6 py-6 space-y-6">
+          {/* Client Info */}
+          <div>
+            <p className={`text-sm font-semibold ${textSub} uppercase tracking-wider mb-2`}>Client</p>
+            <p className={`text-sm ${textMain}`}>{file.applicantName}</p>
+            <p className={`text-xs ${textSub} mt-1`}>{file.passportNo}</p>
+          </div>
+
+          {/* Amount */}
+          <div>
+            <p className={`text-sm font-semibold ${textSub} uppercase tracking-wider mb-2`}>Service Charge</p>
+            <p className={`text-2xl font-bold text-green-600`}>৳{(parseFloat(file.serviceCharge) || 0).toFixed(2)}</p>
+          </div>
+
+          {/* Payment Status */}
+          <div>
+            <p className={`text-sm font-semibold ${textSub} uppercase tracking-wider mb-3`}>Payment Status</p>
+            <div className="space-y-2">
+              {['Paid', 'Unpaid', 'Partially Paid'].map(status => (
+                <label key={status} className="flex items-center gap-3 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="paymentStatus"
+                    value={status}
+                    checked={paymentStatus === status}
+                    onChange={() => handleStatusChange(status)}
+                    className="h-4 w-4"
+                  />
+                  <span className={`text-sm ${paymentStatus === status ? textMain : textSub}`}>{status}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {/* Paid Amount Input */}
+          {showPaidAmountInput && (
+            <div>
+              <label className={`block text-sm font-semibold ${textSub} uppercase tracking-wider mb-2`}>
+                Paid Amount
+              </label>
+              <input
+                type="number"
+                value={paidAmount}
+                onChange={(e) => setPaidAmount(e.target.value)}
+                placeholder="0.00"
+                step="0.01"
+                min="0"
+                max={parseFloat(file.serviceCharge) || 0}
+                className={`w-full px-3 py-2 rounded-lg border ${inputClass} text-sm`}
+              />
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className={`px-6 py-4 border-t ${darkMode ? 'border-slate-800 bg-slate-800/30' : 'border-slate-100 bg-slate-50'} flex gap-2 justify-end`}>
+          <button
+            onClick={onClose}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+              darkMode
+                ? 'bg-slate-800 text-slate-100 hover:bg-slate-700'
+                : 'bg-slate-200 text-slate-900 hover:bg-slate-300'
+            }`}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleGenerateInvoice}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors bg-blue-600 text-white hover:bg-blue-700 flex items-center gap-2`}
+          >
+            <Printer className="h-4 w-4" />
+            Generate Invoice
+          </button>
         </div>
       </div>
     </div>
