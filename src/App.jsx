@@ -20,6 +20,7 @@ import {
   orderBy,
   where,
   getDocs,
+  getDoc,
   setDoc,
   increment,
   runTransaction,
@@ -75,7 +76,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Timer,
-  Monitor // Added missing import
+  Monitor,
+  Plane
 } from 'lucide-react';
 //vercel analytics
 import { Analytics } from "@vercel/analytics/react";
@@ -102,7 +104,16 @@ const ROLES = {
   ADMIN: 'Manager/Admin'
 };
 
+const FILE_TYPES = {
+  VISA: 'Visa',
+  AIR_TICKET: 'Air Ticket',
+  PACKAGE: 'Package'
+};
+
+const AIR_TICKET_PORTALS = ['Ticket Lagbe', 'TripLover', 'FirstTrip', 'AkijAir'];
+
 const STATUS = {
+  // Visa statuses
   RECEIVED_SALES: { label: 'Received (Sales)', color: 'bg-blue-100 text-blue-800', darkColor: 'bg-blue-900/30 text-blue-200', icon: Briefcase },
   HANDOVER_PROCESSING: { label: 'In Processing', color: 'bg-purple-100 text-purple-800', darkColor: 'bg-purple-900/30 text-purple-200', icon: ArrowRight },
   DOCS_PENDING: { label: 'Docs Pending', color: 'bg-yellow-100 text-yellow-800', darkColor: 'bg-yellow-900/30 text-yellow-200', icon: AlertCircle },
@@ -110,6 +121,17 @@ const STATUS = {
   SUBMITTED: { label: 'Submitted to Embassy', color: 'bg-indigo-100 text-indigo-800', darkColor: 'bg-indigo-900/30 text-indigo-200', icon: Send },
   FOLLOW_UP: { label: 'Follow Up Required', color: 'bg-red-100 text-red-800', darkColor: 'bg-red-900/30 text-red-200', icon: Clock },
   DONE: { label: 'Result Received', color: 'bg-green-100 text-green-800', darkColor: 'bg-green-900/30 text-green-200', icon: CheckCircle },
+  
+  // Air Ticket statuses
+  SALE_INITIATED: { label: 'Sale Initiated', color: 'bg-blue-100 text-blue-800', darkColor: 'bg-blue-900/30 text-blue-200', icon: Briefcase },
+  BOOKED: { label: 'Booked', color: 'bg-purple-100 text-purple-800', darkColor: 'bg-purple-900/30 text-purple-200', icon: CheckCircle },
+  ISSUED: { label: 'Ticket Issued', color: 'bg-green-100 text-green-800', darkColor: 'bg-green-900/30 text-green-200', icon: CheckCircle },
+  
+  // Package statuses
+  FLIGHT_ISSUED: { label: 'Flight Ticket Issued', color: 'bg-blue-100 text-blue-800', darkColor: 'bg-blue-900/30 text-blue-200', icon: CheckCircle },
+  HOTELS_BOOKED: { label: 'Hotels Booked', color: 'bg-purple-100 text-purple-800', darkColor: 'bg-purple-900/30 text-purple-200', icon: CheckCircle },
+  PICKUP_DROPOFF_BOOKED: { label: 'Pick & Drop Booked', color: 'bg-indigo-100 text-indigo-800', darkColor: 'bg-indigo-900/30 text-indigo-200', icon: CheckCircle },
+  PACKAGE_READY: { label: 'Package Ready', color: 'bg-green-100 text-green-800', darkColor: 'bg-green-900/30 text-green-200', icon: CheckCircle },
 };
 
 const RESULTS = {
@@ -146,10 +168,14 @@ const formatSimpleDate = (dateString) => {
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 };
 
-const getStartOf = (period) => {
+const getStartOf = (period, customStartDate = null) => {
   const now = new Date();
   const start = new Date(now);
   start.setHours(0, 0, 0, 0);
+  
+  if (period === 'custom' && customStartDate) {
+    return new Date(customStartDate);
+  }
   
   if (period === 'week') {
     const day = start.getDay();
@@ -163,8 +189,50 @@ const getStartOf = (period) => {
   return start;
 };
 
+const getEndOf = (period, customEndDate = null) => {
+  const now = new Date();
+  now.setHours(23, 59, 59, 999);
+  
+  if (period === 'custom' && customEndDate) {
+    const end = new Date(customEndDate);
+    end.setHours(23, 59, 59, 999);
+    return end;
+  }
+  
+  return now;
+};
+
 const formatCurrency = (amount) => {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount || 0);
+  return new Intl.NumberFormat('en-BD', { style: 'currency', currency: 'BDT' }).format(amount || 0);
+};
+
+// Working Hours Calculation Functions
+const calculateWorkingHours = (loginTime, logoutTime) => {
+  if (!loginTime || !logoutTime) return { hours: 0, shift: 0, overtime: 0 };
+  
+  const loginDate = loginTime.toDate ? loginTime.toDate() : new Date(loginTime);
+  const logoutDate = logoutTime.toDate ? logoutTime.toDate() : new Date(logoutTime);
+  
+  const diffMs = logoutDate - loginDate;
+  const diffHours = diffMs / (1000 * 60 * 60);
+  const roundedHours = Math.round(diffHours * 100) / 100; // Round to 2 decimals
+  
+  const SHIFT_HOURS = 8;
+  const shiftHours = Math.min(roundedHours, SHIFT_HOURS);
+  const overtime = Math.max(0, roundedHours - SHIFT_HOURS);
+  
+  return {
+    hours: roundedHours,
+    shift: shiftHours,
+    overtime: overtime
+  };
+};
+
+const formatHours = (hours) => {
+  if (hours === 0) return '-';
+  const wholeHours = Math.floor(hours);
+  const minutes = Math.round((hours - wholeHours) * 60);
+  return `${wholeHours}h ${minutes}m`;
 };
 
 // Animation Functions
@@ -456,6 +524,7 @@ export default function VisaTrackApp() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [files, setFiles] = useState([]);
   const [destinations, setDestinations] = useState([]); 
+  const [allPortals, setAllPortals] = useState(AIR_TICKET_PORTALS);
   const [allUsers, setAllUsers] = useState([]); 
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
@@ -480,9 +549,17 @@ export default function VisaTrackApp() {
   const [invoiceModalOpen, setInvoiceModalOpen] = useState(false);
   const [invoiceFile, setInvoiceFile] = useState(null);
   
+  // Specialized status modals
+  const [airTicketBookedModalOpen, setAirTicketBookedModalOpen] = useState(false);
+  const [airTicketIssuedModalOpen, setAirTicketIssuedModalOpen] = useState(false);
+  const [packageFlightIssuedModalOpen, setPackageFlightIssuedModalOpen] = useState(false);
+  const [packageHotelsBookedModalOpen, setPackageHotelsBookedModalOpen] = useState(false);
+  const [packagePickupDropoffModalOpen, setPackagePickupDropoffModalOpen] = useState(false);
+  
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedAction, setSelectedAction] = useState(null);
   const [fileToDelete, setFileToDelete] = useState(null);
+  const [miscCosts, setMiscCosts] = useState([]);
 
   useEffect(() => {
     const initAuth = async () => {
@@ -535,12 +612,17 @@ export default function VisaTrackApp() {
       if (docSnap.exists()) setDestinations(docSnap.data().items || []);
       else setDestinations(['Canada', 'UK', 'USA', 'Schengen Area', 'Australia', 'Dubai']);
     });
+    const portalsRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'portals');
+    const unsubPortals = onSnapshot(portalsRef, (docSnap) => {
+      if (docSnap.exists()) setAllPortals(docSnap.data().items || AIR_TICKET_PORTALS);
+      else setAllPortals(AIR_TICKET_PORTALS);
+    });
     const qUsers = collection(db, 'artifacts', appId, 'public', 'data', 'agency_users');
     const unsubUsers = onSnapshot(qUsers, (snapshot) => {
       const usersList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setAllUsers(usersList);
     });
-    return () => { unsubFiles(); unsubDest(); unsubUsers(); };
+    return () => { unsubFiles(); unsubDest(); unsubPortals(); unsubUsers(); };
   }, [user]);
 
   const myTasks = useMemo(() => {
@@ -722,36 +804,96 @@ export default function VisaTrackApp() {
     return () => clearInterval(cleanupInterval);
   }, []);
 
+  // Fetch misc costs for accounting
+  useEffect(() => {
+    if (!appUser || appUser.role !== ROLES.ADMIN) return;
+    
+    const q = collection(db, 'artifacts', appId, 'public', 'data', 'misc_costs');
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const costs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setMiscCosts(costs.sort((a, b) => b.createdAt?.seconds - a.createdAt?.seconds));
+    });
+    return () => unsubscribe();
+  }, [appUser]);
+
   const toggleDarkMode = () => setDarkMode(!darkMode);
 
   const addNewFile = async (data) => {
     if (!appUser) return;
     const fileId = `VT-${Math.floor(10000 + Math.random() * 90000)}`;
     const isNewSale = appUser.role !== ROLES.PROCESSING;
-    const newFile = {
+    
+    let newFile = {
       fileId: fileId,
       applicantName: data.applicantName,
-      passportNo: data.passportNo,
       contactNo: data.contactNo,
-      destination: data.destination,
-      serviceCharge: Number(data.serviceCharge) || 0,
-      cost: Number(data.cost) || 0,
-      reminderDate: data.reminderDate || null, 
-      isNewSale: isNewSale, 
-      status: 'RECEIVED_SALES',
-      assignedTo: appUser.name,
+      fileType: data.fileType || FILE_TYPES.VISA,
       createdBy: appUser.name,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
-      visaResult: null,
-      acknowledgedByProcessingAgent: false,
-      history: [{
-        action: 'File Received & Registered',
-        status: 'RECEIVED_SALES',
-        performedBy: appUser.name,
-        timestamp: Date.now()
-      }]
+      isNewSale: isNewSale,
+      assignedTo: appUser.name,
+      history: []
     };
+
+    // File type specific fields
+    if (data.fileType === FILE_TYPES.VISA) {
+      newFile = {
+        ...newFile,
+        passportNo: data.passportNo,
+        destination: data.destination,
+        serviceCharge: Number(data.serviceCharge) || 0,
+        cost: Number(data.cost) || 0,
+        reminderDate: data.reminderDate || null,
+        status: 'RECEIVED_SALES',
+        visaResult: null,
+        acknowledgedByProcessingAgent: false,
+        history: [{
+          action: 'File Received & Registered',
+          status: 'RECEIVED_SALES',
+          performedBy: appUser.name,
+          timestamp: Date.now()
+        }]
+      };
+    } else if (data.fileType === FILE_TYPES.AIR_TICKET) {
+      newFile = {
+        ...newFile,
+        airlineRoute: data.airlineRoute,
+        airlineSalePrice: Number(data.serviceCharge) || 0,
+        airlineCostPrice: Number(data.cost) || 0,
+        status: 'SALE_INITIATED',
+        bookingLastTime: null,
+        pnr: null,
+        portal: null,
+        history: [{
+          action: 'Air Ticket Sale Initiated',
+          status: 'SALE_INITIATED',
+          performedBy: appUser.name,
+          timestamp: Date.now()
+        }]
+      };
+    } else if (data.fileType === FILE_TYPES.PACKAGE) {
+      newFile = {
+        ...newFile,
+        packageCountries: data.packageCountries,
+        packageNights: data.packageNights,
+        includesFlight: data.includesFlight,
+        includesPickDrop: data.includesPickDrop,
+        packageSalePrice: Number(data.packageSalePrice) || 0,
+        packageCostPrice: Number(data.packageCostPrice) || 0,
+        status: 'SALE_INITIATED',
+        flightIssued: false,
+        hotelsBooked: false,
+        pickDropBooked: false,
+        history: [{
+          action: 'Package Sale Initiated',
+          status: 'SALE_INITIATED',
+          performedBy: appUser.name,
+          timestamp: Date.now()
+        }]
+      };
+    }
+
     await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'visa_files'), newFile);
     
     // Trigger new file creation animation
@@ -775,11 +917,39 @@ export default function VisaTrackApp() {
     } catch (err) { console.error("Error deleting file:", err); }
   };
 
-  const openUpdateModal = (file, action) => { setSelectedFile(file); setSelectedAction(action); setModalOpen(true); };
+  const openUpdateModal = (file, action) => { 
+    setSelectedFile(file); 
+    setSelectedAction(action); 
+    
+    // Route to specialized modals for specific statuses
+    const fileType = file.fileType;
+    
+    if (fileType === FILE_TYPES.AIR_TICKET) {
+      if (action === 'BOOKED') {
+        setAirTicketBookedModalOpen(true);
+      } else if (action === 'ISSUED') {
+        setAirTicketIssuedModalOpen(true);
+      } else {
+        setModalOpen(true);
+      }
+    } else if (fileType === FILE_TYPES.PACKAGE) {
+      if (action === 'FLIGHT_ISSUED') {
+        setPackageFlightIssuedModalOpen(true);
+      } else if (action === 'HOTELS_BOOKED') {
+        setPackageHotelsBookedModalOpen(true);
+      } else if (action === 'PICKUP_DROPOFF_BOOKED') {
+        setPackagePickupDropoffModalOpen(true);
+      } else {
+        setModalOpen(true);
+      }
+    } else {
+      setModalOpen(true);
+    }
+  };
   const openNoteModal = (file) => { setSelectedFile(file); setNoteModalOpen(true); };
   const openEditModal = (file) => { setSelectedFile(file); setEditModalOpen(true); };
 
-  const handleStatusUpdate = async (note, result = null, newAssignee = null, reminderDate = null, cost = null, acknowledgeProcessing = false) => {
+  const handleStatusUpdate = async (note, result = null, newAssignee = null, reminderDate = null, cost = null, acknowledgeProcessing = false, specializedData = null) => {
     if (!appUser || !selectedFile) return;
     
     let updateData = {
@@ -819,7 +989,65 @@ export default function VisaTrackApp() {
         history: [newHistoryItem, ...selectedFile.history]
       };
     }
-    // Handle regular status updates
+    // Handle Air Ticket status updates
+    else if (selectedFile.fileType === FILE_TYPES.AIR_TICKET && selectedAction) {
+      let actionText = `Updated to ${STATUS[selectedAction].label}`;
+      const newHistoryItem = {
+        action: note ? `${actionText} - Note: ${note}` : actionText,
+        status: selectedAction,
+        performedBy: appUser.name,
+        timestamp: Date.now()
+      };
+
+      const ticketUpdate = {
+        ...updateData,
+        status: selectedAction,
+        history: [newHistoryItem, ...selectedFile.history]
+      };
+
+      // Add specialized data if provided (from modals)
+      if (specializedData) {
+        if (specializedData.pnr) ticketUpdate.pnr = specializedData.pnr;
+        if (specializedData.portal) ticketUpdate.portal = specializedData.portal;
+        if (specializedData.bookingValidity) ticketUpdate.bookingValidity = specializedData.bookingValidity;
+      }
+
+      updateData = ticketUpdate;
+    }
+    // Handle Package status updates
+    else if (selectedFile.fileType === FILE_TYPES.PACKAGE && selectedAction) {
+      let actionText = `Updated to ${STATUS[selectedAction].label}`;
+      const newHistoryItem = {
+        action: note ? `${actionText} - Note: ${note}` : actionText,
+        status: selectedAction,
+        performedBy: appUser.name,
+        timestamp: Date.now()
+      };
+
+      const packageUpdate = {
+        ...updateData,
+        status: selectedAction,
+        history: [newHistoryItem, ...selectedFile.history]
+      };
+
+      // Update package flags based on status
+      if (selectedAction === 'FLIGHT_ISSUED') packageUpdate.flightIssued = true;
+      if (selectedAction === 'HOTELS_BOOKED') packageUpdate.hotelsBooked = true;
+      if (selectedAction === 'PICKUP_DROPOFF_BOOKED') packageUpdate.pickDropBooked = true;
+
+      // Add specialized data if provided (from modals)
+      if (specializedData) {
+        if (specializedData.flightPnr) packageUpdate.flightPnr = specializedData.flightPnr;
+        if (specializedData.flightPortal) packageUpdate.flightPortal = specializedData.flightPortal;
+        if (specializedData.hotelName) packageUpdate.hotelName = specializedData.hotelName;
+        if (specializedData.hotelFromDate) packageUpdate.hotelFromDate = specializedData.hotelFromDate;
+        if (specializedData.hotelToDate) packageUpdate.hotelToDate = specializedData.hotelToDate;
+        if (specializedData.routes) packageUpdate.routes = specializedData.routes;
+      }
+
+      updateData = packageUpdate;
+    }
+    // Handle regular status updates (Visa workflow)
     else if (selectedAction) {
       let actionText = `Updated status to ${STATUS[selectedAction].label}`;
       if (result) actionText = `Result Received: ${RESULTS[result].label}`;
@@ -876,6 +1104,11 @@ export default function VisaTrackApp() {
     const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id);
     await updateDoc(fileRef, updateData);
     setModalOpen(false);
+    setAirTicketBookedModalOpen(false);
+    setAirTicketIssuedModalOpen(false);
+    setPackageFlightIssuedModalOpen(false);
+    setPackageHotelsBookedModalOpen(false);
+    setPackagePickupDropoffModalOpen(false);
   };
 
   const handleAddNote = async (note) => {
@@ -896,6 +1129,59 @@ export default function VisaTrackApp() {
     const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id);
     await updateDoc(fileRef, { ...data, updatedAt: serverTimestamp() });
     setEditModalOpen(false);
+  };
+
+  const addMiscCost = async (data) => {
+    if (!appUser) return;
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'misc_costs'), {
+        description: data.description,
+        amount: Number(data.amount) || 0,
+        category: data.category || 'Other',
+        date: data.date || new Date().toISOString().split('T')[0],
+        notes: data.notes || '',
+        createdBy: appUser.name,
+        createdAt: serverTimestamp()
+      });
+    } catch (err) {
+      console.error('Error adding misc cost:', err);
+      alert('Failed to add expense');
+    }
+  };
+
+  const deleteMiscCost = async (costId) => {
+    if (confirm('Delete this expense entry?')) {
+      try {
+        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'misc_costs', costId));
+      } catch (err) {
+        console.error('Error deleting misc cost:', err);
+        alert('Failed to delete expense');
+      }
+    }
+  };
+
+  const grantAccountingAccess = async (userId) => {
+    if (confirm('Grant accounting tab access to this employee?')) {
+      try {
+        const userRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_users', userId);
+        await updateDoc(userRef, { accountingAccess: true });
+      } catch (err) {
+        console.error('Error granting access:', err);
+        alert('Failed to grant access');
+      }
+    }
+  };
+
+  const revokeAccountingAccess = async (userId) => {
+    if (confirm('Revoke accounting tab access from this employee?')) {
+      try {
+        const userRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_users', userId);
+        await updateDoc(userRef, { accountingAccess: false });
+      } catch (err) {
+        console.error('Error revoking access:', err);
+        alert('Failed to revoke access');
+      }
+    }
   };
 
   const containerClass = darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-800';
@@ -947,13 +1233,19 @@ export default function VisaTrackApp() {
               >
                 {mobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
               </button>
-              <div className="bg-blue-600 p-2 rounded-lg shadow-lg shadow-blue-500/20">
-                <FileText className="h-6 w-6 text-white" />
-              </div>
-              <div>
-                <h1 className={`text-xl font-bold ${textMain} hidden sm:block`}>VisaTrack Pro</h1>
-                <h1 className={`text-lg font-bold ${textMain} sm:hidden`}>VisaTrack</h1>
-              </div>
+              <button
+                onClick={() => setActiveTab('dashboard')}
+                className="flex items-center gap-2 cursor-pointer transition-opacity hover:opacity-80"
+                title="Go to Dashboard"
+              >
+                <div className="bg-blue-600 p-2 rounded-lg shadow-lg shadow-blue-500/20">
+                  <FileText className="h-6 w-6 text-white" />
+                </div>
+                <div>
+                  <h1 className={`text-xl font-bold ${textMain} hidden sm:block`}>VisaTrack Pro</h1>
+                  <h1 className={`text-lg font-bold ${textMain} sm:hidden`}>VisaTrack</h1>
+                </div>
+              </button>
             </div>
             
             <div className="flex items-center gap-2 md:gap-4">
@@ -962,6 +1254,7 @@ export default function VisaTrackApp() {
                  <NavButton active={activeTab === 'pipeline'} onClick={() => setActiveTab('pipeline')} icon={List} darkMode={darkMode}>Pipeline</NavButton>
                  <NavButton active={activeTab === 'add'} onClick={() => setActiveTab('add')} icon={Plus} darkMode={darkMode}>New File</NavButton>
                  <NavButton active={activeTab === 'reports'} onClick={() => setActiveTab('reports')} icon={Activity} darkMode={darkMode}>Stats</NavButton>
+                 {(appUser.role === ROLES.ADMIN || appUser.accountingAccess) && <NavButton active={activeTab === 'accounting'} onClick={() => setActiveTab('accounting')} icon={DollarSign} darkMode={darkMode}>Accounting</NavButton>}
                  {appUser.role === ROLES.ADMIN && (
                    <NavButton active={activeTab === 'admin'} onClick={() => setActiveTab('admin')} icon={Shield} darkMode={darkMode}>Admin</NavButton>
                  )}
@@ -1008,7 +1301,12 @@ export default function VisaTrackApp() {
                 <NavItem id="pipeline" icon={List} label="Work Pipeline" />
                 <NavItem id="add" icon={Plus} label="Register New File" />
                 <NavItem id="reports" icon={Activity} label="Statistical Reports" />
-                {appUser.role === ROLES.ADMIN && <NavItem id="admin" icon={Shield} label="Admin Panel" />}
+                {(appUser.role === ROLES.ADMIN || appUser.accountingAccess) && (
+                  <NavItem id="accounting" onClick={() => setActiveTab('accounting')} icon={DollarSign} label="Accounting" />
+                )}
+                {appUser.role === ROLES.ADMIN && (
+                  <NavItem id="admin" onClick={() => setActiveTab('admin')} icon={Shield} label="Admin Panel" />
+                )}
              </div>
              <div className={`mt-6 pt-6 border-t ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
                 <div className="flex items-center gap-3 px-4">
@@ -1031,6 +1329,7 @@ export default function VisaTrackApp() {
             files={files} 
             user={appUser} 
             destinations={destinations}
+            allUsers={allUsers}
             onOpenUpdateModal={openUpdateModal} 
             onOpenNoteModal={openNoteModal}
             onOpenEditModal={openEditModal}
@@ -1053,8 +1352,11 @@ export default function VisaTrackApp() {
           />
         )}
         {activeTab === 'reports' && <StatisticalReports files={files} currentUser={appUser} darkMode={darkMode} onOpenInvoiceModal={(f) => { setInvoiceFile(f); setInvoiceModalOpen(true); }} />}
+        {activeTab === 'accounting' && (appUser.role === ROLES.ADMIN || appUser.accountingAccess) && (
+          <AccountingPanel currentUser={appUser} files={files} miscCosts={miscCosts} onAddMiscCost={addMiscCost} onDeleteMiscCost={deleteMiscCost} darkMode={darkMode} isAdmin={appUser.role === ROLES.ADMIN} />
+        )}
         {activeTab === 'admin' && appUser.role === ROLES.ADMIN && (
-          <AdminPanel currentUser={appUser} destinations={destinations} darkMode={darkMode} />
+          <AdminPanel currentUser={appUser} destinations={destinations} darkMode={darkMode} onGrantAccountingAccess={grantAccountingAccess} onRevokeAccountingAccess={revokeAccountingAccess} />
         )}
       </main>
 
@@ -1143,6 +1445,75 @@ export default function VisaTrackApp() {
           onGenerateInvoice={generateInvoice}
         />
       )}
+
+      {/* Specialized Status Update Modals */}
+      {airTicketBookedModalOpen && (
+        <AirTicketBookedModal
+          isOpen={airTicketBookedModalOpen}
+          onClose={() => setAirTicketBookedModalOpen(false)}
+          onConfirm={(data) => {
+            handleStatusUpdate(null, null, null, null, null, false, data);
+            setAirTicketBookedModalOpen(false);
+          }}
+          file={selectedFile}
+          darkMode={darkMode}
+          portals={allPortals}
+        />
+      )}
+
+      {airTicketIssuedModalOpen && (
+        <AirTicketIssuedModal
+          isOpen={airTicketIssuedModalOpen}
+          onClose={() => setAirTicketIssuedModalOpen(false)}
+          onConfirm={(data) => {
+            handleStatusUpdate(null, null, null, null, null, false, data);
+            setAirTicketIssuedModalOpen(false);
+          }}
+          file={selectedFile}
+          darkMode={darkMode}
+          portals={allPortals}
+        />
+      )}
+
+      {packageFlightIssuedModalOpen && (
+        <PackageFlightIssuedModal
+          isOpen={packageFlightIssuedModalOpen}
+          onClose={() => setPackageFlightIssuedModalOpen(false)}
+          onConfirm={(data) => {
+            handleStatusUpdate(null, null, null, null, null, false, data);
+            setPackageFlightIssuedModalOpen(false);
+          }}
+          file={selectedFile}
+          darkMode={darkMode}
+          portals={allPortals}
+        />
+      )}
+
+      {packageHotelsBookedModalOpen && (
+        <PackageHotelsBookedModal
+          isOpen={packageHotelsBookedModalOpen}
+          onClose={() => setPackageHotelsBookedModalOpen(false)}
+          onConfirm={(data) => {
+            handleStatusUpdate(null, null, null, null, null, false, data);
+            setPackageHotelsBookedModalOpen(false);
+          }}
+          file={selectedFile}
+          darkMode={darkMode}
+        />
+      )}
+
+      {packagePickupDropoffModalOpen && (
+        <PackagePickupDropoffModal
+          isOpen={packagePickupDropoffModalOpen}
+          onClose={() => setPackagePickupDropoffModalOpen(false)}
+          onConfirm={(data) => {
+            handleStatusUpdate(null, null, null, null, null, false, data);
+            setPackagePickupDropoffModalOpen(false);
+          }}
+          file={selectedFile}
+          darkMode={darkMode}
+        />
+      )}
     </div>
   );
 }
@@ -1162,7 +1533,7 @@ function NavButton({ active, onClick, icon: Icon, children, darkMode }) {
   );
 }
 
-function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode, onOpenInvoiceModal }) {
+function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode, onOpenInvoiceModal, allUsers }) {
   const [destFilter, setDestFilter] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 20;
@@ -1173,6 +1544,112 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
   const inputClass = darkMode 
     ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
     : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+
+  // Calculate honors board metrics for different categories
+  const honorsMetrics = useMemo(() => {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    
+    // Honors board calculation start date - only count files from this date onwards
+    const honorsBoardStartDate = new Date(2025, 11, 16); // December 16, 2025 - change this to reset
+    const effectiveMonthStart = honorsBoardStartDate > monthStart ? honorsBoardStartDate : monthStart;
+    const effectiveTodayStart = honorsBoardStartDate > todayStart ? honorsBoardStartDate : todayStart;
+    
+    // Work hour calculation start date - separate reset for punctuality metrics
+    const workHourStartDate = new Date(2025, 11, 16); // December 16, 2025 - change this to reset work hours
+    const effectiveWorkHourStart = workHourStartDate > monthStart ? workHourStartDate : monthStart;
+    
+    // Create a map of user roles from allUsers
+    const userRoles = {};
+    allUsers.forEach(u => {
+      userRoles[u.fullName] = u.role;
+    });
+    
+    // Category 1: Earliest Today
+    const earliestToday = files
+      .filter(f => {
+        const createdDate = f.createdAt ? new Date(f.createdAt.seconds * 1000) : null;
+        return createdDate && createdDate >= effectiveTodayStart;
+      })
+      .reduce((earliest, f) => {
+        const createdDate = new Date(f.createdAt.seconds * 1000);
+        if (!earliest || createdDate < earliest.time) {
+          return { user: f.assignedTo || 'System', time: createdDate };
+        }
+        return earliest;
+      }, null);
+
+    // Category 2: Most Punctual (month) - Staff who arrives earliest (closest to 10 AM or least late)
+    const shiftStart = 10 * 60; // 10 AM in minutes
+    const punctualityByUser = {};
+    files.forEach(f => {
+      const createdDate = f.createdAt ? new Date(f.createdAt.seconds * 1000) : null;
+      if (createdDate && createdDate >= effectiveWorkHourStart) {
+        const user = f.assignedTo || 'System';
+        const hour = createdDate.getHours();
+        const minutes = createdDate.getMinutes();
+        const timeInMinutes = hour * 60 + minutes;
+        
+        if (!punctualityByUser[user]) {
+          punctualityByUser[user] = { user, times: [] };
+        }
+        punctualityByUser[user].times.push(timeInMinutes);
+      }
+    });
+    
+    // Calculate average arrival time for each user and find earliest
+    const punctualityScores = Object.values(punctualityByUser).map(entry => {
+      const avgTime = entry.times.reduce((a, b) => a + b, 0) / entry.times.length;
+      const minutesLate = Math.max(0, avgTime - shiftStart); // How many minutes late on average
+      return { user: entry.user, avgTime, minutesLate, count: entry.times.length };
+    });
+    const mostPunctual = punctualityScores.length > 0
+      ? punctualityScores.sort((a, b) => a.avgTime - b.avgTime)[0] // Earliest average time
+      : { user: 'N/A', count: 0 };
+
+    // Category 3: Best Sales (month) - Only Sales Reps with most files created
+    const salesByUser = {};
+    files.forEach(f => {
+      const createdDate = f.createdAt ? new Date(f.createdAt.seconds * 1000) : null;
+      if (createdDate && createdDate >= effectiveMonthStart && f.isNewSale !== false) {
+        const user = f.assignedTo || 'Sales Team';
+        // Only count if assigned user is a Sales Rep
+        if (userRoles[user] === ROLES.SALES) {
+          if (!salesByUser[user]) {
+            salesByUser[user] = { user, count: 0 };
+          }
+          salesByUser[user].count++;
+        }
+      }
+    });
+    const bestSales = Object.values(salesByUser).length > 0
+      ? Object.values(salesByUser).sort((a, b) => b.count - a.count)[0]
+      : { user: 'N/A', count: 0 };
+
+    // Category 4: Best Processing (month) - Most files SUBMITTED (not DONE)
+    const processingByUser = {};
+    files.forEach(f => {
+      const updatedDate = f.updatedAt ? new Date(f.updatedAt.seconds * 1000) : null;
+      if (updatedDate && updatedDate >= effectiveMonthStart && f.status === 'SUBMITTED') {
+        const user = f.assignedTo || 'Processing Team';
+        if (!processingByUser[user]) {
+          processingByUser[user] = { user, count: 0 };
+        }
+        processingByUser[user].count++;
+      }
+    });
+    const bestProcessing = Object.values(processingByUser).length > 0
+      ? Object.values(processingByUser).sort((a, b) => b.count - a.count)[0]
+      : { user: 'N/A', count: 0 };
+
+    return {
+      earliestToday,
+      mostPunctual,
+      bestSales,
+      bestProcessing
+    };
+  }, [files, allUsers]);
 
   const stats = useMemo(() => {
     const today = getStartOf('today');
@@ -1246,38 +1723,80 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
   };
 
   return (
-    <div className="space-y-8">
-      {/* Company Branding Section */}
-      <div className={`rounded-xl border p-6 md:p-8 ${cardClass}`}>
-        <div className="flex flex-col md:flex-row items-start md:items-center gap-6">
-          {/* Logo */}
-          <div className="flex-shrink-0">
+    <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+      {/* Left Sidebar: Company Branding & Honors Board */}
+      <div className="space-y-6">
+        {/* Company Branding Section - Vertical */}
+        <div className={`rounded-xl border p-4 ${cardClass}`}>
+          <div className="flex flex-col items-center text-center">
+            {/* Logo */}
             <img 
               src={logoImage} 
               alt="Company Logo" 
-              className="h-20 w-20 md:h-24 md:w-24 rounded-lg object-cover shadow-lg"
+              className="h-16 w-16 rounded-lg object-cover shadow-lg mb-3"
             />
-          </div>
-          
-          {/* Company Info */}
-          <div className="flex-grow">
-            <h2 className={`text-3xl md:text-4xl font-bold ${textMain} mb-2`}>{COMPANY_INFO.name}</h2>
-            <div className={`grid grid-cols-1 md:grid-cols-2 gap-3 ${textSub} text-sm`}>
+            
+            {/* Company Info */}
+            <h2 className={`text-lg font-bold ${textMain} mb-2`}>{COMPANY_INFO.name}</h2>
+            <div className={`${textSub} text-xs space-y-2`}>
               <div>
                 <p className={`font-semibold ${textMain}`}>Trade License</p>
-                <p>{COMPANY_INFO.tradeNum}</p>
+                <p className="truncate text-[10px]">{COMPANY_INFO.tradeNum}</p>
               </div>
               <div>
                 <p className={`font-semibold ${textMain}`}>CAAB No</p>
-                <p>{COMPANY_INFO.caabNum}</p>
+                <p className="truncate text-[10px]">{COMPANY_INFO.caabNum}</p>
               </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Honors Board - Top Performers by Category */}
+        <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
+          <div className={`px-4 py-3 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
+            <h3 className={`font-bold flex items-center gap-2 text-sm ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
+              ⭐ Honors Board
+            </h3>
+          </div>
+          <div className="p-4 space-y-4">
+            {/* Earliest Today */}
+            <div className={`p-3 rounded-lg border ${darkMode ? 'border-blue-800/50 bg-blue-900/20' : 'border-blue-200 bg-blue-50'}`}>
+              <p className={`text-[10px] font-semibold ${darkMode ? 'text-blue-400' : 'text-blue-600'} uppercase tracking-wide mb-2`}>🌅 Earliest Today</p>
+              {honorsMetrics.earliestToday ? (
+                <p className={`text-sm font-semibold ${textMain}`}>{honorsMetrics.earliestToday.user}</p>
+              ) : (
+                <p className="text-xs text-slate-400">No activity today</p>
+              )}
+            </div>
+
+            {/* Most Punctual */}
+            <div className={`p-3 rounded-lg border ${darkMode ? 'border-green-800/50 bg-green-900/20' : 'border-green-200 bg-green-50'}`}>
+              <p className={`text-[10px] font-semibold ${darkMode ? 'text-green-400' : 'text-green-600'} uppercase tracking-wide mb-2`}>✓ Most Punctual</p>
+              <p className={`text-sm font-semibold ${textMain}`}>{honorsMetrics.mostPunctual.user}</p>
+              <p className={`text-xs ${textSub}`}>{honorsMetrics.mostPunctual.count} logins this month</p>
+            </div>
+
+            {/* Best Sales */}
+            <div className={`p-3 rounded-lg border ${darkMode ? 'border-purple-800/50 bg-purple-900/20' : 'border-purple-200 bg-purple-50'}`}>
+              <p className={`text-[10px] font-semibold ${darkMode ? 'text-purple-400' : 'text-purple-600'} uppercase tracking-wide mb-2`}>💰 Best Sales</p>
+              <p className={`text-sm font-semibold ${textMain}`}>{honorsMetrics.bestSales.user}</p>
+              <p className={`text-xs ${textSub}`}>{honorsMetrics.bestSales.count} sales this month</p>
+            </div>
+
+            {/* Best Processing */}
+            <div className={`p-3 rounded-lg border ${darkMode ? 'border-amber-800/50 bg-amber-900/20' : 'border-amber-200 bg-amber-50'}`}>
+              <p className={`text-[10px] font-semibold ${darkMode ? 'text-amber-400' : 'text-amber-600'} uppercase tracking-wide mb-2`}>⚡ Best Processing</p>
+              <p className={`text-sm font-semibold ${textMain}`}>{honorsMetrics.bestProcessing.user}</p>
+              <p className={`text-xs ${textSub}`}>{honorsMetrics.bestProcessing.count} files completed this month</p>
             </div>
           </div>
         </div>
       </div>
 
-      {/* Stats Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
+      {/* Main Content Area */}
+      <div className="lg:col-span-3 space-y-8">
+        {/* Stats Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
         <div className={`p-4 md:p-6 rounded-xl border flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-0 ${cardClass}`}>
           <div>
             <p className={`text-xs md:text-sm font-medium ${textSub}`}>Sales Today</p>
@@ -1299,9 +1818,9 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
           </div>
           <div className={`${darkMode ? 'bg-indigo-900/30 text-indigo-400' : 'bg-indigo-100 text-indigo-600'} p-2 md:p-3 rounded-full w-fit`}><Send className="h-5 md:h-6 w-5 md:w-6"/></div>
         </div>
-      </div>
+        </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Main Feed / Search */}
         <div className="lg:col-span-2 space-y-6">
           <div className="flex flex-col sm:flex-row justify-between gap-4">
@@ -1444,12 +1963,14 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
               </div>
            </div>
         </div>
+        </div>
       </div>
     </div>
   );
 }
 
 function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
+  const [fileType, setFileType] = useState(FILE_TYPES.VISA);
   const [formData, setFormData] = useState({ 
     applicantName: '', 
     passportNo: '', 
@@ -1457,8 +1978,38 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
     destination: '',
     serviceCharge: '',
     cost: '',
-    reminderDate: ''
+    reminderDate: '',
+    fileType: FILE_TYPES.VISA,
+    // Air Ticket fields
+    airlinePassenger: '',
+    airlineRoute: '',
+    airlineSalePrice: '',
+    airlineCostPrice: '',
+    // Package fields
+    packageCountries: [],
+    packageNights: {},
+    includesFlight: false,
+    includesPickDrop: false,
+    packageSalePrice: '',
+    packageCostPrice: ''
   });
+  const [countries, setCountries] = useState([]);
+
+  useEffect(() => {
+    // Fetch countries from admin settings
+    const fetchCountries = async () => {
+      try {
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'countries');
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          setCountries(docSnap.data().items || []);
+        }
+      } catch (err) {
+        console.error('Error fetching countries:', err);
+      }
+    };
+    fetchCountries();
+  }, []);
 
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-lg';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
@@ -1467,96 +2018,280 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
     ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
     : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
 
+  const handleFileTypeChange = (type) => {
+    setFileType(type);
+    setFormData({...formData, fileType: type});
+  };
+
+  const handleCountryToggle = (country) => {
+    const updated = formData.packageCountries.includes(country)
+      ? formData.packageCountries.filter(c => c !== country)
+      : [...formData.packageCountries, country];
+    setFormData({...formData, packageCountries: updated});
+  };
+
+  const handleNightsChange = (country, nights) => {
+    setFormData({
+      ...formData,
+      packageNights: {...formData.packageNights, [country]: nights}
+    });
+  };
+
   const handleSubmit = (e) => {
     e.preventDefault();
-    onSubmit(formData);
+    onSubmit({...formData, fileType});
   };
 
   return (
-    <div className={`max-w-2xl mx-auto rounded-xl p-4 sm:p-8 border ${cardClass}`}>
+    <div className={`max-w-3xl mx-auto rounded-xl p-4 sm:p-8 border ${cardClass}`}>
       <h2 className={`text-xl sm:text-2xl font-bold mb-4 sm:mb-6 ${textMain}`}>Register New File</h2>
       <form onSubmit={handleSubmit} className="space-y-4 sm:space-y-6">
+        {/* File Type Selector */}
+        <div>
+          <label className={`block text-sm font-medium mb-3 ${labelClass}`}>File Type</label>
+          <div className="flex gap-2 flex-wrap">
+            {Object.values(FILE_TYPES).map(type => (
+              <button
+                key={type}
+                type="button"
+                onClick={() => handleFileTypeChange(type)}
+                className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                  fileType === type 
+                    ? 'bg-blue-600 text-white' 
+                    : darkMode ? 'bg-slate-800 text-slate-300 hover:bg-slate-700' : 'bg-slate-200 text-slate-700 hover:bg-slate-300'
+                }`}
+              >
+                {type}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Common Fields for All Types */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6">
           <div className="col-span-1 sm:col-span-2">
-            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Applicant Full Name</label>
+            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Applicant/Passenger Full Name</label>
             <input 
               required
               className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
-              placeholder="As on passport"
+              placeholder={fileType === FILE_TYPES.VISA ? "As on passport" : "Passenger name"}
               value={formData.applicantName}
               onChange={e => setFormData({...formData, applicantName: e.target.value})}
             />
           </div>
-          <div>
-            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Passport Number</label>
-            <input 
-              required
-              className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
-              value={formData.passportNo}
-              onChange={e => setFormData({...formData, passportNo: e.target.value})}
-            />
-          </div>
-          <div>
-            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Contact Number</label>
-            <input 
-              required
-              className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
-              placeholder="+880..."
-              value={formData.contactNo}
-              onChange={e => setFormData({...formData, contactNo: e.target.value})}
-            />
-          </div>
-          <div>
-            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Destination Country</label>
-            <select
-              required
-              className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
-              value={formData.destination}
-              onChange={e => setFormData({...formData, destination: e.target.value})}
-            >
-               <option value="">Select Destination</option>
-               {destinations.map(d => <option key={d} value={d}>{d}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Service Charge - ৳ (Optional)</label>
-            <div className="relative">
-              <span className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 text-sm font-bold">৳</span>
+
+          {fileType === FILE_TYPES.VISA && (
+            <>
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Passport Number</label>
+                <input 
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  value={formData.passportNo}
+                  onChange={e => setFormData({...formData, passportNo: e.target.value})}
+                />
+              </div>
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Contact Number</label>
+                <input 
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  placeholder="+880..."
+                  value={formData.contactNo}
+                  onChange={e => setFormData({...formData, contactNo: e.target.value})}
+                />
+              </div>
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Destination Country</label>
+                <select
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  value={formData.destination}
+                  onChange={e => setFormData({...formData, destination: e.target.value})}
+                >
+                   <option value="">Select Destination</option>
+                   {destinations.map(d => <option key={d} value={d}>{d}</option>)}
+                </select>
+              </div>
+            </>
+          )}
+
+          {fileType === FILE_TYPES.AIR_TICKET && (
+            <>
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Route (From - To)</label>
+                <input 
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  placeholder="e.g., Dhaka - Bangkok"
+                  value={formData.airlineRoute}
+                  onChange={e => setFormData({...formData, airlineRoute: e.target.value})}
+                />
+              </div>
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Contact Number</label>
+                <input 
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  placeholder="+880..."
+                  value={formData.contactNo}
+                  onChange={e => setFormData({...formData, contactNo: e.target.value})}
+                />
+              </div>
+            </>
+          )}
+
+          {fileType === FILE_TYPES.PACKAGE && (
+            <>
+              <div className="col-span-1 sm:col-span-2">
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Countries</label>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {countries.map(country => (
+                    <label key={country} className={`flex items-center gap-2 p-2 rounded cursor-pointer ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-100'}`}>
+                      <input
+                        type="checkbox"
+                        checked={formData.packageCountries.includes(country)}
+                        onChange={() => handleCountryToggle(country)}
+                        className="h-4 w-4"
+                      />
+                      <span className="text-sm">{country}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              {formData.packageCountries.map(country => (
+                <div key={country}>
+                  <label className={`block text-sm font-medium mb-2 ${labelClass}`}>{country} - Nights</label>
+                  <input
+                    type="number"
+                    min="1"
+                    required
+                    className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                    value={formData.packageNights[country] || ''}
+                    onChange={e => handleNightsChange(country, e.target.value)}
+                  />
+                </div>
+              ))}
+
+              <div className="col-span-1 sm:col-span-2">
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Package Options</label>
+                <div className="space-y-2">
+                  <label className={`flex items-center gap-2 p-2 rounded cursor-pointer ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-100'}`}>
+                    <input
+                      type="checkbox"
+                      checked={formData.includesFlight}
+                      onChange={e => setFormData({...formData, includesFlight: e.target.checked})}
+                      className="h-4 w-4"
+                    />
+                    <span className="text-sm">Including Flight?</span>
+                  </label>
+                  <label className={`flex items-center gap-2 p-2 rounded cursor-pointer ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-100'}`}>
+                    <input
+                      type="checkbox"
+                      checked={formData.includesPickDrop}
+                      onChange={e => setFormData({...formData, includesPickDrop: e.target.checked})}
+                      className="h-4 w-4"
+                    />
+                    <span className="text-sm">Including Pick & Drop?</span>
+                  </label>
+                </div>
+              </div>
+
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Sale Price - ৳</label>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 text-sm font-bold">৳</span>
+                  <input 
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    required
+                    className={`w-full pl-10 pr-3 sm:pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                    placeholder="0.00"
+                    value={formData.packageSalePrice}
+                    onChange={e => setFormData({...formData, packageSalePrice: e.target.value})}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Cost Price - ৳</label>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 text-sm font-bold">৳</span>
+                  <input 
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    required
+                    className={`w-full pl-10 pr-3 sm:pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                    placeholder="0.00"
+                    value={formData.packageCostPrice}
+                    onChange={e => setFormData({...formData, packageCostPrice: e.target.value})}
+                  />
+                </div>
+              </div>
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Contact Number</label>
+                <input 
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  placeholder="+880..."
+                  value={formData.contactNo}
+                  onChange={e => setFormData({...formData, contactNo: e.target.value})}
+                />
+              </div>
+            </>
+          )}
+
+          {(fileType === FILE_TYPES.VISA || fileType === FILE_TYPES.AIR_TICKET) && fileType !== FILE_TYPES.PACKAGE && (
+            <>
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Service Charge - ৳</label>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 text-sm font-bold">৳</span>
+                  <input 
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    required
+                    className={`w-full pl-10 pr-3 sm:pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                    placeholder="0.00"
+                    value={formData.serviceCharge}
+                    onChange={e => setFormData({...formData, serviceCharge: e.target.value})}
+                  />
+                </div>
+              </div>
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Cost - ৳</label>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 text-sm font-bold">৳</span>
+                  <input 
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    required
+                    className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                    placeholder="0.00"
+                    value={formData.cost}
+                    onChange={e => setFormData({...formData, cost: e.target.value})}
+                  />
+                </div>
+              </div>
+            </>
+          )}
+
+          {fileType === FILE_TYPES.VISA && (
+            <div>
+              <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Reminder Date (Optional)</label>
               <input 
-                type="number"
-                min="0"
-                step="0.01"
-                className={`w-full pl-10 pr-3 sm:pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
-                placeholder="0.00"
-                value={formData.serviceCharge}
-                onChange={e => setFormData({...formData, serviceCharge: e.target.value})}
+                  type="date"
+                  className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                  value={formData.reminderDate}
+                  onChange={e => setFormData({...formData, reminderDate: e.target.value})}
               />
             </div>
-          </div>
-          <div>
-            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Cost - ৳ (Optional)</label>
-            <div className="relative">
-              <span className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 text-sm font-bold">৳</span>
-              <input 
-                type="number"
-                min="0"
-                step="0.01"
-                className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
-                placeholder="0.00"
-                value={formData.cost}
-                onChange={e => setFormData({...formData, cost: e.target.value})}
-              />
-            </div>
-          </div>
-          <div>
-            <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Reminder Date (Optional)</label>
-            <input 
-                type="date"
-                className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
-                value={formData.reminderDate}
-                onChange={e => setFormData({...formData, reminderDate: e.target.value})}
-            />
-          </div>
+          )}
         </div>
         
         <div className="flex justify-end gap-3 pt-4">
@@ -1628,11 +2363,14 @@ function PipelineView({ files, darkMode }) {
   );
 }
 
-function AdminPanel({ currentUser, destinations, darkMode }) {
+function AdminPanel({ currentUser, destinations, darkMode, onGrantAccountingAccess, onRevokeAccountingAccess }) {
   const [users, setUsers] = useState([]);
   const [userForm, setUserForm] = useState({ fullName: '', username: '', password: '', role: ROLES.SALES });
   const [newDest, setNewDest] = useState('');
+  const [newPortal, setNewPortal] = useState('');
+  const [portals, setPortals] = useState([]);
   const [isTrusted, setIsTrusted] = useState(() => localStorage.getItem('vt_trusted_device') === 'true');
+  const [activeSessions, setActiveSessions] = useState([]);
   
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
@@ -1645,6 +2383,30 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const usersData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setUsers(usersData);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'portals');
+    const unsubscribe = onSnapshot(docRef, (snapshot) => {
+      if (snapshot.exists()) {
+        setPortals(snapshot.data().items || AIR_TICKET_PORTALS);
+      } else {
+        setPortals(AIR_TICKET_PORTALS);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    const attQ = query(
+      collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
+      where('logoutTime', '==', null)
+    );
+    const unsubscribe = onSnapshot(attQ, (snapshot) => {
+      const sessions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setActiveSessions(sessions);
     });
     return () => unsubscribe();
   }, []);
@@ -1696,6 +2458,22 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
     }
   };
 
+  const handleAddPortal = async (e) => {
+    e.preventDefault();
+    if (!newPortal.trim()) return;
+    
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'portals');
+    await setDoc(docRef, { items: arrayUnion(newPortal.trim()) }, { merge: true });
+    setNewPortal('');
+  };
+
+  const handleDeletePortal = async (portal) => {
+    if (confirm(`Remove ${portal} from portal list?`)) {
+      const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'portals');
+      await updateDoc(docRef, { items: arrayRemove(portal) });
+    }
+  };
+
   const toggleTrust = () => {
     if (isTrusted) {
         localStorage.removeItem('vt_trusted_device');
@@ -1703,6 +2481,32 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
     } else {
         localStorage.setItem('vt_trusted_device', 'true');
         setIsTrusted(true);
+    }
+  };
+
+  const endSessionForUser = async (sessionId, userName) => {
+    if (confirm(`End attendance session for ${userName}?`)) {
+      try {
+        const ref = doc(db, 'artifacts', appId, 'public', 'data', 'attendance', sessionId);
+        await updateDoc(ref, { logoutTime: serverTimestamp() });
+      } catch (err) {
+        console.error('Error ending session:', err);
+        alert('Failed to end session');
+      }
+    }
+  };
+
+  const endAllActiveSessions = async () => {
+    if (confirm(`End all ${activeSessions.length} active attendance sessions?`)) {
+      try {
+        for (const session of activeSessions) {
+          const ref = doc(db, 'artifacts', appId, 'public', 'data', 'attendance', session.id);
+          await updateDoc(ref, { logoutTime: serverTimestamp() });
+        }
+      } catch (err) {
+        console.error('Error ending all sessions:', err);
+        alert('Failed to end some sessions');
+      }
     }
   };
 
@@ -1781,24 +2585,48 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
              <div className={`divide-y max-h-64 overflow-y-auto ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
                {users.map(u => (
                  <div key={u.id} className={`p-4 flex items-center justify-between transition-colors ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`}>
-                   <div className="flex items-center gap-3">
+                   <div className="flex items-center gap-3 flex-1">
                      <div className={`h-8 w-8 rounded-full flex items-center justify-center ${darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-500'}`}>
                        <User className="h-4 w-4" />
                      </div>
-                     <div>
+                     <div className="flex-1">
                        <p className={`font-medium text-sm ${textMain}`}>{u.fullName}</p>
                        <p className="text-[10px] text-slate-500 uppercase tracking-wide">{u.role} • {u.username}</p>
+                       {u.accountingAccess && <p className={`text-[10px] ${darkMode ? 'text-emerald-400' : 'text-emerald-600'}`}> Accounting Access Granted</p>}
                      </div>
                    </div>
-                   {u.id !== currentUser.id && (
-                     <button 
-                       onClick={() => handleDeleteUser(u.id)}
-                       className="text-slate-400 hover:text-red-600 p-1"
-                       title="Delete User"
-                     >
-                       <Trash2 className="h-4 w-4" />
-                     </button>
-                   )}
+                   <div className="flex items-center gap-2">
+                     {u.role !== ROLES.ADMIN && (
+                       <>
+                         {u.accountingAccess ? (
+                           <button 
+                             onClick={() => onRevokeAccountingAccess(u.id)}
+                             className={`px-2 py-1 rounded text-xs font-medium transition-colors ${darkMode ? 'bg-red-900/30 text-red-300 hover:bg-red-900/50' : 'bg-red-100 text-red-700 hover:bg-red-200'}`}
+                             title="Revoke Accounting Access"
+                           >
+                             Revoke Access
+                           </button>
+                         ) : (
+                           <button 
+                             onClick={() => onGrantAccountingAccess(u.id)}
+                             className={`px-2 py-1 rounded text-xs font-medium transition-colors ${darkMode ? 'bg-emerald-900/30 text-emerald-300 hover:bg-emerald-900/50' : 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200'}`}
+                             title="Grant Accounting Access"
+                           >
+                             Grant Access
+                           </button>
+                         )}
+                       </>
+                     )}
+                     {u.id !== currentUser.id && (
+                       <button 
+                         onClick={() => handleDeleteUser(u.id)}
+                         className="text-slate-400 hover:text-red-600 p-1"
+                         title="Delete User"
+                       >
+                         <Trash2 className="h-4 w-4" />
+                       </button>
+                     )}
+                   </div>
                  </div>
                ))}
              </div>
@@ -1834,6 +2662,81 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
           </div>
         </div>
 
+        {/* Portal Settings Section */}
+        <div className={`rounded-xl border h-fit ${cardClass}`}>
+          <div className={`px-6 py-4 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
+             <h3 className={`font-bold flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}><Plane className="h-5 w-5"/> Airline Portals</h3>
+          </div>
+          <div className={`p-4 border-b ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+             <form onSubmit={handleAddPortal} className="flex gap-2">
+               <input 
+                 className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                 placeholder="Add Portal..."
+                 value={newPortal}
+                 onChange={e => setNewPortal(e.target.value)}
+               />
+               <button type="submit" className="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700"><Plus className="h-5 w-5"/></button>
+             </form>
+          </div>
+          <div className="p-2 max-h-[400px] overflow-y-auto">
+             <div className="flex flex-wrap gap-2">
+               {portals.map(p => (
+                 <span key={p} className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm border ${darkMode ? 'bg-slate-800 text-slate-300 border-slate-700' : 'bg-slate-100 text-slate-700 border-slate-200'}`}>
+                    {p}
+                    <button onClick={() => handleDeletePortal(p)} className="hover:text-red-600 text-slate-400 ml-1"><X className="h-3 w-3"/></button>
+                 </span>
+               ))}
+               {portals.length === 0 && <span className="text-slate-400 text-sm p-2">No portals set.</span>}
+             </div>
+          </div>
+        </div>
+
+      </div>
+
+      {/* Attendance Sessions Management Section */}
+      <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
+        <div className={`px-6 py-4 border-b flex justify-between items-center ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
+          <h3 className={`font-bold flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
+            <Clock className="h-5 w-5"/> Active Attendance Sessions
+          </h3>
+          <span className={`text-xs px-2 py-1 rounded-full ${darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600'}`}>{activeSessions.length} Active</span>
+        </div>
+        
+        {activeSessions.length === 0 ? (
+          <div className={`p-6 text-center ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+            <p className="text-sm">No active attendance sessions</p>
+          </div>
+        ) : (
+          <>
+            <div className={`p-4 border-b flex gap-2 ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-100 bg-slate-50'}`}>
+              <button
+                onClick={endAllActiveSessions}
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-medium text-sm"
+              >
+                <LogOut className="h-4 w-4"/> End All Sessions
+              </button>
+            </div>
+
+            <div className={`divide-y max-h-80 overflow-y-auto ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
+              {activeSessions.map(session => (
+                <div key={session.id} className={`p-4 flex items-center justify-between transition-colors ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`}>
+                  <div className="flex-1">
+                    <p className={`font-medium ${textMain}`}>{session.userName}</p>
+                    <p className={`text-xs ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>
+                      Login: {formatTimeOnly(session.loginTime)} • Date: {session.date}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => endSessionForUser(session.id, session.userName)}
+                    className="px-3 py-1.5 bg-red-500 text-white text-sm rounded-lg hover:bg-red-600 transition-colors"
+                  >
+                    End
+                  </button>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -1861,6 +2764,50 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
   const getAvailableActions = () => {
     const actions = [];
     
+    // Air Ticket workflow - Any staff can update
+    if (file.fileType === FILE_TYPES.AIR_TICKET) {
+      if (file.status === 'SALE_INITIATED') {
+        actions.push({ key: 'BOOKED', label: STATUS['BOOKED'].label, isSpecial: true });
+      }
+      if (file.status === 'BOOKED') {
+        actions.push({ key: 'ISSUED', label: STATUS['ISSUED'].label, isSpecial: true });
+      }
+      return actions;
+    }
+    
+    // Package workflow - Any staff can update
+    if (file.fileType === FILE_TYPES.PACKAGE) {
+      const actions_pkg = [];
+      
+      // From SALE_INITIATED
+      if (file.status === 'SALE_INITIATED') {
+        if (file.includesFlight) {
+          actions_pkg.push({ key: 'FLIGHT_ISSUED', label: STATUS['FLIGHT_ISSUED'].label });
+        } else {
+          actions_pkg.push({ key: 'HOTELS_BOOKED', label: STATUS['HOTELS_BOOKED'].label });
+        }
+      }
+      // From FLIGHT_ISSUED
+      else if (file.status === 'FLIGHT_ISSUED') {
+        actions_pkg.push({ key: 'HOTELS_BOOKED', label: STATUS['HOTELS_BOOKED'].label });
+      }
+      // From HOTELS_BOOKED
+      else if (file.status === 'HOTELS_BOOKED') {
+        if (file.includesPickDrop) {
+          actions_pkg.push({ key: 'PICKUP_DROPOFF_BOOKED', label: STATUS['PICKUP_DROPOFF_BOOKED'].label });
+        } else {
+          actions_pkg.push({ key: 'PACKAGE_READY', label: STATUS['PACKAGE_READY'].label });
+        }
+      }
+      // From PICKUP_DROPOFF_BOOKED
+      else if (file.status === 'PICKUP_DROPOFF_BOOKED') {
+        actions_pkg.push({ key: 'PACKAGE_READY', label: STATUS['PACKAGE_READY'].label });
+      }
+      
+      return actions_pkg;
+    }
+    
+    // Visa workflow (existing logic)
     // Sales Rep can send to processing
     if (user.role === ROLES.SALES && file.status === 'RECEIVED_SALES') {
       actions.push({ key: 'SEND_TO_PROCESSING', label: 'Sent to Processing', isSpecial: true });
@@ -1914,6 +2861,12 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
               <div className="flex items-center gap-2 mb-1">
                  <h3 className={`text-lg font-bold ${textMain}`}>{file.applicantName}</h3>
                  <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${darkMode ? 'bg-slate-800 text-slate-400 border-slate-700' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>{file.fileId || 'NO-ID'}</span>
+                 <span className={`text-[10px] px-2 py-0.5 rounded font-semibold ${
+                   file.fileType === FILE_TYPES.VISA ? (darkMode ? 'bg-blue-900/30 text-blue-400' : 'bg-blue-100 text-blue-700') :
+                   file.fileType === FILE_TYPES.AIR_TICKET ? (darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-100 text-purple-700') :
+                   file.fileType === FILE_TYPES.PACKAGE ? (darkMode ? 'bg-emerald-900/30 text-emerald-400' : 'bg-emerald-100 text-emerald-700') :
+                   ''
+                 }`}>{file.fileType || FILE_TYPES.VISA}</span>
               </div>
               
             <div className={`flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm ${textSub}`}>
@@ -2024,6 +2977,53 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
 
       {expanded && (
         <div className={`p-5 border-t ${darkMode ? 'bg-slate-950/50 border-slate-800' : 'bg-slate-50 border-slate-100'}`}>
+          {/* Display Air Ticket & Package Details */}
+          {file.fileType === FILE_TYPES.AIR_TICKET && (file.pnr || file.portal || file.bookingValidity) && (
+            <div className="mb-6 p-4 rounded-lg border border-purple-200 dark:border-purple-800 bg-purple-50 dark:bg-purple-900/20">
+              <h4 className="text-sm font-semibold text-purple-700 dark:text-purple-300 mb-3">✈️ Flight Details</h4>
+              <div className="space-y-2 text-sm">
+                {file.pnr && <p><span className="font-medium">PNR:</span> {file.pnr}</p>}
+                {file.portal && <p><span className="font-medium">Portal:</span> {file.portal}</p>}
+                {file.bookingValidity && <p><span className="font-medium">Valid Until:</span> {file.bookingValidity.date} {file.bookingValidity.time}</p>}
+              </div>
+            </div>
+          )}
+
+          {file.fileType === FILE_TYPES.PACKAGE && (file.flightPnr || file.hotelName || file.routes) && (
+            <div className="mb-6 p-4 rounded-lg border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-900/20">
+              <h4 className="text-sm font-semibold text-emerald-700 dark:text-emerald-300 mb-3">📦 Package Details</h4>
+              <div className="space-y-3 text-sm">
+                {file.flightPnr && (
+                  <div className="pb-3 border-b border-emerald-200 dark:border-emerald-800">
+                    <p className="font-medium">Flight Booking</p>
+                    <p className="text-xs"><span className="font-medium">PNR:</span> {file.flightPnr}</p>
+                    {file.flightPortal && <p className="text-xs"><span className="font-medium">Portal:</span> {file.flightPortal}</p>}
+                  </div>
+                )}
+                {file.hotelName && (
+                  <div className="pb-3 border-b border-emerald-200 dark:border-emerald-800">
+                    <p className="font-medium">Hotel Booking</p>
+                    <p className="text-xs"><span className="font-medium">Hotel:</span> {file.hotelName}</p>
+                    {file.hotelFromDate && <p className="text-xs"><span className="font-medium">Dates:</span> {file.hotelFromDate} to {file.hotelToDate}</p>}
+                  </div>
+                )}
+                {file.routes && file.routes.length > 0 && (
+                  <div>
+                    <p className="font-medium mb-2">Pick & Drop Routes</p>
+                    <div className="space-y-2">
+                      {file.routes.map((route, idx) => (
+                        <div key={idx} className="text-xs bg-white dark:bg-slate-800 p-2 rounded border border-emerald-100 dark:border-emerald-700">
+                          <p><span className="font-medium">Trip {idx + 1}:</span> {route.from} → {route.to}</p>
+                          <p><span className="font-medium">Vendor:</span> {route.vendor}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">Audit Trail</h4>
           <div className="space-y-4">
             {file.history.map((entry, idx) => (
@@ -2234,6 +3234,420 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
         </div>
       </div>
     );
+}
+
+// Air Ticket - BOOKED Status Modal
+function AirTicketBookedModal({ isOpen, onClose, onConfirm, file, darkMode, portals }) {
+  const [pnr, setPnr] = useState(file?.pnr || '');
+  const [portal, setPortal] = useState(file?.portal || '');
+  const [bookingDate, setBookingDate] = useState(file?.bookingValidity?.date || '');
+  const [bookingTime, setBookingTime] = useState(file?.bookingValidity?.time || '');
+
+  if (!isOpen) return null;
+
+  const cardClass = darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900';
+  const inputClass = darkMode 
+    ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
+    : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+
+  const handleSubmit = () => {
+    if (!pnr || !portal || !bookingDate || !bookingTime) {
+      alert("Please fill in all fields");
+      return;
+    }
+    onConfirm({ pnr, portal, bookingValidity: { date: bookingDate, time: bookingTime } });
+    setPnr('');
+    setPortal('');
+    setBookingDate('');
+    setBookingTime('');
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
+        <h3 className="text-lg font-bold mb-2">Flight Ticket Booked</h3>
+        <p className="text-sm text-slate-500 mb-6">Enter booking details for <b>{file?.applicantName}</b></p>
+        
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">PNR / Booking Reference</label>
+            <input
+              type="text"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="e.g., ABC123"
+              value={pnr}
+              onChange={(e) => setPnr(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Portal</label>
+            <select
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              value={portal}
+              onChange={(e) => setPortal(e.target.value)}
+            >
+              <option value="">Select Portal</option>
+              {portals.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Booking Validity Date</label>
+            <input
+              type="date"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              value={bookingDate}
+              onChange={(e) => setBookingDate(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Booking Validity Time</label>
+            <input
+              type="time"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              value={bookingTime}
+              onChange={(e) => setBookingTime(e.target.value)}
+            />
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-3 pt-6">
+          <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
+          <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">Save Booking</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Air Ticket - ISSUED Status Modal
+function AirTicketIssuedModal({ isOpen, onClose, onConfirm, file, darkMode, portals }) {
+  const [pnr, setPnr] = useState(file?.pnr || '');
+  const [portal, setPortal] = useState(file?.portal || '');
+  const [bookingDate, setBookingDate] = useState(file?.bookingValidity?.date || '');
+  const [bookingTime, setBookingTime] = useState(file?.bookingValidity?.time || '');
+
+  if (!isOpen) return null;
+
+  const cardClass = darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900';
+  const inputClass = darkMode 
+    ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
+    : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+
+  const handleSubmit = () => {
+    if (!pnr || !portal || !bookingDate || !bookingTime) {
+      alert("Please fill in all fields");
+      return;
+    }
+    onConfirm({ pnr, portal, bookingValidity: { date: bookingDate, time: bookingTime } });
+    setPnr('');
+    setPortal('');
+    setBookingDate('');
+    setBookingTime('');
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
+        <h3 className="text-lg font-bold mb-2">Flight Ticket Issued</h3>
+        <p className="text-sm text-slate-500 mb-6">Update ticket details for <b>{file?.applicantName}</b></p>
+        
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">PNR / Booking Reference</label>
+            <input
+              type="text"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="e.g., ABC123"
+              value={pnr}
+              onChange={(e) => setPnr(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Portal</label>
+            <select
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              value={portal}
+              onChange={(e) => setPortal(e.target.value)}
+            >
+              <option value="">Select Portal</option>
+              {portals.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Booking Validity Date</label>
+            <input
+              type="date"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              value={bookingDate}
+              onChange={(e) => setBookingDate(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Booking Validity Time</label>
+            <input
+              type="time"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              value={bookingTime}
+              onChange={(e) => setBookingTime(e.target.value)}
+            />
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-3 pt-6">
+          <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
+          <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">Update Ticket</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Package - FLIGHT_ISSUED Status Modal
+function PackageFlightIssuedModal({ isOpen, onClose, onConfirm, file, darkMode, portals }) {
+  const [pnr, setPnr] = useState(file?.flightPnr || '');
+  const [portal, setPortal] = useState(file?.flightPortal || '');
+
+  if (!isOpen) return null;
+
+  const cardClass = darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900';
+  const inputClass = darkMode 
+    ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
+    : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+
+  const handleSubmit = () => {
+    if (!pnr || !portal) {
+      alert("Please fill in all fields");
+      return;
+    }
+    onConfirm({ flightPnr: pnr, flightPortal: portal });
+    setPnr('');
+    setPortal('');
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
+        <h3 className="text-lg font-bold mb-2">Flight Issued</h3>
+        <p className="text-sm text-slate-500 mb-6">Enter flight details for <b>{file?.applicantName}</b></p>
+        
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">PNR / Booking Reference</label>
+            <input
+              type="text"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="e.g., ABC123"
+              value={pnr}
+              onChange={(e) => setPnr(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Portal</label>
+            <select
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              value={portal}
+              onChange={(e) => setPortal(e.target.value)}
+            >
+              <option value="">Select Portal</option>
+              {portals.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-3 pt-6">
+          <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
+          <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">Save Flight Details</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Package - HOTELS_BOOKED Status Modal
+function PackageHotelsBookedModal({ isOpen, onClose, onConfirm, file, darkMode }) {
+  const [hotelName, setHotelName] = useState(file?.hotelName || '');
+  const [fromDate, setFromDate] = useState(file?.hotelFromDate || '');
+  const [toDate, setToDate] = useState(file?.hotelToDate || '');
+
+  if (!isOpen) return null;
+
+  const cardClass = darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900';
+  const inputClass = darkMode 
+    ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
+    : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+
+  const handleSubmit = () => {
+    if (!hotelName || !fromDate || !toDate) {
+      alert("Please fill in all fields");
+      return;
+    }
+    onConfirm({ hotelName, hotelFromDate: fromDate, hotelToDate: toDate });
+    setHotelName('');
+    setFromDate('');
+    setToDate('');
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
+        <h3 className="text-lg font-bold mb-2">Hotels Booked</h3>
+        <p className="text-sm text-slate-500 mb-6">Enter hotel details for <b>{file?.applicantName}</b></p>
+        
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Hotel Name</label>
+            <input
+              type="text"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="Hotel name..."
+              value={hotelName}
+              onChange={(e) => setHotelName(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">From Date</label>
+            <input
+              type="date"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              value={fromDate}
+              onChange={(e) => setFromDate(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">To Date</label>
+            <input
+              type="date"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              value={toDate}
+              onChange={(e) => setToDate(e.target.value)}
+            />
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-3 pt-6">
+          <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
+          <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">Save Hotel Details</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Package - PICKUP_DROPOFF Status Modal
+function PackagePickupDropoffModal({ isOpen, onClose, onConfirm, file, darkMode }) {
+  const [numTrips, setNumTrips] = useState(1);
+  const [showRouteForm, setShowRouteForm] = useState(false);
+  const [routes, setRoutes] = useState(file?.routes || []);
+
+  if (!isOpen) return null;
+
+  const cardClass = darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900';
+  const inputClass = darkMode 
+    ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
+    : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+
+  const handleSetNumTrips = () => {
+    if (numTrips <= 0) {
+      alert("Please enter a valid number of trips");
+      return;
+    }
+    setRoutes(Array(numTrips).fill(null).map((_, i) => routes[i] || { from: '', to: '', vendor: '' }));
+    setShowRouteForm(true);
+  };
+
+  const updateRoute = (index, field, value) => {
+    const newRoutes = [...routes];
+    newRoutes[index] = { ...newRoutes[index], [field]: value };
+    setRoutes(newRoutes);
+  };
+
+  const handleSubmit = () => {
+    if (routes.some(r => !r.from || !r.to || !r.vendor)) {
+      alert("Please fill in all route details");
+      return;
+    }
+    onConfirm({ routes });
+    setRoutes([]);
+    setNumTrips(1);
+    setShowRouteForm(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 max-h-[90vh] overflow-y-auto ${cardClass}`}>
+        <h3 className="text-lg font-bold mb-2">Pick & Drop Details</h3>
+        <p className="text-sm text-slate-500 mb-6">Enter pickup & dropoff information for <b>{file?.applicantName}</b></p>
+        
+        {!showRouteForm ? (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium mb-2 opacity-80">Number of Trips</label>
+              <div className="flex gap-2">
+                <input
+                  type="number"
+                  min="1"
+                  className={`flex-1 px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                  placeholder="e.g., 2"
+                  value={numTrips}
+                  onChange={(e) => setNumTrips(parseInt(e.target.value) || 1)}
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-3 pt-4">
+              <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
+              <button onClick={handleSetNumTrips} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">Continue</button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {routes.map((route, index) => (
+              <div key={index} className={`p-4 rounded-lg border ${darkMode ? 'border-slate-700 bg-slate-950/50' : 'border-slate-200 bg-slate-50'}`}>
+                <h4 className="font-semibold text-sm mb-3">Trip {index + 1}</h4>
+                <div className="space-y-3">
+                  <input
+                    type="text"
+                    className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                    placeholder="From (e.g., Bangkok)"
+                    value={route.from}
+                    onChange={(e) => updateRoute(index, 'from', e.target.value)}
+                  />
+                  <input
+                    type="text"
+                    className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                    placeholder="To (e.g., Pattaya)"
+                    value={route.to}
+                    onChange={(e) => updateRoute(index, 'to', e.target.value)}
+                  />
+                  <input
+                    type="text"
+                    className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                    placeholder="Vendor Name"
+                    value={route.vendor}
+                    onChange={(e) => updateRoute(index, 'vendor', e.target.value)}
+                  />
+                </div>
+              </div>
+            ))}
+
+            <div className="flex justify-end gap-3 pt-4">
+              <button onClick={() => setShowRouteForm(false)} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Back</button>
+              <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">Save Routes</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function NoteModal({ isOpen, onClose, onConfirm, file, darkMode }) {
@@ -2466,6 +3880,8 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
   const [allUsers, setAllUsers] = useState([]);
   const [attendanceData, setAttendanceData] = useState([]);
   const [customReportOpen, setCustomReportOpen] = useState(false);
+  const [customStartDate, setCustomStartDate] = useState('');
+  const [customEndDate, setCustomEndDate] = useState('');
 
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-lg';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
@@ -2494,7 +3910,8 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
   }, []);
 
   const stats = useMemo(() => {
-    const start = getStartOf(timeRange);
+    const start = getStartOf(timeRange, customStartDate ? new Date(customStartDate) : null);
+    const end = getEndOf(timeRange, customEndDate ? new Date(customEndDate) : null);
     const reportData = {
       processing: {
         inProcess: 0,
@@ -2532,15 +3949,27 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
       const fileCreationDate = file.createdAt?.toDate ? file.createdAt.toDate() : new Date(file.createdAt?.seconds * 1000 || 0);
       
       // Revenue and Cost are both based on when file was created (within the selected timeframe)
-      // Include ALL files that have serviceCharge/cost data (regardless of isNewSale flag)
-      if (fileCreationDate >= start) {
-         reportData.finances.revenue += Number(file.serviceCharge || 0);
-         reportData.finances.cost += Number(file.cost || 0);
+      // Include ALL files that have revenue/cost data (regardless of type or isNewSale flag)
+      if (fileCreationDate >= start && fileCreationDate <= end) {
+         if (file.fileType === FILE_TYPES.VISA) {
+           reportData.finances.revenue += Number(file.serviceCharge || 0);
+           reportData.finances.cost += Number(file.cost || 0);
+         } else if (file.fileType === FILE_TYPES.AIR_TICKET) {
+           reportData.finances.revenue += Number(file.airlineSalePrice || 0);
+           reportData.finances.cost += Number(file.airlineCostPrice || 0);
+         } else if (file.fileType === FILE_TYPES.PACKAGE) {
+           reportData.finances.revenue += Number(file.packageSalePrice || 0);
+           reportData.finances.cost += Number(file.packageCostPrice || 0);
+         } else {
+           // Fallback for backward compatibility
+           reportData.finances.revenue += Number(file.serviceCharge || 0);
+           reportData.finances.cost += Number(file.cost || 0);
+         }
       }
 
       file.history.forEach(entry => {
         const entryTime = new Date(entry.timestamp);
-        if (entryTime >= start && (userFilter === 'ALL' || entry.performedBy === userFilter)) {
+        if (entryTime >= start && entryTime <= end && (userFilter === 'ALL' || entry.performedBy === userFilter)) {
           reportData.processing.totalActions++;
           reportData.sales.totalActions++;
 
@@ -2586,11 +4015,11 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
         const [y, m, d] = a.date.split('-').map(Number);
         const aDate = new Date(y, m - 1, d); 
         
-        return (userFilter === 'ALL' || a.userName === userFilter) && aDate >= start;
+        return (userFilter === 'ALL' || a.userName === userFilter) && aDate >= start && aDate <= end;
     }).sort((a,b) => b.loginTime?.seconds - a.loginTime?.seconds); 
 
     return reportData;
-  }, [files, attendanceData, timeRange, userFilter]);
+  }, [files, attendanceData, timeRange, userFilter, customStartDate, customEndDate]);
 
   const handlePrint = () => {
     window.print();
@@ -2638,17 +4067,43 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
              {allUsers.length > 0 ? allUsers.map(u => <option key={u.name} value={u.name}>{u.name}</option>) : <option>{currentUser.name}</option>}
            </select>
 
-           <div className={`flex p-1 rounded-lg ${darkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
+           <div className={`flex p-1 rounded-lg flex-wrap gap-1 ${darkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
              {['today', 'week', 'month', 'alltime'].map(t => (
                <button
                  key={t}
-                 onClick={() => setTimeRange(t)}
+                 onClick={() => { setTimeRange(t); setCustomStartDate(''); setCustomEndDate(''); }}
                  className={`px-3 py-1.5 rounded-md text-sm font-medium capitalize transition-colors ${timeRange === t ? (darkMode ? 'bg-slate-700 text-blue-400 shadow-sm' : 'bg-white text-blue-600 shadow-sm') : 'text-slate-500 hover:text-slate-700'}`}
                >
                  {t === 'alltime' ? 'All Time' : t}
                </button>
              ))}
+             <button
+               onClick={() => setTimeRange('custom')}
+               className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${timeRange === 'custom' ? (darkMode ? 'bg-slate-700 text-blue-400 shadow-sm' : 'bg-white text-blue-600 shadow-sm') : 'text-slate-500 hover:text-slate-700'}`}
+             >
+               Custom
+             </button>
            </div>
+
+           {timeRange === 'custom' && (
+             <div className="flex gap-2 items-center">
+               <input
+                 type="date"
+                 value={customStartDate}
+                 onChange={(e) => setCustomStartDate(e.target.value)}
+                 className={`px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}
+                 placeholder="Start Date"
+               />
+               <span className={darkMode ? 'text-slate-400' : 'text-slate-500'}>to</span>
+               <input
+                 type="date"
+                 value={customEndDate}
+                 onChange={(e) => setCustomEndDate(e.target.value)}
+                 className={`px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}
+                 placeholder="End Date"
+               />
+             </div>
+           )}
 
            <button 
              onClick={handlePrint}
@@ -2695,6 +4150,48 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
             </div>
         )}
 
+        {/* Working Hours Summary */}
+        {stats.attendance.length > 0 && (
+          <div className="mb-8 grid grid-cols-1 md:grid-cols-4 gap-4">
+            {(() => {
+              let totalHours = 0, totalShift = 0, totalOvertime = 0, daysWorked = 0;
+              stats.attendance.forEach(att => {
+                if (att.logoutTime) {
+                  daysWorked++;
+                  const workHours = calculateWorkingHours(att.loginTime, att.logoutTime);
+                  totalHours += workHours.hours;
+                  totalShift += workHours.shift;
+                  totalOvertime += workHours.overtime;
+                }
+              });
+              
+              return (
+                <>
+                  <div className={`p-5 rounded-xl border ${darkMode ? 'bg-blue-900/20 border-blue-800' : 'bg-blue-50 border-blue-100'}`}>
+                    <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-blue-400' : 'text-blue-700'}`}>Days Worked</p>
+                    <p className={`text-2xl font-bold ${darkMode ? 'text-blue-300' : 'text-blue-900'}`}>{daysWorked}</p>
+                  </div>
+                  
+                  <div className={`p-5 rounded-xl border ${darkMode ? 'bg-green-900/20 border-green-800' : 'bg-green-50 border-green-100'}`}>
+                    <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-green-400' : 'text-green-700'}`}>Total Hours</p>
+                    <p className={`text-2xl font-bold ${darkMode ? 'text-green-300' : 'text-green-900'}`}>{formatHours(totalHours)}</p>
+                  </div>
+                  
+                  <div className={`p-5 rounded-xl border ${darkMode ? 'bg-indigo-900/20 border-indigo-800' : 'bg-indigo-50 border-indigo-100'}`}>
+                    <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-indigo-400' : 'text-indigo-700'}`}>Shift Hours</p>
+                    <p className={`text-2xl font-bold ${darkMode ? 'text-indigo-300' : 'text-indigo-900'}`}>{formatHours(totalShift)}</p>
+                  </div>
+                  
+                  <div className={`p-5 rounded-xl border ${totalOvertime > 0 ? (darkMode ? 'bg-orange-900/20 border-orange-800' : 'bg-orange-50 border-orange-100') : (darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-100 border-slate-200')}`}>
+                    <p className={`text-xs font-semibold uppercase mb-1 ${totalOvertime > 0 ? (darkMode ? 'text-orange-400' : 'text-orange-700') : 'text-slate-500'}`}>Overtime</p>
+                    <p className={`text-2xl font-bold ${totalOvertime > 0 ? (darkMode ? 'text-orange-300' : 'text-orange-900') : (darkMode ? 'text-slate-400' : 'text-slate-500')}`}>{formatHours(totalOvertime)}</p>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        )}
+
         <div className={`mb-8 p-6 rounded-xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
             <h3 className={`text-lg font-bold mb-4 flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
                 <Timer className="h-5 w-5 text-blue-500"/> Attendance Log
@@ -2710,23 +4207,32 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
                                 {userFilter === 'ALL' && <th className="px-4 py-3">Employee</th>}
                                 <th className="px-4 py-3">Login Time</th>
                                 <th className="px-4 py-3">Logout Time</th>
+                                <th className="px-4 py-3">Total Hours</th>
+                                <th className="px-4 py-3">Shift (8h)</th>
+                                <th className="px-4 py-3">Overtime</th>
                                 <th className="px-4 py-3 rounded-r-lg">Status</th>
                             </tr>
                         </thead>
                         <tbody className={textMain}>
-                            {stats.attendance.map((att) => (
+                            {stats.attendance.map((att) => {
+                              const workHours = calculateWorkingHours(att.loginTime, att.logoutTime);
+                              return (
                                 <tr key={att.id} className={`border-b ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
                                     <td className="px-4 py-3 font-medium">{att.date}</td>
                                     {userFilter === 'ALL' && <td className="px-4 py-3 font-medium">{att.userName}</td>}
                                     <td className="px-4 py-3 text-green-600 font-mono">{formatTimeOnly(att.loginTime)}</td>
                                     <td className="px-4 py-3 text-red-500 font-mono">{att.logoutTime ? formatTimeOnly(att.logoutTime) : '-'}</td>
+                                    <td className="px-4 py-3 font-mono font-medium">{formatHours(workHours.hours)}</td>
+                                    <td className={`px-4 py-3 font-mono font-medium ${darkMode ? 'text-blue-400' : 'text-blue-700'}`}>{formatHours(workHours.shift)}</td>
+                                    <td className={`px-4 py-3 font-mono font-medium ${workHours.overtime > 0 ? (darkMode ? 'text-orange-400' : 'text-orange-700') : 'text-slate-400'}`}>{formatHours(workHours.overtime)}</td>
                                     <td className="px-4 py-3">
                                         <span className={`px-2 py-1 rounded-full text-xs ${att.logoutTime ? (darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600') : 'bg-green-100 text-green-700'}`}>
                                             {att.logoutTime ? 'Completed' : 'Active'}
                                         </span>
                                     </td>
                                 </tr>
-                            ))}
+                              );
+                            })}
                         </tbody>
                     </table>
                 </div>
@@ -2911,9 +4417,9 @@ function CustomReportModal({ isOpen, onClose, files, userFilter, timeRange, dark
     // Financial Summary (Admin Only)
     if (isAdmin && (reportType === 'all' || reportType === 'financial')) {
       addSection('💰 FINANCIAL SUMMARY');
-      addText('Total Revenue', `$${stats.finances.revenue.toFixed(2)}`, true);
-      addText('Total Cost', `$${stats.finances.cost.toFixed(2)}`, true);
-      addText('Net Profit', `$${stats.finances.profit.toFixed(2)}`, true);
+      addText('Total Revenue', `Tk ${stats.finances.revenue.toFixed(2)}`, true);
+      addText('Total Cost', `Tk ${stats.finances.cost.toFixed(2)}`, true);
+      addText('Net Profit', `Tk ${stats.finances.profit.toFixed(2)}`, true);
       yPosition += 4;
     }
 
@@ -3560,6 +5066,252 @@ function InvoiceModal({ isOpen, onClose, file, darkMode, onGenerateInvoice }) {
             <Printer className="h-4 w-4" />
             Generate Invoice
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AccountingPanel({ currentUser, files, miscCosts, onAddMiscCost, onDeleteMiscCost, darkMode, isAdmin }) {
+  const [newMiscCost, setNewMiscCost] = useState({
+    description: '',
+    amount: '',
+    category: 'Operational',
+    date: new Date().toISOString().split('T')[0],
+    notes: ''
+  });
+
+  const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-lg';
+  const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
+  const textSub = darkMode ? 'text-slate-400' : 'text-slate-500';
+  const inputClass = darkMode 
+    ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
+    : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+
+  // Calculate financial totals including all file types
+  const totalRevenue = files.reduce((sum, f) => {
+    if (f.fileType === FILE_TYPES.VISA) return sum + (Number(f.serviceCharge) || 0);
+    if (f.fileType === FILE_TYPES.AIR_TICKET) return sum + (Number(f.airlineSalePrice) || 0);
+    if (f.fileType === FILE_TYPES.PACKAGE) return sum + (Number(f.packageSalePrice) || 0);
+    return sum + (Number(f.serviceCharge) || 0); // Default to visa for backward compatibility
+  }, 0);
+  
+  const totalCost = files.reduce((sum, f) => {
+    if (f.fileType === FILE_TYPES.VISA) return sum + (Number(f.cost) || 0);
+    if (f.fileType === FILE_TYPES.AIR_TICKET) return sum + (Number(f.airlineCostPrice) || 0);
+    if (f.fileType === FILE_TYPES.PACKAGE) return sum + (Number(f.packageCostPrice) || 0);
+    return sum + (Number(f.cost) || 0); // Default to visa for backward compatibility
+  }, 0);
+  
+  const totalMiscCosts = miscCosts.reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
+  const totalExpenditure = totalCost + totalMiscCosts;
+  const netProfit = totalRevenue - totalExpenditure;
+  const profitMargin = totalRevenue > 0 ? ((netProfit / totalRevenue) * 100).toFixed(2) : 0;
+
+  const handleAddMiscCost = (e) => {
+    e.preventDefault();
+    if (!newMiscCost.description || !newMiscCost.amount) {
+      alert('Please fill in description and amount');
+      return;
+    }
+    onAddMiscCost(newMiscCost);
+    setNewMiscCost({
+      description: '',
+      amount: '',
+      category: 'Operational',
+      date: new Date().toISOString().split('T')[0],
+      notes: ''
+    });
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex justify-between items-center">
+        <div>
+          <h2 className={`text-2xl font-bold ${textMain}`}>Accounting & Finance</h2>
+          <p className={textSub}>Comprehensive financial overview of the business</p>
+        </div>
+      </div>
+
+      {/* Financial Overview Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+        <div className={`p-5 rounded-xl border ${darkMode ? 'bg-emerald-900/20 border-emerald-800' : 'bg-emerald-50 border-emerald-100'}`}>
+          <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-emerald-400' : 'text-emerald-700'}`}>Total Income</p>
+          <p className={`text-2xl font-bold ${darkMode ? 'text-emerald-300' : 'text-emerald-900'}`}>৳{totalRevenue.toFixed(2)}</p>
+          <p className={`text-xs mt-2 ${textSub}`}>{files.length} files</p>
+        </div>
+
+        <div className={`p-5 rounded-xl border ${darkMode ? 'bg-orange-900/20 border-orange-800' : 'bg-orange-50 border-orange-100'}`}>
+          <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-orange-400' : 'text-orange-700'}`}>File Costs</p>
+          <p className={`text-2xl font-bold ${darkMode ? 'text-orange-300' : 'text-orange-900'}`}>৳{totalCost.toFixed(2)}</p>
+          <p className={`text-xs mt-2 ${textSub}`}>Direct costs</p>
+        </div>
+
+        <div className={`p-5 rounded-xl border ${darkMode ? 'bg-red-900/20 border-red-800' : 'bg-red-50 border-red-100'}`}>
+          <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-red-400' : 'text-red-700'}`}>Misc Expenses</p>
+          <p className={`text-2xl font-bold ${darkMode ? 'text-red-300' : 'text-red-900'}`}>৳{totalMiscCosts.toFixed(2)}</p>
+          <p className={`text-xs mt-2 ${textSub}`}>{miscCosts.length} entries</p>
+        </div>
+
+        <div className={`p-5 rounded-xl border ${darkMode ? 'bg-yellow-900/20 border-yellow-800' : 'bg-yellow-50 border-yellow-100'}`}>
+          <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-yellow-400' : 'text-yellow-700'}`}>Total Expenditure</p>
+          <p className={`text-2xl font-bold ${darkMode ? 'text-yellow-300' : 'text-yellow-900'}`}>৳{totalExpenditure.toFixed(2)}</p>
+          <p className={`text-xs mt-2 ${textSub}`}>All costs combined</p>
+        </div>
+
+        <div className={`p-5 rounded-xl border ${netProfit >= 0 ? (darkMode ? 'bg-blue-900/20 border-blue-800' : 'bg-blue-50 border-blue-100') : (darkMode ? 'bg-red-900/20 border-red-800' : 'bg-red-50 border-red-100')}`}>
+          <p className={`text-xs font-semibold uppercase mb-1 ${netProfit >= 0 ? (darkMode ? 'text-blue-400' : 'text-blue-700') : (darkMode ? 'text-red-400' : 'text-red-700')}`}>Net Profit</p>
+          <p className={`text-2xl font-bold ${netProfit >= 0 ? (darkMode ? 'text-blue-300' : 'text-blue-900') : (darkMode ? 'text-red-300' : 'text-red-900')}`}>৳{netProfit.toFixed(2)}</p>
+          <p className={`text-xs mt-2 ${textSub}`}>Margin: {profitMargin}%</p>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Add Misc Cost Form - Available to all users with accounting access */}
+        <div className={`rounded-xl border p-6 ${cardClass}`}>
+          <h3 className={`text-lg font-bold mb-4 flex items-center gap-2 ${textMain}`}>
+            <Plus className="h-5 w-5 text-blue-500"/> Add Expense Entry
+          </h3>
+          <form onSubmit={handleAddMiscCost} className="space-y-4">
+            <div>
+              <label className={`block text-sm font-medium mb-2 ${textMain}`}>Description *</label>
+              <input
+                type="text"
+                required
+                placeholder="e.g., Office supplies, Travel cost"
+                className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                value={newMiscCost.description}
+                onChange={e => setNewMiscCost({...newMiscCost, description: e.target.value})}
+              />
+            </div>
+
+            <div>
+              <label className={`block text-sm font-medium mb-2 ${textMain}`}>Amount (Tk) *</label>
+              <input
+                type="number"
+                required
+                min="0"
+                step="0.01"
+                placeholder="0.00"
+                className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                value={newMiscCost.amount}
+                onChange={e => setNewMiscCost({...newMiscCost, amount: e.target.value})}
+              />
+            </div>
+
+            <div>
+              <label className={`block text-sm font-medium mb-2 ${textMain}`}>Category</label>
+              <select
+                className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                value={newMiscCost.category}
+                onChange={e => setNewMiscCost({...newMiscCost, category: e.target.value})}
+              >
+                <option value="Operational">Operational</option>
+                <option value="Travel">Travel</option>
+                <option value="Supplies">Supplies</option>
+                <option value="Utilities">Utilities</option>
+                <option value="Equipment">Equipment</option>
+                <option value="Other">Other</option>
+              </select>
+            </div>
+
+            <div>
+              <label className={`block text-sm font-medium mb-2 ${textMain}`}>Date</label>
+              <input
+                type="date"
+                className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                value={newMiscCost.date}
+                onChange={e => setNewMiscCost({...newMiscCost, date: e.target.value})}
+              />
+            </div>
+
+            <div>
+              <label className={`block text-sm font-medium mb-2 ${textMain}`}>Notes (Optional)</label>
+              <textarea
+                placeholder="Additional details..."
+                className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none min-h-[80px] ${inputClass}`}
+                value={newMiscCost.notes}
+                onChange={e => setNewMiscCost({...newMiscCost, notes: e.target.value})}
+              />
+            </div>
+
+            <button
+              type="submit"
+              className="w-full px-4 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-colors"
+            >
+              Add Expense
+            </button>
+          </form>
+        </div>
+
+        {/* Misc Costs List */}
+        <div className={`lg:col-span-2 rounded-xl border p-6 ${cardClass}`}>
+          <h3 className={`text-lg font-bold mb-4 ${textMain}`}>Expense Entries ({miscCosts.length})</h3>
+          
+          {miscCosts.length === 0 ? (
+            <p className={`text-center py-8 ${textSub}`}>No expense entries yet. Add one to get started.</p>
+          ) : (
+            <div className="space-y-3 max-h-96 overflow-y-auto">
+              {miscCosts.map(cost => (
+                <div key={cost.id} className={`p-4 rounded-lg border flex items-center justify-between ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1">
+                      <p className={`font-medium ${textMain}`}>{cost.description}</p>
+                      <span className={`px-2 py-0.5 rounded text-xs font-semibold ${
+                        cost.category === 'Operational' ? (darkMode ? 'bg-blue-900/30 text-blue-400' : 'bg-blue-100 text-blue-700') :
+                        cost.category === 'Travel' ? (darkMode ? 'bg-green-900/30 text-green-400' : 'bg-green-100 text-green-700') :
+                        cost.category === 'Supplies' ? (darkMode ? 'bg-yellow-900/30 text-yellow-400' : 'bg-yellow-100 text-yellow-700') :
+                        darkMode ? 'bg-slate-700 text-slate-300' : 'bg-slate-200 text-slate-600'
+                      }`}>
+                        {cost.category}
+                      </span>
+                    </div>
+                    <p className={`text-sm ${textSub}`}>{cost.date} • {cost.createdBy}</p>
+                    {cost.notes && <p className={`text-xs mt-1 ${textSub}`}>{cost.notes}</p>}
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <p className={`font-bold text-lg ${darkMode ? 'text-red-400' : 'text-red-600'}`}>৳{Number(cost.amount).toFixed(2)}</p>
+                    {isAdmin && (
+                      <button
+                        onClick={() => onDeleteMiscCost(cost.id)}
+                        className={`p-1.5 rounded transition-colors ${darkMode ? 'text-slate-400 hover:text-red-500 hover:bg-slate-700' : 'text-slate-400 hover:text-red-500 hover:bg-slate-100'}`}
+                        title="Delete entry"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Summary Table */}
+      <div className={`rounded-xl border p-6 ${cardClass}`}>
+        <h3 className={`text-lg font-bold mb-4 ${textMain}`}>Financial Summary</h3>
+        <div className="space-y-3">
+          <div className="flex justify-between items-center p-3 rounded-lg" style={{backgroundColor: darkMode ? 'rgba(16,185,129,0.1)' : 'rgba(16,185,129,0.1)'}}>
+            <span className={textMain}>Total Income (All Files)</span>
+            <span className={`font-bold text-lg ${darkMode ? 'text-emerald-400' : 'text-emerald-700'}`}>৳{totalRevenue.toFixed(2)}</span>
+          </div>
+          <div className="flex justify-between items-center p-3 rounded-lg" style={{backgroundColor: darkMode ? 'rgba(249,115,22,0.1)' : 'rgba(249,115,22,0.1)'}}>
+            <span className={textMain}>File Processing Costs</span>
+            <span className={`font-bold text-lg ${darkMode ? 'text-orange-400' : 'text-orange-700'}`}>৳{totalCost.toFixed(2)}</span>
+          </div>
+          <div className="flex justify-between items-center p-3 rounded-lg" style={{backgroundColor: darkMode ? 'rgba(239,68,68,0.1)' : 'rgba(239,68,68,0.1)'}}>
+            <span className={textMain}>Miscellaneous Expenses</span>
+            <span className={`font-bold text-lg ${darkMode ? 'text-red-400' : 'text-red-700'}`}>৳{totalMiscCosts.toFixed(2)}</span>
+          </div>
+          <div className={`flex justify-between items-center p-4 rounded-lg font-bold ${darkMode ? 'bg-slate-800 border border-slate-700' : 'bg-slate-100 border border-slate-300'}`}>
+            <span className={`text-lg ${textMain}`}>Net Profit / (Loss)</span>
+            <span className={`text-2xl ${netProfit >= 0 ? (darkMode ? 'text-blue-400' : 'text-blue-700') : (darkMode ? 'text-red-400' : 'text-red-700')}`}>৳{netProfit.toFixed(2)}</span>
+          </div>
+          <div className={`flex justify-between items-center p-3 rounded-lg ${darkMode ? 'bg-slate-800' : 'bg-slate-100'}`}>
+            <span className={textMain}>Profit Margin</span>
+            <span className={`font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>{profitMargin}%</span>
+          </div>
         </div>
       </div>
     </div>
