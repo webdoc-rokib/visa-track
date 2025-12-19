@@ -101,7 +101,8 @@ const appId = "app-version-3";
 const ROLES = {
   SALES: 'Sales Representative',
   PROCESSING: 'Processing Agent',
-  ADMIN: 'Manager/Admin'
+  ADMIN: 'Manager/Admin',
+  ACCOUNTS: 'Accounts'
 };
 
 const FILE_TYPES = {
@@ -168,8 +169,16 @@ const formatSimpleDate = (dateString) => {
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 };
 
-const getStartOf = (period, customStartDate = null) => {
+// Timezone utility for Dhaka (+6 UTC)
+const getDhakaDate = () => {
   const now = new Date();
+  // Convert to Dhaka timezone (UTC+6)
+  const dhakaTime = new Date(now.getTime() + (6 * 60 * 60 * 1000) - (now.getTimezoneOffset() * 60 * 1000));
+  return dhakaTime;
+};
+
+const getStartOf = (period, customStartDate = null) => {
+  const now = getDhakaDate();
   const start = new Date(now);
   start.setHours(0, 0, 0, 0);
   
@@ -190,7 +199,7 @@ const getStartOf = (period, customStartDate = null) => {
 };
 
 const getEndOf = (period, customEndDate = null) => {
-  const now = new Date();
+  const now = getDhakaDate();
   now.setHours(23, 59, 59, 999);
   
   if (period === 'custom' && customEndDate) {
@@ -526,6 +535,7 @@ export default function VisaTrackApp() {
   const [destinations, setDestinations] = useState([]); 
   const [allPortals, setAllPortals] = useState(AIR_TICKET_PORTALS);
   const [allUsers, setAllUsers] = useState([]); 
+  const [attendanceRecords, setAttendanceRecords] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -621,8 +631,26 @@ export default function VisaTrackApp() {
     const unsubUsers = onSnapshot(qUsers, (snapshot) => {
       const usersList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setAllUsers(usersList);
+      
+      // Update appUser if the current user's data has changed
+      if (appUser) {
+        const currentUserDoc = snapshot.docs.find(doc => doc.data().name === appUser.name);
+        if (currentUserDoc) {
+          const updatedUserData = { id: currentUserDoc.id, ...currentUserDoc.data() };
+          // Only update if something has changed
+          if (JSON.stringify(updatedUserData) !== JSON.stringify(appUser)) {
+            setAppUser(updatedUserData);
+            localStorage.setItem('visaTrackUser', JSON.stringify(updatedUserData));
+          }
+        }
+      }
     });
-    return () => { unsubFiles(); unsubDest(); unsubPortals(); unsubUsers(); };
+    const qAttendance = collection(db, 'artifacts', appId, 'public', 'data', 'attendance');
+    const unsubAttendance = onSnapshot(qAttendance, (snapshot) => {
+      const attendanceData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setAttendanceRecords(attendanceData);
+    });
+    return () => { unsubFiles(); unsubDest(); unsubPortals(); unsubUsers(); unsubAttendance(); };
   }, [user]);
 
   const myTasks = useMemo(() => {
@@ -652,13 +680,31 @@ export default function VisaTrackApp() {
       const storedUser = localStorage.getItem('visaTrackUser');
       if (storedUser) {
         const userProfile = JSON.parse(storedUser);
-        setAppUser(userProfile);
+        
+        // Fetch fresh user data from Firestore to get latest role and permissions
+        try {
+          const userRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_users', userProfile.id);
+          const userSnap = await getDoc(userRef);
+          if (userSnap.exists()) {
+            const freshUserData = userSnap.data();
+            const updatedUser = {
+              ...userProfile,
+              role: freshUserData.role || userProfile.role
+            };
+            setAppUser(updatedUser);
+          } else {
+            setAppUser(userProfile);
+          }
+        } catch (e) {
+          console.error("Error fetching fresh user data:", e);
+          setAppUser(userProfile);
+        }
         
         // Restore attendance session ID if user is on a trusted device
         const isTrustedDevice = localStorage.getItem('vt_trusted_device') === 'true';
         if (isTrustedDevice) {
           try {
-            const now = new Date();
+            const now = getDhakaDate();
             const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
             
             // Look for active session for this user today
@@ -703,7 +749,7 @@ export default function VisaTrackApp() {
     // Record attendance for trusted devices only
     if (isTrustedDevice) {
         try {
-            const now = new Date();
+            const now = getDhakaDate();
             const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
             
             // Check if there's an active session already to prevent duplicate sessions
@@ -773,7 +819,7 @@ export default function VisaTrackApp() {
   useEffect(() => {
     const cleanupStaleAttendance = async () => {
       try {
-        const now = new Date();
+        const now = getDhakaDate();
         const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
         
         // Find sessions that have been open for more than 12 hours (unlikely normal work session)
@@ -881,6 +927,8 @@ export default function VisaTrackApp() {
         includesPickDrop: data.includesPickDrop,
         packageSalePrice: Number(data.packageSalePrice) || 0,
         packageCostPrice: Number(data.packageCostPrice) || 0,
+        numberOfPersons: Number(data.numberOfPersons) || 0,
+        mainPersonPassport: data.mainPersonPassport,
         status: 'SALE_INITIATED',
         flightIssued: false,
         hotelsBooked: false,
@@ -1126,9 +1174,58 @@ export default function VisaTrackApp() {
 
   const handleEditFile = async (data) => {
     if (!appUser || !selectedFile) return;
-    const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id);
-    await updateDoc(fileRef, { ...data, updatedAt: serverTimestamp() });
-    setEditModalOpen(false);
+    
+    try {
+      const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id);
+      
+      // Convert numeric strings to numbers where needed
+      let updateData = { ...data };
+      
+      const oldCreatedBy = selectedFile.createdBy || '';
+      const newCreatedBy = data.createdBy || '';
+      
+      console.log('Old createdBy:', oldCreatedBy, 'New createdBy:', newCreatedBy);
+      
+      // When createdBy (sales rep) is changed, update assignedTo and add history entry
+      if (newCreatedBy && oldCreatedBy !== newCreatedBy) {
+        console.log('Sales rep changed! Updating assignedTo and history');
+        updateData.assignedTo = newCreatedBy;
+        
+        // Add to history to track sales rep change
+        const historyEntry = {
+          status: selectedFile.status,
+          timestamp: Date.now(),
+          performedBy: appUser.name,
+          action: `Sales Rep changed from ${oldCreatedBy} to ${newCreatedBy}`,
+          note: `Sales Rep changed from ${oldCreatedBy} to ${newCreatedBy}`
+        };
+        
+        updateData.history = [...(selectedFile.history || []), historyEntry];
+      }
+      
+      if (selectedFile.fileType === FILE_TYPES.VISA) {
+        updateData.serviceCharge = Number(data.serviceCharge) || 0;
+        updateData.cost = Number(data.cost) || 0;
+      } else if (selectedFile.fileType === FILE_TYPES.AIR_TICKET) {
+        updateData.airlineSalePrice = Number(data.airlineSalePrice) || 0;
+        updateData.airlineCostPrice = Number(data.airlineCostPrice) || 0;
+      } else if (selectedFile.fileType === FILE_TYPES.PACKAGE) {
+        updateData.numberOfPersons = Number(data.numberOfPersons) || 0;
+        updateData.packageSalePrice = Number(data.packageSalePrice) || 0;
+        updateData.packageCostPrice = Number(data.packageCostPrice) || 0;
+      }
+      
+      updateData.updatedAt = serverTimestamp();
+      
+      console.log('Final update data:', updateData);
+      await updateDoc(fileRef, updateData);
+      console.log('File updated successfully');
+      setEditModalOpen(false);
+      alert('File updated successfully!');
+    } catch (err) {
+      console.error('Error updating file:', err);
+      alert('Failed to update file');
+    }
   };
 
   const addMiscCost = async (data) => {
@@ -1156,30 +1253,6 @@ export default function VisaTrackApp() {
       } catch (err) {
         console.error('Error deleting misc cost:', err);
         alert('Failed to delete expense');
-      }
-    }
-  };
-
-  const grantAccountingAccess = async (userId) => {
-    if (confirm('Grant accounting tab access to this employee?')) {
-      try {
-        const userRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_users', userId);
-        await updateDoc(userRef, { accountingAccess: true });
-      } catch (err) {
-        console.error('Error granting access:', err);
-        alert('Failed to grant access');
-      }
-    }
-  };
-
-  const revokeAccountingAccess = async (userId) => {
-    if (confirm('Revoke accounting tab access from this employee?')) {
-      try {
-        const userRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_users', userId);
-        await updateDoc(userRef, { accountingAccess: false });
-      } catch (err) {
-        console.error('Error revoking access:', err);
-        alert('Failed to revoke access');
       }
     }
   };
@@ -1251,10 +1324,14 @@ export default function VisaTrackApp() {
             <div className="flex items-center gap-2 md:gap-4">
                <div className="hidden md:flex gap-1">
                  <NavButton active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} icon={Layout} darkMode={darkMode}>Dashboard</NavButton>
-                 <NavButton active={activeTab === 'pipeline'} onClick={() => setActiveTab('pipeline')} icon={List} darkMode={darkMode}>Pipeline</NavButton>
-                 <NavButton active={activeTab === 'add'} onClick={() => setActiveTab('add')} icon={Plus} darkMode={darkMode}>New File</NavButton>
-                 <NavButton active={activeTab === 'reports'} onClick={() => setActiveTab('reports')} icon={Activity} darkMode={darkMode}>Stats</NavButton>
-                 {(appUser.role === ROLES.ADMIN || appUser.accountingAccess) && <NavButton active={activeTab === 'accounting'} onClick={() => setActiveTab('accounting')} icon={DollarSign} darkMode={darkMode}>Accounting</NavButton>}
+                 {appUser.role !== ROLES.ACCOUNTS && (
+                   <>
+                     <NavButton active={activeTab === 'pipeline'} onClick={() => setActiveTab('pipeline')} icon={List} darkMode={darkMode}>Pipeline</NavButton>
+                     <NavButton active={activeTab === 'add'} onClick={() => setActiveTab('add')} icon={Plus} darkMode={darkMode}>New File</NavButton>
+                     <NavButton active={activeTab === 'reports'} onClick={() => setActiveTab('reports')} icon={Activity} darkMode={darkMode}>Stats</NavButton>
+                   </>
+                 )}
+                 {(appUser.role === ROLES.ADMIN || appUser.role === ROLES.ACCOUNTS) && <NavButton active={activeTab === 'accounting'} onClick={() => setActiveTab('accounting')} icon={DollarSign} darkMode={darkMode}>Accounting</NavButton>}
                  {appUser.role === ROLES.ADMIN && (
                    <NavButton active={activeTab === 'admin'} onClick={() => setActiveTab('admin')} icon={Shield} darkMode={darkMode}>Admin</NavButton>
                  )}
@@ -1298,10 +1375,14 @@ export default function VisaTrackApp() {
           <div className={`md:hidden absolute top-16 left-0 w-full h-[calc(100vh-4rem)] z-50 p-4 border-t ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
              <div className="space-y-1">
                 <NavItem id="dashboard" icon={Layout} label="Dashboard" />
-                <NavItem id="pipeline" icon={List} label="Work Pipeline" />
-                <NavItem id="add" icon={Plus} label="Register New File" />
-                <NavItem id="reports" icon={Activity} label="Statistical Reports" />
-                {(appUser.role === ROLES.ADMIN || appUser.accountingAccess) && (
+                {appUser.role !== ROLES.ACCOUNTS && (
+                  <>
+                    <NavItem id="pipeline" icon={List} label="Work Pipeline" />
+                    <NavItem id="add" icon={Plus} label="Register New File" />
+                    <NavItem id="reports" icon={Activity} label="Statistical Reports" />
+                  </>
+                )}
+                {(appUser.role === ROLES.ADMIN || appUser.role === ROLES.ACCOUNTS) && (
                   <NavItem id="accounting" onClick={() => setActiveTab('accounting')} icon={DollarSign} label="Accounting" />
                 )}
                 {appUser.role === ROLES.ADMIN && (
@@ -1330,6 +1411,7 @@ export default function VisaTrackApp() {
             user={appUser} 
             destinations={destinations}
             allUsers={allUsers}
+            attendanceRecords={attendanceRecords}
             onOpenUpdateModal={openUpdateModal} 
             onOpenNoteModal={openNoteModal}
             onOpenEditModal={openEditModal}
@@ -1352,11 +1434,11 @@ export default function VisaTrackApp() {
           />
         )}
         {activeTab === 'reports' && <StatisticalReports files={files} currentUser={appUser} darkMode={darkMode} onOpenInvoiceModal={(f) => { setInvoiceFile(f); setInvoiceModalOpen(true); }} />}
-        {activeTab === 'accounting' && (appUser.role === ROLES.ADMIN || appUser.accountingAccess) && (
+        {activeTab === 'accounting' && (appUser.role === ROLES.ADMIN || appUser.role === ROLES.ACCOUNTS) && (
           <AccountingPanel currentUser={appUser} files={files} miscCosts={miscCosts} onAddMiscCost={addMiscCost} onDeleteMiscCost={deleteMiscCost} darkMode={darkMode} isAdmin={appUser.role === ROLES.ADMIN} />
         )}
         {activeTab === 'admin' && appUser.role === ROLES.ADMIN && (
-          <AdminPanel currentUser={appUser} destinations={destinations} darkMode={darkMode} onGrantAccountingAccess={grantAccountingAccess} onRevokeAccountingAccess={revokeAccountingAccess} />
+          <AdminPanel currentUser={appUser} destinations={destinations} darkMode={darkMode} />
         )}
       </main>
 
@@ -1399,6 +1481,8 @@ export default function VisaTrackApp() {
           file={selectedFile}
           destinations={destinations}
           darkMode={darkMode}
+          allUsers={allUsers}
+          currentUser={appUser}
         />
       )}
 
@@ -1533,10 +1617,17 @@ function NavButton({ active, onClick, icon: Icon, children, darkMode }) {
   );
 }
 
-function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode, onOpenInvoiceModal, allUsers }) {
+function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode, onOpenInvoiceModal, allUsers, attendanceRecords }) {
   const [destFilter, setDestFilter] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
+  const [currentTime, setCurrentTime] = useState(new Date());
   const itemsPerPage = 20;
+
+  // Update clock every second
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
@@ -1545,111 +1636,208 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
     ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
     : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
 
-  // Calculate honors board metrics for different categories
+  // Calculate honors board metrics - clean rebuild with proper logic
   const honorsMetrics = useMemo(() => {
-    const now = new Date();
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const HONORS_START_DATE = new Date(2025, 11, 16); // Reset point: Dec 16, 2025
     
-    // Honors board calculation start date - only count files from this date onwards
-    const honorsBoardStartDate = new Date(2025, 11, 16); // December 16, 2025 - change this to reset
-    const effectiveMonthStart = honorsBoardStartDate > monthStart ? honorsBoardStartDate : monthStart;
-    const effectiveTodayStart = honorsBoardStartDate > todayStart ? honorsBoardStartDate : todayStart;
+    // Convert Firebase timestamp to Dhaka time
+    const toDhakaTime = (timestamp) => {
+      if (!timestamp) return null;
+      const date = timestamp.toDate ? timestamp.toDate() : new Date((timestamp.seconds || 0) * 1000);
+      return new Date(date.getTime() + (6 * 60 * 60 * 1000) - (date.getTimezoneOffset() * 60 * 1000));
+    };
     
-    // Work hour calculation start date - separate reset for punctuality metrics
-    const workHourStartDate = new Date(2025, 11, 16); // December 16, 2025 - change this to reset work hours
-    const effectiveWorkHourStart = workHourStartDate > monthStart ? workHourStartDate : monthStart;
+    // Get current Dhaka date
+    const now = getDhakaDate();
+    const todayString = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}`;
+    const monthString = `${now.getFullYear()}-${now.getMonth()}`;
     
-    // Create a map of user roles from allUsers
+    // Helper to create date string from date object
+    const getDateString = (date) => `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+    const getMonthString = (date) => `${date.getFullYear()}-${date.getMonth()}`;
+
+    // Current Dhaka Y/M/D parts and a robust date key with padding (YYYY-MM-DD)
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth();
+    const currentDay = now.getDate();
+    const getDateKey = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    
+    // Build user roles map
     const userRoles = {};
     allUsers.forEach(u => {
       userRoles[u.fullName] = u.role;
     });
     
-    // Category 1: Earliest Today
-    const earliestToday = files
-      .filter(f => {
-        const createdDate = f.createdAt ? new Date(f.createdAt.seconds * 1000) : null;
-        return createdDate && createdDate >= effectiveTodayStart;
-      })
-      .reduce((earliest, f) => {
-        const createdDate = new Date(f.createdAt.seconds * 1000);
-        if (!earliest || createdDate < earliest.time) {
-          return { user: f.assignedTo || 'System', time: createdDate };
-        }
-        return earliest;
-      }, null);
+    // ===== CATEGORY 1: EARLIEST TODAY =====
+    // Use attendance `date` if present (format YYYY-MM-DD) else fallback to Dhaka-converted loginTime
+    const pad = (n) => String(n).padStart(2, '0');
+    const dhakaDateString = `${currentYear}-${pad(currentMonth + 1)}-${pad(currentDay)}`;
 
-    // Category 2: Most Punctual (month) - Staff who arrives earliest (closest to 10 AM or least late)
-    const shiftStart = 10 * 60; // 10 AM in minutes
-    const punctualityByUser = {};
-    files.forEach(f => {
-      const createdDate = f.createdAt ? new Date(f.createdAt.seconds * 1000) : null;
-      if (createdDate && createdDate >= effectiveWorkHourStart) {
-        const user = f.assignedTo || 'System';
-        const hour = createdDate.getHours();
-        const minutes = createdDate.getMinutes();
-        const timeInMinutes = hour * 60 + minutes;
-        
-        if (!punctualityByUser[user]) {
-          punctualityByUser[user] = { user, times: [] };
+    let earliestToday = { user: 'N/A', time: null };
+    let earliestTime = Infinity;
+
+    attendanceRecords.forEach(record => {
+      // Prefer explicit date field
+      if (record.date && record.date === dhakaDateString && record.loginTime) {
+        const loginTime = toDhakaTime(record.loginTime);
+        if (loginTime && loginTime.getTime() < earliestTime) {
+          earliestTime = loginTime.getTime();
+          earliestToday = { user: record.userName || 'System', time: loginTime };
         }
-        punctualityByUser[user].times.push(timeInMinutes);
+        return;
+      }
+
+      // Fallback to using loginTime conversion
+      const loginTime = toDhakaTime(record.loginTime);
+      if (!loginTime) return;
+      const recordDateString = getDateKey(loginTime);
+      const todayKey = getDateKey(now);
+      if (recordDateString === todayKey && loginTime.getTime() < earliestTime) {
+        earliestTime = loginTime.getTime();
+        earliestToday = { user: record.userName || 'System', time: loginTime };
+      }
+    });
+
+    // ===== CATEGORY 2: MOST PUNCTUAL =====
+    // First login per user per day for current month (and after HONORS_START_DATE)
+    const firstLoginByDay = {}; // Key: "user|YYYY-M-D" => minutes
+    const monthWorkdaysByUser = {}; // user => Set of day keys in current month
+
+    attendanceRecords.forEach(record => {
+      if (!record.loginTime) return;
+      const loginTime = toDhakaTime(record.loginTime);
+      if (!loginTime || loginTime < HONORS_START_DATE) return;
+
+      // Only consider records in current month
+      if (loginTime.getFullYear() !== currentYear || loginTime.getMonth() !== currentMonth) return;
+
+      // Skip Friday (5) - Dhaka weekend
+      const dayOfWeek = loginTime.getDay();
+      if (dayOfWeek === 5) return;
+
+      const user = record.userName || 'System';
+      const dateKey = getDateKey(loginTime);
+      const userDateKey = `${user}|${dateKey}`;
+
+      // Capture first login time per user/day
+      if (!firstLoginByDay[userDateKey]) {
+        firstLoginByDay[userDateKey] = loginTime.getHours() * 60 + loginTime.getMinutes();
+      }
+
+      if (!monthWorkdaysByUser[user]) monthWorkdaysByUser[user] = new Set();
+      monthWorkdaysByUser[user].add(dateKey);
+    });
+
+    // Build punctuality stats
+    const punctualityStats = {};
+    Object.entries(firstLoginByDay).forEach(([key, minutes]) => {
+      const user = key.split('|')[0];
+      if (!punctualityStats[user]) punctualityStats[user] = { times: [], workdays: monthWorkdaysByUser[user]?.size || 0 };
+      punctualityStats[user].times.push(minutes);
+    });
+
+    // Calculate how many workdays have occurred in the current month (excluding holidays)
+    // Dhaka weekend: Friday (5) only
+    const countWorkdaysSoFar = (startDate, endDate, holidays = []) => {
+      let count = 0;
+      const d = new Date(startDate);
+      const holidayDates = new Set(holidays);
+      while (d <= endDate) {
+        const day = d.getDay();
+        const dateStr = getDateKey(d);
+        // Workdays: exclude Friday (5) and any holidays
+        if (day !== 5 && !holidayDates.has(dateStr)) count++;
+        d.setDate(d.getDate() + 1);
+      }
+      return count;
+    };
+
+    const monthStart = new Date(currentYear, currentMonth, 1);
+    // TODO: Pass holidays from parent state when available
+    const monthWorkdaysSoFar = countWorkdaysSoFar(monthStart, now, []);
+    const minWorkdaysRequired = Math.ceil(monthWorkdaysSoFar * 0.9); // 90% threshold
+    
+    // Find most punctual (earliest average arrival time, tie-break by most workdays)
+    let mostPunctual = { user: 'N/A', workdayCount: 0, avgTime: Infinity };
+    
+    Object.entries(punctualityStats).forEach(([user, stats]) => {
+      const avgTime = stats.times.reduce((a, b) => a + b, 0) / stats.times.length;
+      const workdays = stats.workdays;
+
+      // Require minimum workdays participation
+      if (workdays < minWorkdaysRequired) return;
+      
+      // Compare: earliest average time wins, if tied then most workdays wins
+      const isBetter = (avgTime < mostPunctual.avgTime) || 
+                       (avgTime === mostPunctual.avgTime && workdays > mostPunctual.workdayCount);
+      
+      if (isBetter) {
+        mostPunctual = { user, workdayCount: workdays, avgTime };
       }
     });
     
-    // Calculate average arrival time for each user and find earliest
-    const punctualityScores = Object.values(punctualityByUser).map(entry => {
-      const avgTime = entry.times.reduce((a, b) => a + b, 0) / entry.times.length;
-      const minutesLate = Math.max(0, avgTime - shiftStart); // How many minutes late on average
-      return { user: entry.user, avgTime, minutesLate, count: entry.times.length };
+    // ===== CATEGORY 3: BEST SALES =====
+    let bestSales = { user: 'N/A', count: 0 };
+    const salesCounts = {};
+    
+    files.forEach(file => {
+      const createdDate = toDhakaTime(file.createdAt);
+      if (!createdDate || createdDate < HONORS_START_DATE || !file.isNewSale) return;
+      
+      const fileMonthString = getMonthString(createdDate);
+      if (fileMonthString !== monthString) return;
+      
+      const user = file.assignedTo || 'System';
+      if (userRoles[user] !== ROLES.SALES) return;
+      
+      salesCounts[user] = (salesCounts[user] || 0) + 1;
     });
-    const mostPunctual = punctualityScores.length > 0
-      ? punctualityScores.sort((a, b) => a.avgTime - b.avgTime)[0] // Earliest average time
-      : { user: 'N/A', count: 0 };
-
-    // Category 3: Best Sales (month) - Only Sales Reps with most files created
-    const salesByUser = {};
-    files.forEach(f => {
-      const createdDate = f.createdAt ? new Date(f.createdAt.seconds * 1000) : null;
-      if (createdDate && createdDate >= effectiveMonthStart && f.isNewSale !== false) {
-        const user = f.assignedTo || 'Sales Team';
-        // Only count if assigned user is a Sales Rep
-        if (userRoles[user] === ROLES.SALES) {
-          if (!salesByUser[user]) {
-            salesByUser[user] = { user, count: 0 };
-          }
-          salesByUser[user].count++;
-        }
+    
+    Object.entries(salesCounts).forEach(([user, count]) => {
+      if (count > bestSales.count) {
+        bestSales = { user, count };
       }
     });
-    const bestSales = Object.values(salesByUser).length > 0
-      ? Object.values(salesByUser).sort((a, b) => b.count - a.count)[0]
-      : { user: 'N/A', count: 0 };
-
-    // Category 4: Best Processing (month) - Most files SUBMITTED (not DONE)
-    const processingByUser = {};
-    files.forEach(f => {
-      const updatedDate = f.updatedAt ? new Date(f.updatedAt.seconds * 1000) : null;
-      if (updatedDate && updatedDate >= effectiveMonthStart && f.status === 'SUBMITTED') {
-        const user = f.assignedTo || 'Processing Team';
-        if (!processingByUser[user]) {
-          processingByUser[user] = { user, count: 0 };
-        }
-        processingByUser[user].count++;
+    
+    // ===== CATEGORY 4: BEST PROCESSING =====
+    let bestProcessing = { user: 'N/A', count: 0 };
+    const processingCounts = {};
+    
+    files.forEach(file => {
+      const updatedDate = toDhakaTime(file.updatedAt);
+      if (!updatedDate || updatedDate < HONORS_START_DATE || file.status !== 'SUBMITTED') return;
+      
+      const fileMonthString = getMonthString(updatedDate);
+      if (fileMonthString !== monthString) return;
+      
+      const user = file.assignedTo || 'System';
+      processingCounts[user] = (processingCounts[user] || 0) + 1;
+    });
+    
+    Object.entries(processingCounts).forEach(([user, count]) => {
+      if (count > bestProcessing.count) {
+        bestProcessing = { user, count };
       }
     });
-    const bestProcessing = Object.values(processingByUser).length > 0
-      ? Object.values(processingByUser).sort((a, b) => b.count - a.count)[0]
-      : { user: 'N/A', count: 0 };
-
+    
     return {
       earliestToday,
       mostPunctual,
       bestSales,
       bestProcessing
     };
-  }, [files, allUsers]);
+  }, [files, allUsers, attendanceRecords]);
+
+  const isFileCompleted = (file) => {
+    if (file.fileType === FILE_TYPES.VISA) {
+      return ['DONE', 'FOLLOW_UP'].includes(file.status);
+    } else if (file.fileType === FILE_TYPES.AIR_TICKET) {
+      return file.status === 'ISSUED';
+    } else if (file.fileType === FILE_TYPES.PACKAGE) {
+      return file.status === 'PACKAGE_READY';
+    }
+    return false;
+  };
 
   const stats = useMemo(() => {
     const today = getStartOf('today');
@@ -1658,7 +1846,8 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
     let inProcess = 0;
 
     files.forEach(f => {
-      // Logic Update: Count only if isNewSale is EXACTLY true (future files)
+      if (isFileCompleted(f)) return;
+
       const isSale = f.isNewSale !== false;
       
       if (f.createdAt?.seconds * 1000 >= today.getTime() && isSale) {
@@ -1671,8 +1860,45 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
       if (submittedAction) submittedToday++;
     });
 
-    return { salesToday, submittedToday, inProcess };
-  }, [files]);
+    // Calculate workdays for current user this month
+    const now = getDhakaDate();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth();
+    const monthStart = new Date(currentYear, currentMonth, 1);
+    const getDateKey = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    
+    // User's workdays (unique days with at least one login, excluding Fridays)
+    const userWorkdaysSet = new Set();
+    attendanceRecords.forEach(record => {
+      if (!record.loginTime) return;
+      const loginTime = record.loginTime.toDate ? record.loginTime.toDate() : new Date((record.loginTime.seconds || 0) * 1000);
+      // Adjust to Dhaka time
+      const dhakaTime = new Date(loginTime.getTime() + (6 * 60 * 60 * 1000) - (loginTime.getTimezoneOffset() * 60 * 1000));
+      
+      // Only count if in current month and not Friday (5)
+      if (dhakaTime.getFullYear() === currentYear && dhakaTime.getMonth() === currentMonth && dhakaTime.getDay() !== 5) {
+        userWorkdaysSet.add(getDateKey(dhakaTime));
+      }
+    });
+    
+    // Total workdays in month (1st to today, excluding Fridays)
+    let totalWorkdaysInMonth = 0;
+    const d = new Date(monthStart);
+    while (d <= now) {
+      if (d.getDay() !== 5) { // Skip Friday
+        totalWorkdaysInMonth++;
+      }
+      d.setDate(d.getDate() + 1);
+    }
+
+    return { 
+      salesToday, 
+      submittedToday, 
+      inProcess,
+      daysWorked: userWorkdaysSet.size,
+      totalWorkdaysMonth: totalWorkdaysInMonth
+    };
+  }, [files, isFileCompleted, attendanceRecords]);
 
   const recentActivity = useMemo(() => {
     const allEvents = [];
@@ -1686,8 +1912,8 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
 
   // Upcoming Reminders Logic
   const reminders = useMemo(() => {
-    const today = new Date();
-    today.setHours(0,0,0,0); // Local midnight today
+    const today = getDhakaDate();
+    today.setHours(0,0,0,0); // Dhaka midnight today
 
     return files
         .filter(f => f.reminderDate)
@@ -1702,12 +1928,17 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
         .slice(0, 5); 
   }, [files]);
   
+  const normalizedSearch = searchTerm.trim().toLowerCase();
   const filteredFiles = files.filter(f => {
+    if (!normalizedSearch) return destFilter ? f.destination === destFilter : true;
+
     const matchesSearch = 
-      f.applicantName.toLowerCase().includes(searchTerm.toLowerCase()) || 
-      f.passportNo.includes(searchTerm) ||
-      (f.fileId && f.fileId.toLowerCase().includes(searchTerm.toLowerCase()));
-    
+      (f.applicantName && String(f.applicantName).toLowerCase().includes(normalizedSearch)) || 
+      (f.passportNo && String(f.passportNo).trim().toLowerCase().includes(normalizedSearch)) ||
+      (f.mainPersonPassport && String(f.mainPersonPassport).trim().toLowerCase().includes(normalizedSearch)) ||
+      (f.destination && String(f.destination).toLowerCase().includes(normalizedSearch)) ||
+      (f.fileId && String(f.fileId).toLowerCase().includes(normalizedSearch));
+
     const matchesDest = destFilter ? f.destination === destFilter : true;
     return matchesSearch && matchesDest;
   });
@@ -1773,7 +2004,7 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
             <div className={`p-3 rounded-lg border ${darkMode ? 'border-green-800/50 bg-green-900/20' : 'border-green-200 bg-green-50'}`}>
               <p className={`text-[10px] font-semibold ${darkMode ? 'text-green-400' : 'text-green-600'} uppercase tracking-wide mb-2`}>✓ Most Punctual</p>
               <p className={`text-sm font-semibold ${textMain}`}>{honorsMetrics.mostPunctual.user}</p>
-              <p className={`text-xs ${textSub}`}>{honorsMetrics.mostPunctual.count} logins this month</p>
+              <p className={`text-xs ${textSub}`}>{honorsMetrics.mostPunctual.workdayCount} workdays this month</p>
             </div>
 
             {/* Best Sales */}
@@ -1795,6 +2026,26 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
 
       {/* Main Content Area */}
       <div className="lg:col-span-3 space-y-8">
+        {/* Clock and Workday Count */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className={`p-6 rounded-xl border flex items-center justify-between ${cardClass}`}>
+            <div>
+              <p className={`text-xs font-medium ${textSub}`}>Current Time (Dhaka)</p>
+              <p className={`text-3xl md:text-4xl font-bold ${textMain} font-mono`}>{currentTime.toLocaleTimeString('en-BD', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}</p>
+            </div>
+            <div className={`${darkMode ? 'bg-blue-900/30 text-blue-400' : 'bg-blue-100 text-blue-600'} p-4 rounded-full`}><Clock className="h-6 md:h-8 w-6 md:w-8"/></div>
+          </div>
+
+          <div className={`p-6 rounded-xl border flex items-center justify-between ${cardClass}`}>
+            <div>
+              <p className={`text-xs font-medium ${textSub}`}>Workdays This Month</p>
+              <p className={`text-3xl md:text-4xl font-bold ${textMain}`}><span className="text-green-600">{stats.daysWorked || 0}</span>/<span className="text-slate-400">{stats.totalWorkdaysMonth || 0}</span></p>
+              <p className={`text-xs ${textSub} mt-1`}>{stats.daysWorked ? Math.round((stats.daysWorked / stats.totalWorkdaysMonth) * 100) : 0}% attendance</p>
+            </div>
+            <div className={`${darkMode ? 'bg-green-900/30 text-green-400' : 'bg-green-100 text-green-600'} p-4 rounded-full`}><Calendar className="h-6 md:h-8 w-6 md:w-8"/></div>
+          </div>
+        </div>
+
         {/* Stats Cards */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
         <div className={`p-4 md:p-6 rounded-xl border flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-0 ${cardClass}`}>
@@ -1953,7 +2204,7 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
               <div className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
                  {recentActivity.map((act, idx) => (
                     <div key={idx} className="p-4">
-                       <p className={`text-sm ${textMain}`}><span className="font-medium">{act.performedBy}</span> {act.action.split(' - ')[0]}</p>
+                       <p className={`text-sm ${textMain}`}><span className="font-medium">{act.performedBy}</span> {(act.action || act.note || '').split(' - ')[0]}</p>
                        <div className="flex justify-between items-center mt-1">
                           <span className="text-xs text-blue-500 font-medium">{act.fileId || 'N/A'} - {act.applicant}</span>
                           <span className="text-[10px] text-slate-400">{formatDate({seconds: act.timestamp/1000}).split(',')[1]}</span>
@@ -1991,25 +2242,36 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
     includesFlight: false,
     includesPickDrop: false,
     packageSalePrice: '',
-    packageCostPrice: ''
+    packageCostPrice: '',
+    numberOfPersons: '',
+    mainPersonPassport: ''
   });
   const [countries, setCountries] = useState([]);
 
   useEffect(() => {
-    // Fetch countries from admin settings
+    // First try to fetch countries from admin settings
     const fetchCountries = async () => {
       try {
         const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'countries');
         const docSnap = await getDoc(docRef);
-        if (docSnap.exists()) {
-          setCountries(docSnap.data().items || []);
+        if (docSnap.exists() && docSnap.data().items && docSnap.data().items.length > 0) {
+          setCountries(docSnap.data().items);
+        } else {
+          // Fallback to destinations if countries not found in settings
+          if (destinations && destinations.length > 0) {
+            setCountries(destinations);
+          }
         }
       } catch (err) {
         console.error('Error fetching countries:', err);
+        // Fallback to destinations on error
+        if (destinations && destinations.length > 0) {
+          setCountries(destinations);
+        }
       }
     };
     fetchCountries();
-  }, []);
+  }, [destinations]);
 
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-lg';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
@@ -2173,6 +2435,31 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
                   />
                 </div>
               ))}
+
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Number of Persons</label>
+                <input
+                  type="number"
+                  min="1"
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  placeholder="Enter number of persons"
+                  value={formData.numberOfPersons}
+                  onChange={e => setFormData({...formData, numberOfPersons: e.target.value})}
+                />
+              </div>
+
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Main Person Passport No.</label>
+                <input
+                  type="text"
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  placeholder="Enter passport number"
+                  value={formData.mainPersonPassport}
+                  onChange={e => setFormData({...formData, mainPersonPassport: e.target.value})}
+                />
+              </div>
 
               <div className="col-span-1 sm:col-span-2">
                 <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Package Options</label>
@@ -2363,7 +2650,7 @@ function PipelineView({ files, darkMode }) {
   );
 }
 
-function AdminPanel({ currentUser, destinations, darkMode, onGrantAccountingAccess, onRevokeAccountingAccess }) {
+function AdminPanel({ currentUser, destinations, darkMode }) {
   const [users, setUsers] = useState([]);
   const [userForm, setUserForm] = useState({ fullName: '', username: '', password: '', role: ROLES.SALES });
   const [newDest, setNewDest] = useState('');
@@ -2371,6 +2658,9 @@ function AdminPanel({ currentUser, destinations, darkMode, onGrantAccountingAcce
   const [portals, setPortals] = useState([]);
   const [isTrusted, setIsTrusted] = useState(() => localStorage.getItem('vt_trusted_device') === 'true');
   const [activeSessions, setActiveSessions] = useState([]);
+  const [holidays, setHolidays] = useState([]);
+  const [showHolidayForm, setShowHolidayForm] = useState(false);
+  const [holidayForm, setHolidayForm] = useState({ startDate: '', endDate: '', reason: '' });
   
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
@@ -2407,6 +2697,18 @@ function AdminPanel({ currentUser, destinations, darkMode, onGrantAccountingAcce
     const unsubscribe = onSnapshot(attQ, (snapshot) => {
       const sessions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setActiveSessions(sessions);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'holidays');
+    const unsubscribe = onSnapshot(docRef, (snapshot) => {
+      if (snapshot.exists()) {
+        setHolidays(snapshot.data().items || []);
+      } else {
+        setHolidays([]);
+      }
     });
     return () => unsubscribe();
   }, []);
@@ -2510,6 +2812,36 @@ function AdminPanel({ currentUser, destinations, darkMode, onGrantAccountingAcce
     }
   };
 
+  const handleAddHoliday = async (e) => {
+    e.preventDefault();
+    if (!holidayForm.startDate || !holidayForm.endDate) {
+      alert('Please select both start and end dates');
+      return;
+    }
+    
+    try {
+      const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'holidays');
+      await setDoc(docRef, { items: arrayUnion(holidayForm) }, { merge: true });
+      setHolidayForm({ startDate: '', endDate: '', reason: '' });
+      setShowHolidayForm(false);
+    } catch (err) {
+      console.error('Error adding holiday:', err);
+      alert('Error adding holiday period');
+    }
+  };
+
+  const handleDeleteHoliday = async (holiday) => {
+    if (confirm(`Remove holiday period ${holiday.startDate} to ${holiday.endDate}?`)) {
+      try {
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'holidays');
+        await updateDoc(docRef, { items: arrayRemove(holiday) });
+      } catch (err) {
+        console.error('Error deleting holiday:', err);
+        alert('Error removing holiday');
+      }
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">
@@ -2592,31 +2924,9 @@ function AdminPanel({ currentUser, destinations, darkMode, onGrantAccountingAcce
                      <div className="flex-1">
                        <p className={`font-medium text-sm ${textMain}`}>{u.fullName}</p>
                        <p className="text-[10px] text-slate-500 uppercase tracking-wide">{u.role} • {u.username}</p>
-                       {u.accountingAccess && <p className={`text-[10px] ${darkMode ? 'text-emerald-400' : 'text-emerald-600'}`}> Accounting Access Granted</p>}
                      </div>
                    </div>
                    <div className="flex items-center gap-2">
-                     {u.role !== ROLES.ADMIN && (
-                       <>
-                         {u.accountingAccess ? (
-                           <button 
-                             onClick={() => onRevokeAccountingAccess(u.id)}
-                             className={`px-2 py-1 rounded text-xs font-medium transition-colors ${darkMode ? 'bg-red-900/30 text-red-300 hover:bg-red-900/50' : 'bg-red-100 text-red-700 hover:bg-red-200'}`}
-                             title="Revoke Accounting Access"
-                           >
-                             Revoke Access
-                           </button>
-                         ) : (
-                           <button 
-                             onClick={() => onGrantAccountingAccess(u.id)}
-                             className={`px-2 py-1 rounded text-xs font-medium transition-colors ${darkMode ? 'bg-emerald-900/30 text-emerald-300 hover:bg-emerald-900/50' : 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200'}`}
-                             title="Grant Accounting Access"
-                           >
-                             Grant Access
-                           </button>
-                         )}
-                       </>
-                     )}
                      {u.id !== currentUser.id && (
                        <button 
                          onClick={() => handleDeleteUser(u.id)}
@@ -2691,6 +3001,88 @@ function AdminPanel({ currentUser, destinations, darkMode, onGrantAccountingAcce
           </div>
         </div>
 
+      </div>
+
+      {/* Holiday Period Management Section */}
+      <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
+        <div className={`px-6 py-4 border-b flex justify-between items-center ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
+          <h3 className={`font-bold flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
+            <Calendar className="h-5 w-5"/> Holiday Periods
+          </h3>
+          <span className={`text-xs px-2 py-1 rounded-full ${darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600'}`}>{holidays.length} Periods</span>
+        </div>
+
+        <div className={`p-4 border-b ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-100 bg-slate-50'}`}>
+          {!showHolidayForm ? (
+            <button
+              onClick={() => setShowHolidayForm(true)}
+              className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium text-sm"
+            >
+              <Plus className="h-4 w-4"/> Add Holiday Period
+            </button>
+          ) : (
+            <form onSubmit={handleAddHoliday} className="space-y-3">
+              <div>
+                <label className={`block text-xs font-bold mb-1 ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Start Date</label>
+                <input 
+                  type="date"
+                  required
+                  className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                  value={holidayForm.startDate}
+                  onChange={e => setHolidayForm({...holidayForm, startDate: e.target.value})}
+                />
+              </div>
+              <div>
+                <label className={`block text-xs font-bold mb-1 ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>End Date</label>
+                <input 
+                  type="date"
+                  required
+                  className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                  value={holidayForm.endDate}
+                  onChange={e => setHolidayForm({...holidayForm, endDate: e.target.value})}
+                />
+              </div>
+              <div>
+                <label className={`block text-xs font-bold mb-1 ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Reason (optional)</label>
+                <input 
+                  type="text"
+                  placeholder="e.g., National Holiday, Office Maintenance"
+                  className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
+                  value={holidayForm.reason}
+                  onChange={e => setHolidayForm({...holidayForm, reason: e.target.value})}
+                />
+              </div>
+              <div className="flex gap-2">
+                <button type="submit" className="flex-1 bg-green-600 text-white p-2 rounded-lg hover:bg-green-700 text-sm font-medium">Save</button>
+                <button type="button" onClick={() => setShowHolidayForm(false)} className="flex-1 bg-slate-600 text-white p-2 rounded-lg hover:bg-slate-700 text-sm font-medium">Cancel</button>
+              </div>
+            </form>
+          )}
+        </div>
+
+        <div className={`divide-y max-h-64 overflow-y-auto ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
+          {holidays.length === 0 ? (
+            <div className={`p-4 text-center ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+              <p className="text-sm">No holiday periods set</p>
+            </div>
+          ) : (
+            holidays.map((holiday, idx) => (
+              <div key={idx} className={`p-4 flex items-center justify-between transition-colors ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`}>
+                <div className="flex-1">
+                  <p className={`font-medium text-sm ${textMain}`}>{holiday.startDate} to {holiday.endDate}</p>
+                  {holiday.reason && <p className={`text-xs ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>{holiday.reason}</p>}
+                </div>
+                <button
+                  onClick={() => handleDeleteHoliday(holiday)}
+                  className="text-slate-400 hover:text-red-600 p-1"
+                  title="Delete Holiday"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            ))
+          )}
+        </div>
       </div>
 
       {/* Attendance Sessions Management Section */}
@@ -2873,9 +3265,25 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
                 {file.visaResult === 'APPROVED' && <span className={`text-[10px] sm:text-xs px-2 py-0.5 rounded border flex items-center gap-1 ${darkMode ? 'bg-green-900/30 text-green-400 border-green-800' : 'bg-green-100 text-green-700 border-green-200'}`}><ThumbsUp className="h-3 w-3"/> Approved</span>}
                 {file.visaResult === 'REJECTED' && <span className={`text-[10px] sm:text-xs px-2 py-0.5 rounded border flex items-center gap-1 ${darkMode ? 'bg-red-900/30 text-red-400 border-red-800' : 'bg-red-100 text-red-700 border-red-200'}`}><ThumbsDown className="h-3 w-3"/> Rejected</span>}
                 
-                <span className="flex items-center gap-1"><User className="h-3 w-3" /> {file.passportNo}</span>
-                <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {file.destination || 'N/A'}</span>
-                {file.serviceCharge && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold">৳</span> {file.serviceCharge}</span>}
+                {file.fileType === FILE_TYPES.PACKAGE ? (
+                  <>
+                    {file.numberOfPersons && <span className="flex items-center gap-1"><User className="h-3 w-3" /> {file.numberOfPersons} person{file.numberOfPersons > 1 ? 's' : ''}</span>}
+                    {file.mainPersonPassport && <span className="flex items-center gap-1"><User className="h-3 w-3" /> Passport: {file.mainPersonPassport}</span>}
+                    {file.packageCountries && file.packageCountries.length > 0 && <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {file.packageCountries.join(', ')}</span>}
+                    {file.packageSalePrice && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold">৳</span> {file.packageSalePrice}</span>}
+                  </>
+                ) : file.fileType === FILE_TYPES.AIR_TICKET ? (
+                  <>
+                    {file.airlineRoute && <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {file.airlineRoute}</span>}
+                    {file.airlineSalePrice && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold">৳</span> {file.airlineSalePrice}</span>}
+                  </>
+                ) : (
+                  <>
+                    <span className="flex items-center gap-1"><User className="h-3 w-3" /> {file.passportNo}</span>
+                    <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {file.destination || 'N/A'}</span>
+                    {file.serviceCharge && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold\">৳</span> {file.serviceCharge}</span>}
+                  </>
+                )}
                 <span className="flex items-center gap-1">📞 {file.contactNo}</span>
                 {file.reminderDate && <span className="flex items-center gap-1 text-orange-500"><Clock className="h-3 w-3"/> {formatSimpleDate(file.reminderDate)}</span>}
               </div>
@@ -2947,7 +3355,7 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
             )}
           </div>
 
-          {isOwner && file.status !== 'DONE' && (
+          {(isOwner || ((file.fileType === FILE_TYPES.PACKAGE || file.fileType === FILE_TYPES.AIR_TICKET) && user.role === ROLES.ADMIN)) && file.status !== 'DONE' && file.status !== 'ISSUED' && file.status !== 'PACKAGE_READY' && (
             <div className="flex flex-wrap gap-1.5 sm:gap-2 w-full sm:w-auto">
               {getAvailableActions().map(action => (
                 <button
@@ -2989,10 +3397,38 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
             </div>
           )}
 
-          {file.fileType === FILE_TYPES.PACKAGE && (file.flightPnr || file.hotelName || file.routes) && (
+          {file.fileType === FILE_TYPES.PACKAGE && (file.numberOfPersons || file.mainPersonPassport || file.flightPnr || file.hotelName || file.routes) && (
             <div className="mb-6 p-4 rounded-lg border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-900/20">
               <h4 className="text-sm font-semibold text-emerald-700 dark:text-emerald-300 mb-3">📦 Package Details</h4>
               <div className="space-y-3 text-sm">
+                {(file.packageCountries && file.packageCountries.length > 0) && (
+                  <div className="pb-3 border-b border-emerald-200 dark:border-emerald-800">
+                    <p className="font-medium">Itinerary</p>
+                    <div className="text-xs space-y-1 mt-1">
+                      {file.packageCountries.map(country => (
+                        <p key={country} className="text-slate-600 dark:text-slate-400">
+                          <span className="font-medium">{country}:</span> {file.packageNights && file.packageNights[country] ? file.packageNights[country] + ' nights' : 'N/A'}
+                        </p>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {(file.includesFlight !== undefined || file.includesPickDrop !== undefined) && (
+                  <div className="pb-3 border-b border-emerald-200 dark:border-emerald-800">
+                    <p className="font-medium">Package Inclusions</p>
+                    <div className="text-xs space-y-1 mt-1">
+                      <p className="text-slate-600 dark:text-slate-400">✈️ Flight: {file.includesFlight ? 'Yes' : 'No'}</p>
+                      <p className="text-slate-600 dark:text-slate-400">🚗 Pick & Drop: {file.includesPickDrop ? 'Yes' : 'No'}</p>
+                    </div>
+                  </div>
+                )}
+                {(file.numberOfPersons || file.mainPersonPassport) && (
+                  <div className="pb-3 border-b border-emerald-200 dark:border-emerald-800">
+                    <p className="font-medium">Passenger Information</p>
+                    {file.numberOfPersons && <p className="text-xs"><span className="font-medium">Number of Persons:</span> {file.numberOfPersons}</p>}
+                    {file.mainPersonPassport && <p className="text-xs"><span className="font-medium">Main Person Passport:</span> {file.mainPersonPassport}</p>}
+                  </div>
+                )}
                 {file.flightPnr && (
                   <div className="pb-3 border-b border-emerald-200 dark:border-emerald-800">
                     <p className="font-medium">Flight Booking</p>
@@ -3680,30 +4116,73 @@ function NoteModal({ isOpen, onClose, onConfirm, file, darkMode }) {
     );
 }
 
-function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMode }) {
-    const [editData, setEditData] = useState({
-        applicantName: file?.applicantName || '',
-        passportNo: file?.passportNo || '',
-        contactNo: file?.contactNo || '',
-        destination: file?.destination || '',
-        serviceCharge: file?.serviceCharge || '',
-        cost: file?.cost || '',
-        reminderDate: file?.reminderDate || ''
-    });
+function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMode, allUsers, currentUser }) {
+    const [editData, setEditData] = useState({});
+    const [initialized, setInitialized] = useState(false);
 
     useEffect(() => {
-        if (file) {
-            setEditData({
-                applicantName: file.applicantName || '',
-                passportNo: file.passportNo || '',
-                contactNo: file.contactNo || '',
-                destination: file.destination || '',
-                serviceCharge: file.serviceCharge || '',
-                cost: file.cost || '',
-                reminderDate: file.reminderDate || ''
-            });
+        if (isOpen && file && !initialized) {
+            // Only initialize once when modal opens
+            if (file.fileType === FILE_TYPES.VISA) {
+                setEditData({
+                    applicantName: file.applicantName || '',
+                    passportNo: file.passportNo || '',
+                    contactNo: file.contactNo || '',
+                    destination: file.destination || '',
+                    serviceCharge: file.serviceCharge || '',
+                    cost: file.cost || '',
+                    reminderDate: file.reminderDate || '',
+                    createdBy: file.createdBy || ''
+                });
+            } else if (file.fileType === FILE_TYPES.AIR_TICKET) {
+                setEditData({
+                    applicantName: file.applicantName || '',
+                    contactNo: file.contactNo || '',
+                    airlineRoute: file.airlineRoute || '',
+                    airlineSalePrice: file.airlineSalePrice || '',
+                    airlineCostPrice: file.airlineCostPrice || '',
+                    pnr: file.pnr || '',
+                    portal: file.portal || '',
+                    createdBy: file.createdBy || ''
+                });
+            } else if (file.fileType === FILE_TYPES.PACKAGE) {
+                setEditData({
+                    applicantName: file.applicantName || '',
+                    contactNo: file.contactNo || '',
+                    numberOfPersons: file.numberOfPersons || '',
+                    mainPersonPassport: file.mainPersonPassport || '',
+                    packageCountries: file.packageCountries || [],
+                    packageNights: file.packageNights || {},
+                    includesFlight: file.includesFlight || false,
+                    includesPickDrop: file.includesPickDrop || false,
+                    packageSalePrice: file.packageSalePrice || '',
+                    packageCostPrice: file.packageCostPrice || '',
+                    createdBy: file.createdBy || ''
+                });
+            }
+            setInitialized(true);
+        } else if (!isOpen) {
+            // Reset when modal closes
+            setInitialized(false);
         }
-    }, [file]);
+    }, [isOpen, file?.id]);
+
+    const handleCountryToggle = (country) => {
+        const updated = editData.packageCountries.includes(country)
+          ? editData.packageCountries.filter(c => c !== country)
+          : [...editData.packageCountries, country];
+        setEditData({...editData, packageCountries: updated});
+    };
+
+    const handleNightsChange = (country, nights) => {
+        setEditData({
+            ...editData, 
+            packageNights: {
+                ...editData.packageNights,
+                [country]: nights
+            }
+        });
+    };
 
     if (!isOpen) return null;
 
@@ -3712,59 +4191,233 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
       ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
       : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
 
+    const renderVISAFields = () => (
+        <>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Applicant Name</label>
+                <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.applicantName} onChange={e => setEditData({...editData, applicantName: e.target.value})} />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Passport No</label>
+                    <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.passportNo} onChange={e => setEditData({...editData, passportNo: e.target.value})} />
+                </div>
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Contact No</label>
+                    <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.contactNo} onChange={e => setEditData({...editData, contactNo: e.target.value})} />
+                </div>
+            </div>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Destination</label>
+                <select className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.destination} onChange={e => setEditData({...editData, destination: e.target.value})}>
+                    <option value="">Select destination</option>
+                    {destinations.map(d => <option key={d} value={d}>{d}</option>)}
+                </select>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Service Charge (৳)</label>
+                    <input 
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                      value={editData.serviceCharge} 
+                      onChange={e => setEditData({...editData, serviceCharge: e.target.value})} 
+                    />
+                </div>
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Cost (৳)</label>
+                    <input 
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                      value={editData.cost} 
+                      onChange={e => setEditData({...editData, cost: e.target.value})} 
+                    />
+                </div>
+            </div>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Reminder Date</label>
+                <input type="date" className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.reminderDate || ''} onChange={e => setEditData({...editData, reminderDate: e.target.value})} />
+            </div>
+        </>
+    );
+
+    const renderAIR_TICKETFields = () => (
+        <>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Applicant Name</label>
+                <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.applicantName} onChange={e => setEditData({...editData, applicantName: e.target.value})} />
+            </div>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Contact No</label>
+                <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.contactNo} onChange={e => setEditData({...editData, contactNo: e.target.value})} />
+            </div>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Airline Route</label>
+                <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} placeholder="e.g., DHK-NYC-DHK" value={editData.airlineRoute} onChange={e => setEditData({...editData, airlineRoute: e.target.value})} />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Sale Price (৳)</label>
+                    <input 
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                      value={editData.airlineSalePrice} 
+                      onChange={e => setEditData({...editData, airlineSalePrice: e.target.value})} 
+                    />
+                </div>
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Cost Price (৳)</label>
+                    <input 
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                      value={editData.airlineCostPrice} 
+                      onChange={e => setEditData({...editData, airlineCostPrice: e.target.value})} 
+                    />
+                </div>
+            </div>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">PNR</label>
+                <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.pnr} onChange={e => setEditData({...editData, pnr: e.target.value})} />
+            </div>
+        </>
+    );
+
+    const renderPACKAGEFields = () => (
+        <>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Applicant Name</label>
+                <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.applicantName} onChange={e => setEditData({...editData, applicantName: e.target.value})} />
+            </div>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Contact No</label>
+                <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.contactNo} onChange={e => setEditData({...editData, contactNo: e.target.value})} />
+            </div>
+            <div className="col-span-1 sm:col-span-2">
+                <label className="block text-sm font-medium mb-2 opacity-80">Destinations</label>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 p-3 border rounded-lg bg-opacity-50">
+                    {destinations.map(country => (
+                        <label key={country} className={`flex items-center gap-2 p-2 rounded cursor-pointer ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-100'}`}>
+                            <input
+                                type="checkbox"
+                                checked={editData.packageCountries?.includes(country) || false}
+                                onChange={() => handleCountryToggle(country)}
+                                className="h-4 w-4"
+                            />
+                            <span className="text-sm">{country}</span>
+                        </label>
+                    ))}
+                </div>
+            </div>
+
+            {editData.packageCountries?.map(country => (
+                <div key={country}>
+                    <label className="block text-sm font-medium mb-1 opacity-80">{country} - Nights</label>
+                    <input
+                        type="number"
+                        min="1"
+                        className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}
+                        value={editData.packageNights?.[country] || ''}
+                        onChange={e => handleNightsChange(country, e.target.value)}
+                    />
+                </div>
+            ))}
+
+            <div className="grid grid-cols-2 gap-4">
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Number of Persons</label>
+                    <input 
+                      type="number"
+                      min="1"
+                      className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                      value={editData.numberOfPersons} 
+                      onChange={e => setEditData({...editData, numberOfPersons: e.target.value})} 
+                    />
+                </div>
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Main Person Passport</label>
+                    <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.mainPersonPassport} onChange={e => setEditData({...editData, mainPersonPassport: e.target.value})} />
+                </div>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Sale Price (৳)</label>
+                    <input 
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                      value={editData.packageSalePrice} 
+                      onChange={e => setEditData({...editData, packageSalePrice: e.target.value})} 
+                    />
+                </div>
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Cost Price (৳)</label>
+                    <input 
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                      value={editData.packageCostPrice} 
+                      onChange={e => setEditData({...editData, packageCostPrice: e.target.value})} 
+                    />
+                </div>
+            </div>
+            <div className="space-y-2">
+                <label className="flex items-center gap-2">
+                    <input 
+                      type="checkbox"
+                      checked={editData.includesFlight}
+                      onChange={e => setEditData({...editData, includesFlight: e.target.checked})}
+                      className="h-4 w-4"
+                    />
+                    <span className="text-sm font-medium">Includes Flight</span>
+                </label>
+                <label className="flex items-center gap-2">
+                    <input 
+                      type="checkbox"
+                      checked={editData.includesPickDrop}
+                      onChange={e => setEditData({...editData, includesPickDrop: e.target.checked})}
+                      className="h-4 w-4"
+                    />
+                    <span className="text-sm font-medium">Includes Pick & Drop</span>
+                </label>
+            </div>
+        </>
+    );
+
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
-            <div className={`rounded-2xl shadow-xl w-full max-w-lg p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
-                <h3 className="text-lg font-bold mb-6">Edit File Details</h3>
+            <div className={`rounded-2xl shadow-xl w-full max-w-lg p-6 animate-in fade-in zoom-in duration-200 max-h-[90vh] overflow-y-auto ${cardClass}`}>
+                <h3 className="text-lg font-bold mb-6">Edit File Details ({file?.fileType || 'File'})</h3>
                 <div className="space-y-4">
-                    <div>
-                        <label className="block text-sm font-medium mb-1 opacity-80">Applicant Name</label>
-                        <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.applicantName} onChange={e => setEditData({...editData, applicantName: e.target.value})} />
-                    </div>
-                    <div className="grid grid-cols-2 gap-4">
+                    {/* Sales Rep - Admin Only */}
+                    {currentUser?.role === ROLES.ADMIN && (
                         <div>
-                            <label className="block text-sm font-medium mb-1 opacity-80">Passport No</label>
-                            <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.passportNo} onChange={e => setEditData({...editData, passportNo: e.target.value})} />
+                            <label className="block text-sm font-medium mb-1 opacity-80">Sales Rep</label>
+                            <select 
+                                className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                                value={editData.createdBy} 
+                                onChange={e => setEditData({...editData, createdBy: e.target.value})}
+                            >
+                                <option value="">Select Sales Rep</option>
+                                {allUsers && allUsers.map(u => (
+                                    <option key={u.id} value={u.fullName}>{u.fullName} ({u.role})</option>
+                                ))}
+                            </select>
                         </div>
-                        <div>
-                            <label className="block text-sm font-medium mb-1 opacity-80">Contact No</label>
-                            <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.contactNo} onChange={e => setEditData({...editData, contactNo: e.target.value})} />
-                        </div>
-                    </div>
-                    <div>
-                        <label className="block text-sm font-medium mb-1 opacity-80">Destination</label>
-                        <select className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.destination} onChange={e => setEditData({...editData, destination: e.target.value})}>
-                            {destinations.map(d => <option key={d} value={d}>{d}</option>)}
-                        </select>
-                    </div>
-                    <div className="grid grid-cols-2 gap-4">
-                        <div>
-                            <label className="block text-sm font-medium mb-1 opacity-80">Service Charge</label>
-                            <input 
-                              type="number"
-                              min="0"
-                              step="0.01"
-                              className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
-                              value={editData.serviceCharge} 
-                              onChange={e => setEditData({...editData, serviceCharge: e.target.value})} 
-                            />
-                        </div>
-                        <div>
-                            <label className="block text-sm font-medium mb-1 opacity-80">Cost</label>
-                            <input 
-                              type="number"
-                              min="0"
-                              step="0.01"
-                              className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
-                              value={editData.cost} 
-                              onChange={e => setEditData({...editData, cost: e.target.value})} 
-                            />
-                        </div>
-                    </div>
-                    <div>
-                        <label className="block text-sm font-medium mb-1 opacity-80">Reminder Date</label>
-                        <input type="date" className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.reminderDate} onChange={e => setEditData({...editData, reminderDate: e.target.value})} />
-                    </div>
+                    )}
+                    
+                    {file?.fileType === FILE_TYPES.VISA && renderVISAFields()}
+                    {file?.fileType === FILE_TYPES.AIR_TICKET && renderAIR_TICKETFields()}
+                    {file?.fileType === FILE_TYPES.PACKAGE && renderPACKAGEFields()}
                 </div>
                 <div className="flex justify-end gap-3 pt-6">
                     <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
@@ -3967,6 +4620,23 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
          }
       }
 
+      // New Deals count: based on createdBy field (which sales rep created the file)
+      // Count files created within date range by the selected sales rep, if marked as new sale
+      if (fileCreationDate >= start && fileCreationDate <= end && file.isNewSale !== false) {
+        if (userFilter === 'ALL' || file.createdBy === userFilter) {
+          reportData.sales.successfulDeals++;
+          // Use appropriate field based on file type: destination for VISA/PACKAGE, airlineRoute for AIR_TICKET
+          let dest = 'Unknown';
+          if (file.fileType === FILE_TYPES.AIR_TICKET) {
+            // Handle both undefined and the string "undefined"
+            dest = (file.airlineRoute && file.airlineRoute !== 'undefined' && file.airlineRoute.trim()) ? file.airlineRoute : 'Unknown';
+          } else {
+            dest = (file.destination && file.destination.trim()) ? file.destination : 'Unknown';
+          }
+          reportData.sales.destinations[dest] = (reportData.sales.destinations[dest] || 0) + 1;
+        }
+      }
+
       file.history.forEach(entry => {
         const entryTime = new Date(entry.timestamp);
         if (entryTime >= start && entryTime <= end && (userFilter === 'ALL' || entry.performedBy === userFilter)) {
@@ -3988,15 +4658,6 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
             reportData.processing.completedToday++;
             if (entry.result === 'APPROVED') reportData.processing.approvals++;
             if (entry.result === 'REJECTED') reportData.processing.rejections++;
-          }
-
-          if (entry.status === 'RECEIVED_SALES' || entry.status === 'HANDOVER_PROCESSING') {
-             // Logic Update: Count only if it's considered a "New Sale" (true or undefined for old files)
-             if (entry.status === 'RECEIVED_SALES' && file.isNewSale !== false) { 
-               reportData.sales.successfulDeals++;
-               const dest = file.destination || 'Unknown';
-               reportData.sales.destinations[dest] = (reportData.sales.destinations[dest] || 0) + 1;
-             }
           }
 
           // Only count actual customer communications (FOLLOW_UP, DOCS_PENDING)
@@ -4155,15 +4816,23 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
           <div className="mb-8 grid grid-cols-1 md:grid-cols-4 gap-4">
             {(() => {
               let totalHours = 0, totalShift = 0, totalOvertime = 0, daysWorked = 0;
+              const uniqueDays = new Set(); // Track unique days worked
+              
               stats.attendance.forEach(att => {
                 if (att.logoutTime) {
-                  daysWorked++;
+                  // Extract date from loginTime (YYYY-MM-DD format for unique day tracking)
+                  const loginDate = att.loginTime?.toDate ? att.loginTime.toDate() : new Date(att.loginTime?.seconds * 1000);
+                  const dateKey = `${loginDate.getFullYear()}-${loginDate.getMonth()}-${loginDate.getDate()}`;
+                  uniqueDays.add(dateKey); // Add to set to track unique days
+                  
                   const workHours = calculateWorkingHours(att.loginTime, att.logoutTime);
                   totalHours += workHours.hours;
                   totalShift += workHours.shift;
                   totalOvertime += workHours.overtime;
                 }
               });
+              
+              daysWorked = uniqueDays.size; // Count unique days only
               
               return (
                 <>
