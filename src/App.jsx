@@ -1,5 +1,11 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import logoImage from './assets/logo.jpg';
+import ErrorBoundary from './ErrorBoundary';
+import DhakaClock from './DhakaClock';
+import { validateDateFormat, parseDateSafe } from './utils/dateValidation';
+import { storeSecureUserSession, getSecureUserSession, clearUserSession, logoutUser } from './utils/sessionManager';
+import { sanitizeInput, validateFileData, validateNote } from './utils/sanitization';
+import { getDhakaDate, getStartOf, getEndOf, getDhakaTodayString, toDhakaTime, getDateKey } from './utils/timezoneUtils';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
@@ -169,47 +175,8 @@ const formatSimpleDate = (dateString) => {
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 };
 
-// Timezone utility for Dhaka (+6 UTC)
-const getDhakaDate = () => {
-  const now = new Date();
-  // Convert to Dhaka timezone (UTC+6)
-  const dhakaTime = new Date(now.getTime() + (6 * 60 * 60 * 1000) - (now.getTimezoneOffset() * 60 * 1000));
-  return dhakaTime;
-};
-
-const getStartOf = (period, customStartDate = null) => {
-  const now = getDhakaDate();
-  const start = new Date(now);
-  start.setHours(0, 0, 0, 0);
-  
-  if (period === 'custom' && customStartDate) {
-    return new Date(customStartDate);
-  }
-  
-  if (period === 'week') {
-    const day = start.getDay();
-    const diff = start.getDate() - day + (day === 0 ? -6 : 1); 
-    start.setDate(diff);
-  } else if (period === 'month') {
-    start.setDate(1);
-  } else if (period === 'alltime') {
-    return new Date(0); 
-  }
-  return start;
-};
-
-const getEndOf = (period, customEndDate = null) => {
-  const now = getDhakaDate();
-  now.setHours(23, 59, 59, 999);
-  
-  if (period === 'custom' && customEndDate) {
-    const end = new Date(customEndDate);
-    end.setHours(23, 59, 59, 999);
-    return end;
-  }
-  
-  return now;
-};
+// Timezone functions now imported from utils/timezoneUtils.js
+// Old functions removed - using corrected UTC+6 implementation
 
 const formatCurrency = (amount) => {
   return new Intl.NumberFormat('en-BD', { style: 'currency', currency: 'BDT' }).format(amount || 0);
@@ -373,7 +340,8 @@ const generateInvoice = async (file, paymentStatus, paidAmount = null) => {
     pdf.setFont(undefined, 'normal');
     pdf.setFontSize(8);
     pdf.setTextColor(80, 80, 80);
-    const today = new Date().toLocaleDateString('en-US', {
+    const dhakaToday = getDhakaDate();
+    const today = dhakaToday.toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'long',
       day: 'numeric'
@@ -677,9 +645,8 @@ export default function VisaTrackApp() {
   // Initialize app - check for existing user session
   useEffect(() => {
     const initializeApp = async () => {
-      const storedUser = localStorage.getItem('visaTrackUser');
-      if (storedUser) {
-        const userProfile = JSON.parse(storedUser);
+      const userProfile = getSecureUserSession();
+      if (userProfile) {
         
         // Fetch fresh user data from Firestore to get latest role and permissions
         try {
@@ -738,7 +705,7 @@ export default function VisaTrackApp() {
         return;
     }
     setAppUser(userProfile);
-    localStorage.setItem('visaTrackUser', JSON.stringify(userProfile));
+    storeSecureUserSession(userProfile);
     setHasCheckedIn(false);
     
     // Trigger welcome animation
@@ -789,30 +756,17 @@ export default function VisaTrackApp() {
         } catch(e) { console.error("Error updating logout:", e); }
         localStorage.removeItem('currentAttendanceId');
     }
+    logoutUser();
     setAppUser(null);
-    localStorage.removeItem('visaTrackUser');
     setActiveTab('dashboard'); 
     setHasCheckedIn(false);
   };
 
   // Handle logout on browser close or shutdown
   useEffect(() => {
-    const handleBeforeUnload = (e) => {
-      if (appUser && localStorage.getItem('currentAttendanceId')) {
-        // Clear local storage to indicate user logged out
-        // Database will be cleaned up by a separate periodic task or manual cleanup
-        localStorage.removeItem('currentAttendanceId');
-        localStorage.removeItem('visaTrackUser');
-      }
-    };
-
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    window.addEventListener('pagehide', handleBeforeUnload);
-    
-    return () => {
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-      window.removeEventListener('pagehide', handleBeforeUnload);
-    };
+    // Session now persists across browser closes
+    // Only explicit logout button clears the session
+    // No beforeunload or pagehide handlers needed
   }, [appUser]);
 
   // Periodic cleanup: mark sessions as timed out if they've been idle too long
@@ -852,7 +806,7 @@ export default function VisaTrackApp() {
 
   // Fetch misc costs for accounting
   useEffect(() => {
-    if (!appUser || appUser.role !== ROLES.ADMIN) return;
+    if (!appUser || (appUser.role !== ROLES.ADMIN && appUser.role !== ROLES.ACCOUNTS)) return;
     
     const q = collection(db, 'artifacts', appId, 'public', 'data', 'misc_costs');
     const unsubscribe = onSnapshot(q, (snapshot) => {
@@ -866,13 +820,24 @@ export default function VisaTrackApp() {
 
   const addNewFile = async (data) => {
     if (!appUser) return;
+    
+    // Validate and sanitize input data
+    const validation = validateFileData(data);
+    if (!validation.isValid) {
+      const errorList = Object.entries(validation.errors)
+        .map(([field, error]) => `${field}: ${error}`)
+        .join('\n');
+      alert(`Validation errors:\n${errorList}`);
+      return;
+    }
+
     const fileId = `VT-${Math.floor(10000 + Math.random() * 90000)}`;
     const isNewSale = appUser.role !== ROLES.PROCESSING;
     
     let newFile = {
       fileId: fileId,
-      applicantName: data.applicantName,
-      contactNo: data.contactNo,
+      applicantName: sanitizeInput(data.applicantName, { maxLength: 100 }),
+      contactNo: sanitizeInput(data.contactNo, { maxLength: 20 }),
       fileType: data.fileType || FILE_TYPES.VISA,
       createdBy: appUser.name,
       createdAt: serverTimestamp(),
@@ -886,8 +851,8 @@ export default function VisaTrackApp() {
     if (data.fileType === FILE_TYPES.VISA) {
       newFile = {
         ...newFile,
-        passportNo: data.passportNo,
-        destination: data.destination,
+        passportNo: sanitizeInput(data.passportNo, { maxLength: 30 }).toUpperCase(),
+        destination: sanitizeInput(data.destination, { maxLength: 50 }),
         serviceCharge: Number(data.serviceCharge) || 0,
         cost: Number(data.cost) || 0,
         reminderDate: data.reminderDate || null,
@@ -1161,8 +1126,17 @@ export default function VisaTrackApp() {
 
   const handleAddNote = async (note) => {
     if (!appUser || !selectedFile || !note.trim()) return;
+    
+    // Validate and sanitize note
+    const noteValidation = validateNote(note);
+    if (!noteValidation.isValid) {
+      alert(noteValidation.error);
+      return;
+    }
+    
+    const sanitizedNote = noteValidation.value;
     const newHistoryItem = {
-      action: `Note Added: ${note}`,
+      action: `Note Added: ${sanitizedNote}`,
       status: selectedFile.status,
       performedBy: appUser.name,
       timestamp: Date.now()
@@ -1235,7 +1209,7 @@ export default function VisaTrackApp() {
         description: data.description,
         amount: Number(data.amount) || 0,
         category: data.category || 'Other',
-        date: data.date || new Date().toISOString().split('T')[0],
+        date: data.date || getDhakaTodayString(),
         notes: data.notes || '',
         createdBy: appUser.name,
         createdAt: serverTimestamp()
@@ -1295,7 +1269,8 @@ export default function VisaTrackApp() {
   );
 
   return (
-    <div className={`min-h-screen font-sans transition-colors duration-200 flex flex-col ${containerClass}`}>
+    <ErrorBoundary>
+      <div className={`min-h-screen font-sans transition-colors duration-200 flex flex-col ${containerClass}`}>
       <nav className={`${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} border-b sticky top-0 z-20 print:hidden`}>
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between h-16">
@@ -1599,6 +1574,7 @@ export default function VisaTrackApp() {
         />
       )}
     </div>
+    </ErrorBoundary>
   );
 }
 
@@ -1620,12 +1596,12 @@ function NavButton({ active, onClick, icon: Icon, children, darkMode }) {
 function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode, onOpenInvoiceModal, allUsers, attendanceRecords }) {
   const [destFilter, setDestFilter] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
-  const [currentTime, setCurrentTime] = useState(new Date());
+  const [currentTime, setCurrentTime] = useState(getDhakaDate());
   const itemsPerPage = 20;
 
   // Update clock every second
   useEffect(() => {
-    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    const timer = setInterval(() => setCurrentTime(getDhakaDate()), 1000);
     return () => clearInterval(timer);
   }, []);
 
@@ -1640,12 +1616,8 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
   const honorsMetrics = useMemo(() => {
     const HONORS_START_DATE = new Date(2025, 11, 16); // Reset point: Dec 16, 2025
     
-    // Convert Firebase timestamp to Dhaka time
-    const toDhakaTime = (timestamp) => {
-      if (!timestamp) return null;
-      const date = timestamp.toDate ? timestamp.toDate() : new Date((timestamp.seconds || 0) * 1000);
-      return new Date(date.getTime() + (6 * 60 * 60 * 1000) - (date.getTimezoneOffset() * 60 * 1000));
-    };
+    // Convert Firebase timestamp to Dhaka time - using corrected formula from timezoneUtils
+    const convertTimestampToDhaka = toDhakaTime;
     
     // Get current Dhaka date
     const now = getDhakaDate();
@@ -1679,7 +1651,7 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
     attendanceRecords.forEach(record => {
       // Prefer explicit date field
       if (record.date && record.date === dhakaDateString && record.loginTime) {
-        const loginTime = toDhakaTime(record.loginTime);
+        const loginTime = convertTimestampToDhaka(record.loginTime);
         if (loginTime && loginTime.getTime() < earliestTime) {
           earliestTime = loginTime.getTime();
           earliestToday = { user: record.userName || 'System', time: loginTime };
@@ -1872,8 +1844,8 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
     attendanceRecords.forEach(record => {
       if (!record.loginTime) return;
       const loginTime = record.loginTime.toDate ? record.loginTime.toDate() : new Date((record.loginTime.seconds || 0) * 1000);
-      // Adjust to Dhaka time
-      const dhakaTime = new Date(loginTime.getTime() + (6 * 60 * 60 * 1000) - (loginTime.getTimezoneOffset() * 60 * 1000));
+      // Adjust to Dhaka time using corrected UTC+6 formula
+      const dhakaTime = new Date(loginTime.getTime() + (6 * 60 * 60 * 1000));
       
       // Only count if in current month and not Friday (5)
       if (dhakaTime.getFullYear() === currentYear && dhakaTime.getMonth() === currentMonth && dhakaTime.getDay() !== 5) {
@@ -1918,12 +1890,18 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
     return files
         .filter(f => f.reminderDate)
         .map(f => {
+            // Validate date format before parsing
+            const validation = validateDateFormat(f.reminderDate);
+            if (!validation.isValid) {
+              console.warn(`Invalid reminder date for file ${f.fileId}: "${f.reminderDate}" - ${validation.error}`);
+              return null;
+            }
+            
             // Parse YYYY-MM-DD to Local Date to avoid UTC timezone issues
-            const [y, m, d] = f.reminderDate.split('-').map(Number);
-            const rDate = new Date(y, m - 1, d); // Month is 0-indexed
-            return { ...f, rDate };
+            const rDate = parseDateSafe(f.reminderDate);
+            return rDate ? { ...f, rDate } : null;
         })
-        .filter(f => f.rDate >= today) // Strict filter: Must be today or future
+        .filter(f => f !== null && f.rDate >= today) // Strict filter: Must be valid and today or future
         .sort((a, b) => a.rDate - b.rDate)
         .slice(0, 5); 
   }, [files]);
@@ -1954,7 +1932,8 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
   };
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+    <div className="space-y-6">
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
       {/* Left Sidebar: Company Branding & Honors Board */}
       <div className="space-y-6">
         {/* Company Branding Section - Vertical */}
@@ -2026,23 +2005,31 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
 
       {/* Main Content Area */}
       <div className="lg:col-span-3 space-y-8">
-        {/* Clock and Workday Count */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <div className={`p-6 rounded-xl border flex items-center justify-between ${cardClass}`}>
-            <div>
-              <p className={`text-xs font-medium ${textSub}`}>Current Time (Dhaka)</p>
-              <p className={`text-3xl md:text-4xl font-bold ${textMain} font-mono`}>{currentTime.toLocaleTimeString('en-BD', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}</p>
+        {/* Clock, Date and Workdays - Compact Top Card */}
+        <div className={`rounded-xl border ${darkMode ? 'bg-slate-900/50 border-slate-700' : 'bg-white border-slate-200'}`}>
+          <div className="grid grid-cols-5 gap-0">
+            {/* Clock - Left (wider: 3 columns) */}
+            <div className={`col-span-3 px-10 py-4 border-r ${darkMode ? 'border-slate-700' : 'border-slate-200'} flex flex-col items-center justify-center min-h-[200px]`}>
+              <DhakaClock />
             </div>
-            <div className={`${darkMode ? 'bg-blue-900/30 text-blue-400' : 'bg-blue-100 text-blue-600'} p-4 rounded-full`}><Clock className="h-6 md:h-8 w-6 md:w-8"/></div>
-          </div>
 
-          <div className={`p-6 rounded-xl border flex items-center justify-between ${cardClass}`}>
-            <div>
-              <p className={`text-xs font-medium ${textSub}`}>Workdays This Month</p>
-              <p className={`text-3xl md:text-4xl font-bold ${textMain}`}><span className="text-green-600">{stats.daysWorked || 0}</span>/<span className="text-slate-400">{stats.totalWorkdaysMonth || 0}</span></p>
-              <p className={`text-xs ${textSub} mt-1`}>{stats.daysWorked ? Math.round((stats.daysWorked / stats.totalWorkdaysMonth) * 100) : 0}% attendance</p>
+            {/* Workdays - Right (2 columns) */}
+            <div className={`col-span-2 px-10 py-4 flex flex-col items-center justify-center gap-6`}>
+              <div className="flex items-center gap-4">
+                <div className={`${darkMode ? 'bg-slate-800 text-blue-400' : 'bg-blue-100 text-blue-600'} p-3 rounded`}>
+                  <Calendar className="h-8 w-8" />
+                </div>
+                <div className="text-left">
+                  <p className={`text-base font-semibold uppercase tracking-wide ${textSub}`}>Workdays</p>
+                  <p className={`text-4xl font-bold ${textMain} leading-none`}>
+                    <span className="text-green-500">{stats.daysWorked || 0}</span>
+                    <span className={`text-slate-400 mx-2`}>/</span>
+                    <span className={`${textSub}`}>{stats.totalWorkdaysMonth || 0}</span>
+                  </p>
+                </div>
+              </div>
+              <p className={`text-base font-semibold text-green-500`}>Attendance: {stats.daysWorked ? Math.round((stats.daysWorked / stats.totalWorkdaysMonth) * 100) : 0}%</p>
             </div>
-            <div className={`${darkMode ? 'bg-green-900/30 text-green-400' : 'bg-green-100 text-green-600'} p-4 rounded-full`}><Calendar className="h-6 md:h-8 w-6 md:w-8"/></div>
           </div>
         </div>
 
@@ -2215,6 +2202,7 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
            </div>
         </div>
         </div>
+      </div>
       </div>
     </div>
   );
@@ -4565,6 +4553,19 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
   const stats = useMemo(() => {
     const start = getStartOf(timeRange, customStartDate ? new Date(customStartDate) : null);
     const end = getEndOf(timeRange, customEndDate ? new Date(customEndDate) : null);
+    
+    // Safety check - ensure dates are valid
+    if (!start || !end || isNaN(start.getTime()) || isNaN(end.getTime())) {
+      console.error('Invalid date range:', { start, end, timeRange });
+      return {
+        processing: { inProcess: 0, submittedToday: 0, docsPendingToday: 0, completedToday: 0, approvals: 0, rejections: 0, totalActions: 0 },
+        sales: { successfulDeals: 0, clientComms: 0, destinations: {}, totalActions: 0 },
+        finances: { revenue: 0, cost: 0, profit: 0 },
+        notes: [],
+        attendance: []
+      };
+    }
+
     const reportData = {
       processing: {
         inProcess: 0,
@@ -4591,7 +4592,7 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
     };
 
     files.forEach(file => {
-      if (file.assignedTo === userFilter) {
+      if (userFilter === 'ALL' || file.assignedTo === userFilter) {
         if (!['DONE', 'RECEIVED_SALES'].includes(file.status)) {
           reportData.processing.inProcess++;
         }
@@ -4637,44 +4638,56 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
         }
       }
 
-      file.history.forEach(entry => {
-        const entryTime = new Date(entry.timestamp);
-        if (entryTime >= start && entryTime <= end && (userFilter === 'ALL' || entry.performedBy === userFilter)) {
-          reportData.processing.totalActions++;
-          reportData.sales.totalActions++;
+      if (file.history && Array.isArray(file.history)) {
+        file.history.forEach(entry => {
+          if (!entry || !entry.timestamp) return;
+          
+          const entryTime = new Date(entry.timestamp);
+          if (entryTime >= start && entryTime <= end && (userFilter === 'ALL' || entry.performedBy === userFilter)) {
+            reportData.processing.totalActions++;
+            reportData.sales.totalActions++;
 
-          if (entry.action.includes('Note:')) {
-            const noteContent = entry.action.split('Note:')[1].trim();
-            reportData.notes.push({
-               file: file.applicantName,
-               note: noteContent,
-               time: entry.timestamp
-            });
-          }
+            if (entry.action && entry.action.includes('Note:')) {
+              const noteContent = entry.action.split('Note:')[1].trim();
+              reportData.notes.push({
+                 file: file.applicantName,
+                 note: noteContent,
+                 time: entry.timestamp
+              });
+            }
 
-          if (entry.status === 'SUBMITTED') reportData.processing.submittedToday++;
-          if (entry.status === 'DOCS_PENDING') reportData.processing.docsPendingToday++;
-          if (entry.status === 'DONE') {
-            reportData.processing.completedToday++;
-            if (entry.result === 'APPROVED') reportData.processing.approvals++;
-            if (entry.result === 'REJECTED') reportData.processing.rejections++;
-          }
+            if (entry.status === 'SUBMITTED') reportData.processing.submittedToday++;
+            if (entry.status === 'DOCS_PENDING') reportData.processing.docsPendingToday++;
+            if (entry.status === 'DONE') {
+              reportData.processing.completedToday++;
+              if (entry.result === 'APPROVED') reportData.processing.approvals++;
+              if (entry.result === 'REJECTED') reportData.processing.rejections++;
+            }
 
-          // Only count actual customer communications (FOLLOW_UP, DOCS_PENDING)
-          // PAYMENT_PENDING is internal embassy payment, not customer communication
-          if (['FOLLOW_UP', 'DOCS_PENDING'].includes(entry.status)) {
-            reportData.sales.clientComms++;
+            // Only count actual customer communications (FOLLOW_UP, DOCS_PENDING)
+            // PAYMENT_PENDING is internal embassy payment, not customer communication
+            if (entry.status && ['FOLLOW_UP', 'DOCS_PENDING'].includes(entry.status)) {
+              reportData.sales.clientComms++;
+            }
           }
-        }
-      });
+        });
+      }
     });
     
     reportData.finances.profit = reportData.finances.revenue - reportData.finances.cost;
 
     reportData.attendance = attendanceData.filter(a => {
         if (!a.date) return false;
-        const [y, m, d] = a.date.split('-').map(Number);
-        const aDate = new Date(y, m - 1, d); 
+        
+        // Validate date format
+        const validation = validateDateFormat(a.date);
+        if (!validation.isValid) {
+          console.warn(`Invalid attendance date: "${a.date}" for user ${a.userName} - ${validation.error}`);
+          return false;
+        }
+        
+        const aDate = parseDateSafe(a.date);
+        if (!aDate) return false;
         
         return (userFilter === 'ALL' || a.userName === userFilter) && aDate >= start && aDate <= end;
     }).sort((a,b) => b.loginTime?.seconds - a.loginTime?.seconds); 
@@ -4788,7 +4801,7 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
           <div className="text-sm text-slate-500 flex justify-between">
              <span>Employee: <b>{userFilter === 'ALL' ? 'All Staff' : userFilter}</b></span>
              <span>Period: <b>{timeRange.toUpperCase()}</b></span>
-             <span>Generated: {new Date().toLocaleString()}</span>
+             <span>Generated: {getDhakaDate().toLocaleString()}</span>
           </div>
           <hr className="my-4"/>
         </div>
@@ -5080,7 +5093,8 @@ function CustomReportModal({ isOpen, onClose, files, userFilter, timeRange, dark
 
     doc.setFontSize(10);
     doc.setFont(undefined, 'normal');
-    doc.text(`Period: ${timeRange.toUpperCase()} | Generated: ${new Date().toLocaleString()}`, margin, yPosition);
+    const dhakaGeneratedTime = getDhakaDate();
+    doc.text(`Period: ${timeRange.toUpperCase()} | Generated: ${dhakaGeneratedTime.toLocaleString()}`, margin, yPosition);
     yPosition += 8;
 
     // Financial Summary (Admin Only)
@@ -5746,7 +5760,7 @@ function AccountingPanel({ currentUser, files, miscCosts, onAddMiscCost, onDelet
     description: '',
     amount: '',
     category: 'Operational',
-    date: new Date().toISOString().split('T')[0],
+    date: getDhakaTodayString(),
     notes: ''
   });
 
@@ -5788,7 +5802,7 @@ function AccountingPanel({ currentUser, files, miscCosts, onAddMiscCost, onDelet
       description: '',
       amount: '',
       category: 'Operational',
-      date: new Date().toISOString().split('T')[0],
+      date: getDhakaTodayString(),
       notes: ''
     });
   };
