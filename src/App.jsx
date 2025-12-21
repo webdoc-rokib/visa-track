@@ -671,8 +671,7 @@ export default function VisaTrackApp() {
         const isTrustedDevice = localStorage.getItem('vt_trusted_device') === 'true';
         if (isTrustedDevice) {
           try {
-            const now = getDhakaDate();
-            const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+            const today = getDhakaTodayString();
             
             // Look for active session for this user today
             const q = query(
@@ -716,8 +715,7 @@ export default function VisaTrackApp() {
     // Record attendance for trusted devices only
     if (isTrustedDevice) {
         try {
-            const now = getDhakaDate();
-            const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+            const today = getDhakaTodayString();
             
             // Check if there's an active session already to prevent duplicate sessions
             const q = query(
@@ -773,8 +771,7 @@ export default function VisaTrackApp() {
   useEffect(() => {
     const cleanupStaleAttendance = async () => {
       try {
-        const now = getDhakaDate();
-        const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+        const today = getDhakaTodayString();
         
         // Find sessions that have been open for more than 12 hours (unlikely normal work session)
         const q = query(
@@ -786,6 +783,7 @@ export default function VisaTrackApp() {
         
         docs.forEach(doc => {
           const loginTime = doc.data().loginTime?.toDate ? doc.data().loginTime.toDate() : new Date(doc.data().loginTime?.seconds * 1000);
+          const now = getDhakaDate();
           const hoursDiff = (now - loginTime) / (1000 * 60 * 60);
           
           // If session is older than 12 hours, mark it as ended

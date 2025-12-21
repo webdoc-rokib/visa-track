@@ -81,7 +81,7 @@ export const getStartOf = (period, customStartDate = null) => {
   
   const now = getDhakaDate();
   const start = new Date(now);
-  start.setUTCHours(0, 0, 0, 0);
+  start.setHours(0, 0, 0, 0);
   
   if (period === 'custom') {
     if (!customStartDate) {
@@ -89,18 +89,18 @@ export const getStartOf = (period, customStartDate = null) => {
       return start;
     }
     const customStart = new Date(customStartDate);
-    customStart.setUTCHours(0, 0, 0, 0);
+    customStart.setHours(0, 0, 0, 0);
     return customStart;
   }
   
   if (period === 'week') {
-    const dayOfWeek = start.getUTCDay();
+    const dayOfWeek = start.getDay();
     // Monday = 1, so subtract (dayOfWeek - 1) days to get to Monday
     // If Sunday (0), go back 6 days; otherwise go back (day-1) days
     const daysToSubtract = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-    start.setUTCDate(start.getUTCDate() - daysToSubtract);
+    start.setDate(start.getDate() - daysToSubtract);
   } else if (period === 'month') {
-    start.setUTCDate(1);
+    start.setDate(1);
   } else if (period === 'alltime') {
     return new Date(0);
   }
@@ -120,7 +120,7 @@ export const getEndOf = (period, customEndDate = null) => {
   
   const now = getDhakaDate();
   const end = new Date(now);
-  end.setUTCHours(23, 59, 59, 999);
+  end.setHours(23, 59, 59, 999);
   
   if (period === 'custom') {
     if (!customEndDate) {
@@ -128,24 +128,24 @@ export const getEndOf = (period, customEndDate = null) => {
       return end;
     }
     const customEnd = new Date(customEndDate);
-    customEnd.setUTCHours(23, 59, 59, 999);
+    customEnd.setHours(23, 59, 59, 999);
     return customEnd;
   }
   
   if (period === 'week') {
-    const dayOfWeek = end.getUTCDay();
+    const dayOfWeek = end.getDay();
     // Get to Sunday (end of week)
     const daysToAdd = dayOfWeek === 0 ? 0 : 7 - dayOfWeek;
-    end.setUTCDate(end.getUTCDate() + daysToAdd);
+    end.setDate(end.getDate() + daysToAdd);
   } else if (period === 'month') {
     // Get last day of current month
-    end.setUTCMonth(end.getUTCMonth() + 1);
-    end.setUTCDate(0);
+    end.setMonth(end.getMonth() + 1);
+    end.setDate(0);
   } else if (period === 'alltime') {
     // Far future date
-    end.setUTCFullYear(2099);
-    end.setUTCMonth(11);
-    end.setUTCDate(31);
+    end.setFullYear(2099);
+    end.setMonth(11);
+    end.setDate(31);
   }
   // else period === 'today', which is already set
   
@@ -160,9 +160,9 @@ export const getEndOf = (period, customEndDate = null) => {
 export const getDateKey = (date) => {
   if (!date || !(date instanceof Date)) return '';
   
-  const year = date.getUTCFullYear();
-  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(date.getUTCDate()).padStart(2, '0');
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
   
   return `${year}-${month}-${day}`;
 };
