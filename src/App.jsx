@@ -504,6 +504,9 @@ export default function VisaTrackApp() {
   const [allPortals, setAllPortals] = useState(AIR_TICKET_PORTALS);
   const [allUsers, setAllUsers] = useState([]); 
   const [attendanceRecords, setAttendanceRecords] = useState([]);
+  const [leaveRequests, setLeaveRequests] = useState([]);
+  const [approvedLeaves, setApprovedLeaves] = useState([]);
+  const [cleanupComplete, setCleanupComplete] = useState(false);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -517,6 +520,8 @@ export default function VisaTrackApp() {
 
   const [showNotifications, setShowNotifications] = useState(false);
   const [hasCheckedIn, setHasCheckedIn] = useState(false); 
+  const [showLeaveRequestModal, setShowLeaveRequestModal] = useState(false);
+  const [leaveFormData, setLeaveFormData] = useState({ startDate: '', endDate: '', reason: '' });
   
   const [modalOpen, setModalOpen] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -618,17 +623,33 @@ export default function VisaTrackApp() {
       const attendanceData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setAttendanceRecords(attendanceData);
     });
-    return () => { unsubFiles(); unsubDest(); unsubPortals(); unsubUsers(); unsubAttendance(); };
-  }, [user]);
+
+    // Fetch leave requests
+    const qLeaveRequests = collection(db, 'artifacts', appId, 'public', 'data', 'leave_requests');
+    const unsubLeaveRequests = onSnapshot(qLeaveRequests, (snapshot) => {
+      const requests = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setLeaveRequests(requests);
+    });
+
+    // Fetch approved leaves
+    const qApprovedLeaves = collection(db, 'artifacts', appId, 'public', 'data', 'approved_leaves');
+    const unsubApprovedLeaves = onSnapshot(qApprovedLeaves, (snapshot) => {
+      const leaves = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setApprovedLeaves(leaves);
+    });
+
+    return () => { unsubFiles(); unsubDest(); unsubPortals(); unsubUsers(); unsubAttendance(); unsubLeaveRequests(); unsubApprovedLeaves(); };
+  }, [user, cleanupComplete]);
 
   const myTasks = useMemo(() => {
     if (!appUser || files.length === 0) return [];
-    // For Processing Agents: Show files that are assigned to them and either not yet acknowledged, or acknowledged
-    // Files disappear when status becomes SUBMITTED or DONE
+    // For Processing Agents: Show only files that are NOT acknowledged and NOT in terminal states
+    // Files disappear when: acknowledged by processing agent, submitted, or done
     if (appUser.role === ROLES.PROCESSING) {
       return files.filter(f => 
         f.assignedTo === appUser.name && 
-        !['DONE', 'SUBMITTED'].includes(f.status)
+        !['DONE', 'SUBMITTED'].includes(f.status) &&
+        !f.acknowledgedByProcessingAgent
       );
     }
     // For others: Show files assigned to them that are not DONE
@@ -645,6 +666,25 @@ export default function VisaTrackApp() {
   // Initialize app - check for existing user session
   useEffect(() => {
     const initializeApp = async () => {
+      // Delete old attendance records before 26/12/2025 - keep fresh data
+      try {
+        const allAttendance = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'));
+        const cutoffDate = '2025-12-26'; // YYYY-MM-DD format
+        
+        for (const docSnapshot of allAttendance.docs) {
+          const attendanceDate = docSnapshot.data().date;
+          // Only delete records before the cutoff date
+          if (attendanceDate && attendanceDate < cutoffDate) {
+            await deleteDoc(docSnapshot.ref);
+          }
+        }
+      } catch (e) {
+        console.error("Error cleaning up old attendance records:", e);
+      }
+      
+      // Mark cleanup as complete
+      setCleanupComplete(true);
+
       const userProfile = getSecureUserSession();
       if (userProfile) {
         
@@ -667,30 +707,9 @@ export default function VisaTrackApp() {
           setAppUser(userProfile);
         }
         
-        // Restore attendance session ID if user is on a trusted device
-        const isTrustedDevice = localStorage.getItem('vt_trusted_device') === 'true';
-        if (isTrustedDevice) {
-          try {
-            const today = getDhakaTodayString();
-            
-            // Look for active session for this user today
-            const q = query(
-              collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
-              where('userName', '==', userProfile.name),
-              where('date', '==', today),
-              where('logoutTime', '==', null)
-            );
-            const existingDocs = await getDocs(q);
-            
-            if (existingDocs.size > 0) {
-              // Restore the active session
-              localStorage.setItem('currentAttendanceId', existingDocs.docs[0].id);
-            } else {
-              // No active session, clear the ID
-              localStorage.removeItem('currentAttendanceId');
-            }
-          } catch (e) { console.error("Error restoring attendance session:", e); }
-        }
+        // Attendance is now tracked per-day per-user in Firestore
+        // No session ID restoration needed in localStorage
+
       }
     };
     
@@ -699,10 +718,7 @@ export default function VisaTrackApp() {
 
   const handleLogin = async (userProfile) => {
     const isTrustedDevice = localStorage.getItem('vt_trusted_device') === 'true';
-    if (userProfile.role !== ROLES.ADMIN && !isTrustedDevice) {
-        alert("Security Restriction: You must log in from an authorized office computer.");
-        return;
-    }
+    // All users can log in from anywhere - attendance recording will be restricted to trusted devices only
     setAppUser(userProfile);
     storeSecureUserSession(userProfile);
     setHasCheckedIn(false);
@@ -712,52 +728,167 @@ export default function VisaTrackApp() {
       triggerConfetti();
     }, 300);
 
-    // Record attendance for trusted devices only
+    // Record attendance ONLY for trusted devices - ONE record per user per day
     if (isTrustedDevice) {
         try {
-            const today = getDhakaTodayString();
+            const todayDate = getDhakaTodayString(); // YYYY-MM-DD in GMT+6
             
-            // Check if there's an active session already to prevent duplicate sessions
+            // Check if attendance record already exists for this user today
             const q = query(
               collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
               where('userName', '==', userProfile.name),
-              where('date', '==', today),
-              where('logoutTime', '==', null)
+              where('date', '==', todayDate)
             );
             const existingDocs = await getDocs(q);
             
             if (existingDocs.size === 0) {
-              // Only create a new attendance record if there's no active session
-              const docRef = await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'), {
+              // First login today - create new attendance record
+              await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'), {
                 userId: userProfile.id,
                 userName: userProfile.name,
                 role: userProfile.role,
-                date: today,
-                loginTime: serverTimestamp(),
-                logoutTime: null
+                date: todayDate,
+                firstLoginTime: serverTimestamp(),
+                lastLogoutTime: null
               });
-              localStorage.setItem('currentAttendanceId', docRef.id);
-            } else {
-              // If there's an active session, use that one
-              localStorage.setItem('currentAttendanceId', existingDocs.docs[0].id);
             }
+            // If attendance record exists, do nothing (already counted for the day)
         } catch (e) { console.error("Error recording attendance:", e); }
     }
   };
 
   const handleLogout = async () => {
-    const attId = localStorage.getItem('currentAttendanceId');
-    if (attId) {
+    const isTrustedDevice = localStorage.getItem('vt_trusted_device') === 'true';
+    if (appUser && isTrustedDevice) {
         try {
-            const ref = doc(db, 'artifacts', appId, 'public', 'data', 'attendance', attId);
-            await updateDoc(ref, { logoutTime: serverTimestamp() });
-        } catch(e) { console.error("Error updating logout:", e); }
-        localStorage.removeItem('currentAttendanceId');
+            const todayDate = getDhakaTodayString(); // YYYY-MM-DD in GMT+6
+            
+            // Update the attendance record with last logout time
+            const q = query(
+              collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
+              where('userName', '==', appUser.name),
+              where('date', '==', todayDate)
+            );
+            const docs = await getDocs(q);
+            if (docs.size > 0) {
+              await updateDoc(docs.docs[0].ref, { lastLogoutTime: serverTimestamp() });
+            }
+        } catch(e) { console.error("Error recording logout:", e); }
     }
     logoutUser();
     setAppUser(null);
     setActiveTab('dashboard'); 
     setHasCheckedIn(false);
+  };
+
+  // Leave Request Functions
+  const handleRequestLeave = async (e) => {
+    e.preventDefault();
+    if (!appUser || !leaveFormData.startDate || !leaveFormData.endDate) {
+      alert('Please fill all fields');
+      return;
+    }
+
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'leave_requests'), {
+        userName: appUser.name,
+        userId: appUser.id,
+        role: appUser.role,
+        startDate: leaveFormData.startDate,
+        endDate: leaveFormData.endDate,
+        reason: leaveFormData.reason || '',
+        status: 'PENDING', // PENDING, APPROVED, REJECTED
+        requestedAt: serverTimestamp(),
+        approvedAt: null,
+        approvedBy: null
+      });
+      setLeaveFormData({ startDate: '', endDate: '', reason: '' });
+      setShowLeaveRequestModal(false);
+      alert('Leave request submitted successfully!');
+    } catch (e) {
+      console.error('Error submitting leave request:', e);
+      alert('Failed to submit leave request');
+    }
+  };
+
+  const approveLeaveRequest = async (requestId, request) => {
+    try {
+      // Update leave request status
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'leave_requests', requestId), {
+        status: 'APPROVED',
+        approvedAt: serverTimestamp(),
+        approvedBy: appUser.name
+      });
+
+      // Create approved leave record
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'approved_leaves'), {
+        userName: request.userName,
+        userId: request.userId,
+        role: request.role,
+        startDate: request.startDate,
+        endDate: request.endDate,
+        reason: request.reason || '',
+        approvedAt: serverTimestamp(),
+        approvedBy: appUser.name,
+        type: 'REQUESTED' // REQUESTED or DIRECT
+      });
+
+      alert('Leave request approved!');
+    } catch (e) {
+      console.error('Error approving leave request:', e);
+      alert('Failed to approve leave request');
+    }
+  };
+
+  const rejectLeaveRequest = async (requestId) => {
+    try {
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'leave_requests', requestId), {
+        status: 'REJECTED',
+        approvedAt: serverTimestamp(),
+        approvedBy: appUser.name
+      });
+      alert('Leave request rejected!');
+    } catch (e) {
+      console.error('Error rejecting leave request:', e);
+      alert('Failed to reject leave request');
+    }
+  };
+
+  const grantDirectLeave = async (userName, startDate, endDate, reason) => {
+    if (!userName || !startDate || !endDate) {
+      alert('Please fill all fields');
+      return;
+    }
+
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'approved_leaves'), {
+        userName,
+        userId: allUsers.find(u => u.fullName === userName)?.id || '',
+        role: allUsers.find(u => u.fullName === userName)?.role || '',
+        startDate,
+        endDate,
+        reason: reason || '',
+        approvedAt: serverTimestamp(),
+        approvedBy: appUser.name,
+        type: 'DIRECT' // REQUESTED or DIRECT
+      });
+      alert('Leave granted successfully!');
+    } catch (e) {
+      console.error('Error granting leave:', e);
+      alert('Failed to grant leave');
+    }
+  };
+
+  const deleteApprovedLeave = async (leaveId, userName) => {
+    if (confirm(`Delete approved leave for ${userName}? This action cannot be undone.`)) {
+      try {
+        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'approved_leaves', leaveId));
+        alert('Leave deleted successfully!');
+      } catch (e) {
+        console.error('Error deleting leave:', e);
+        alert('Failed to delete leave');
+      }
+    }
   };
 
   // Handle logout on browser close or shutdown
@@ -766,41 +897,6 @@ export default function VisaTrackApp() {
     // Only explicit logout button clears the session
     // No beforeunload or pagehide handlers needed
   }, [appUser]);
-
-  // Periodic cleanup: mark sessions as timed out if they've been idle too long
-  useEffect(() => {
-    const cleanupStaleAttendance = async () => {
-      try {
-        const today = getDhakaTodayString();
-        
-        // Find sessions that have been open for more than 12 hours (unlikely normal work session)
-        const q = query(
-          collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
-          where('date', '==', today),
-          where('logoutTime', '==', null)
-        );
-        const docs = await getDocs(q);
-        
-        docs.forEach(doc => {
-          const loginTime = doc.data().loginTime?.toDate ? doc.data().loginTime.toDate() : new Date(doc.data().loginTime?.seconds * 1000);
-          const now = getDhakaDate();
-          const hoursDiff = (now - loginTime) / (1000 * 60 * 60);
-          
-          // If session is older than 12 hours, mark it as ended
-          if (hoursDiff > 12) {
-            updateDoc(doc.ref, { logoutTime: serverTimestamp() }).catch(err => 
-              console.error("Error marking stale session as ended:", err)
-            );
-          }
-        });
-      } catch (e) { console.error("Error in cleanup task:", e); }
-    };
-
-    // Run cleanup every 30 minutes
-    const cleanupInterval = setInterval(cleanupStaleAttendance, 30 * 60 * 1000);
-    
-    return () => clearInterval(cleanupInterval);
-  }, []);
 
   // Fetch misc costs for accounting
   useEffect(() => {
@@ -1305,6 +1401,7 @@ export default function VisaTrackApp() {
                    </>
                  )}
                  {(appUser.role === ROLES.ADMIN || appUser.role === ROLES.ACCOUNTS) && <NavButton active={activeTab === 'accounting'} onClick={() => setActiveTab('accounting')} icon={DollarSign} darkMode={darkMode}>Accounting</NavButton>}
+                 <NavButton active={activeTab === 'leaves'} onClick={() => setActiveTab('leaves')} icon={Calendar} darkMode={darkMode} badge={appUser.role === ROLES.ADMIN ? leaveRequests.filter(r => r.status === 'PENDING').length : 0}>Leaves</NavButton>
                  {appUser.role === ROLES.ADMIN && (
                    <NavButton active={activeTab === 'admin'} onClick={() => setActiveTab('admin')} icon={Shield} darkMode={darkMode}>Admin</NavButton>
                  )}
@@ -1385,6 +1482,7 @@ export default function VisaTrackApp() {
             destinations={destinations}
             allUsers={allUsers}
             attendanceRecords={attendanceRecords}
+            approvedLeaves={approvedLeaves}
             onOpenUpdateModal={openUpdateModal} 
             onOpenNoteModal={openNoteModal}
             onOpenEditModal={openEditModal}
@@ -1409,6 +1507,9 @@ export default function VisaTrackApp() {
         {activeTab === 'reports' && <StatisticalReports files={files} currentUser={appUser} darkMode={darkMode} onOpenInvoiceModal={(f) => { setInvoiceFile(f); setInvoiceModalOpen(true); }} />}
         {activeTab === 'accounting' && (appUser.role === ROLES.ADMIN || appUser.role === ROLES.ACCOUNTS) && (
           <AccountingPanel currentUser={appUser} files={files} miscCosts={miscCosts} onAddMiscCost={addMiscCost} onDeleteMiscCost={deleteMiscCost} darkMode={darkMode} isAdmin={appUser.role === ROLES.ADMIN} />
+        )}
+        {activeTab === 'leaves' && (
+          <LeavesPanel currentUser={appUser} leaveRequests={leaveRequests} approvedLeaves={approvedLeaves} allUsers={allUsers} darkMode={darkMode} onApprove={approveLeaveRequest} onReject={rejectLeaveRequest} onGrantDirect={grantDirectLeave} onDeleteLeave={deleteApprovedLeave} onRequestLeave={() => setShowLeaveRequestModal(true)} />
         )}
         {activeTab === 'admin' && appUser.role === ROLES.ADMIN && (
           <AdminPanel currentUser={appUser} destinations={destinations} darkMode={darkMode} />
@@ -1468,6 +1569,17 @@ export default function VisaTrackApp() {
             setShowNotifications(false);
             openUpdateModal(file, file.status);
           }}
+          darkMode={darkMode}
+        />
+      )}
+
+      {showLeaveRequestModal && (
+        <LeaveRequestModal
+          isOpen={showLeaveRequestModal}
+          onClose={() => setShowLeaveRequestModal(false)}
+          onSubmit={handleRequestLeave}
+          leaveFormData={leaveFormData}
+          setLeaveFormData={setLeaveFormData}
           darkMode={darkMode}
         />
       )}
@@ -1578,8 +1690,8 @@ export default function VisaTrackApp() {
 
 // --- Sub-Components ---
 
-function NavButton({ active, onClick, icon: Icon, children, darkMode }) {
-  const baseClass = "flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors";
+function NavButton({ active, onClick, icon: Icon, children, darkMode, badge }) {
+  const baseClass = "flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors relative";
   const activeClass = darkMode ? "bg-slate-800 text-blue-400" : "bg-slate-100 text-blue-600";
   const inactiveClass = darkMode ? "text-slate-400 hover:bg-slate-800 hover:text-slate-200" : "text-slate-600 hover:bg-slate-50 hover:text-slate-900";
 
@@ -1587,11 +1699,16 @@ function NavButton({ active, onClick, icon: Icon, children, darkMode }) {
     <button onClick={onClick} className={`${baseClass} ${active ? activeClass : inactiveClass}`}>
       <Icon className="h-4 w-4" />
       {children}
+      {badge && badge > 0 && (
+        <span className="absolute -top-2 -right-2 flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-xs font-bold text-white">
+          {badge > 99 ? '99+' : badge}
+        </span>
+      )}
     </button>
   );
 }
 
-function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode, onOpenInvoiceModal, allUsers, attendanceRecords }) {
+function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode, onOpenInvoiceModal, allUsers, attendanceRecords, approvedLeaves }) {
   const [destFilter, setDestFilter] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const [currentTime, setCurrentTime] = useState(getDhakaDate());
@@ -1614,136 +1731,21 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
   const honorsMetrics = useMemo(() => {
     const HONORS_START_DATE = new Date(2025, 11, 16); // Reset point: Dec 16, 2025
     
-    // Convert Firebase timestamp to Dhaka time - using corrected formula from timezoneUtils
-    const convertTimestampToDhaka = toDhakaTime;
-    
     // Get current Dhaka date
     const now = getDhakaDate();
-    const todayString = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()}`;
     const monthString = `${now.getFullYear()}-${now.getMonth()}`;
     
-    // Helper to create date string from date object
-    const getDateString = (date) => `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+    // Helper to create month string from date object
     const getMonthString = (date) => `${date.getFullYear()}-${date.getMonth()}`;
 
-    // Current Dhaka Y/M/D parts and a robust date key with padding (YYYY-MM-DD)
+    // Current Dhaka Y/M/D parts
     const currentYear = now.getFullYear();
     const currentMonth = now.getMonth();
-    const currentDay = now.getDate();
-    const getDateKey = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
     
     // Build user roles map
     const userRoles = {};
     allUsers.forEach(u => {
       userRoles[u.fullName] = u.role;
-    });
-    
-    // ===== CATEGORY 1: EARLIEST TODAY =====
-    // Use attendance `date` if present (format YYYY-MM-DD) else fallback to Dhaka-converted loginTime
-    const pad = (n) => String(n).padStart(2, '0');
-    const dhakaDateString = `${currentYear}-${pad(currentMonth + 1)}-${pad(currentDay)}`;
-
-    let earliestToday = { user: 'N/A', time: null };
-    let earliestTime = Infinity;
-
-    attendanceRecords.forEach(record => {
-      // Prefer explicit date field
-      if (record.date && record.date === dhakaDateString && record.loginTime) {
-        const loginTime = convertTimestampToDhaka(record.loginTime);
-        if (loginTime && loginTime.getTime() < earliestTime) {
-          earliestTime = loginTime.getTime();
-          earliestToday = { user: record.userName || 'System', time: loginTime };
-        }
-        return;
-      }
-
-      // Fallback to using loginTime conversion
-      const loginTime = toDhakaTime(record.loginTime);
-      if (!loginTime) return;
-      const recordDateString = getDateKey(loginTime);
-      const todayKey = getDateKey(now);
-      if (recordDateString === todayKey && loginTime.getTime() < earliestTime) {
-        earliestTime = loginTime.getTime();
-        earliestToday = { user: record.userName || 'System', time: loginTime };
-      }
-    });
-
-    // ===== CATEGORY 2: MOST PUNCTUAL =====
-    // First login per user per day for current month (and after HONORS_START_DATE)
-    const firstLoginByDay = {}; // Key: "user|YYYY-M-D" => minutes
-    const monthWorkdaysByUser = {}; // user => Set of day keys in current month
-
-    attendanceRecords.forEach(record => {
-      if (!record.loginTime) return;
-      const loginTime = toDhakaTime(record.loginTime);
-      if (!loginTime || loginTime < HONORS_START_DATE) return;
-
-      // Only consider records in current month
-      if (loginTime.getFullYear() !== currentYear || loginTime.getMonth() !== currentMonth) return;
-
-      // Skip Friday (5) - Dhaka weekend
-      const dayOfWeek = loginTime.getDay();
-      if (dayOfWeek === 5) return;
-
-      const user = record.userName || 'System';
-      const dateKey = getDateKey(loginTime);
-      const userDateKey = `${user}|${dateKey}`;
-
-      // Capture first login time per user/day
-      if (!firstLoginByDay[userDateKey]) {
-        firstLoginByDay[userDateKey] = loginTime.getHours() * 60 + loginTime.getMinutes();
-      }
-
-      if (!monthWorkdaysByUser[user]) monthWorkdaysByUser[user] = new Set();
-      monthWorkdaysByUser[user].add(dateKey);
-    });
-
-    // Build punctuality stats
-    const punctualityStats = {};
-    Object.entries(firstLoginByDay).forEach(([key, minutes]) => {
-      const user = key.split('|')[0];
-      if (!punctualityStats[user]) punctualityStats[user] = { times: [], workdays: monthWorkdaysByUser[user]?.size || 0 };
-      punctualityStats[user].times.push(minutes);
-    });
-
-    // Calculate how many workdays have occurred in the current month (excluding holidays)
-    // Dhaka weekend: Friday (5) only
-    const countWorkdaysSoFar = (startDate, endDate, holidays = []) => {
-      let count = 0;
-      const d = new Date(startDate);
-      const holidayDates = new Set(holidays);
-      while (d <= endDate) {
-        const day = d.getDay();
-        const dateStr = getDateKey(d);
-        // Workdays: exclude Friday (5) and any holidays
-        if (day !== 5 && !holidayDates.has(dateStr)) count++;
-        d.setDate(d.getDate() + 1);
-      }
-      return count;
-    };
-
-    const monthStart = new Date(currentYear, currentMonth, 1);
-    // TODO: Pass holidays from parent state when available
-    const monthWorkdaysSoFar = countWorkdaysSoFar(monthStart, now, []);
-    const minWorkdaysRequired = Math.ceil(monthWorkdaysSoFar * 0.9); // 90% threshold
-    
-    // Find most punctual (earliest average arrival time, tie-break by most workdays)
-    let mostPunctual = { user: 'N/A', workdayCount: 0, avgTime: Infinity };
-    
-    Object.entries(punctualityStats).forEach(([user, stats]) => {
-      const avgTime = stats.times.reduce((a, b) => a + b, 0) / stats.times.length;
-      const workdays = stats.workdays;
-
-      // Require minimum workdays participation
-      if (workdays < minWorkdaysRequired) return;
-      
-      // Compare: earliest average time wins, if tied then most workdays wins
-      const isBetter = (avgTime < mostPunctual.avgTime) || 
-                       (avgTime === mostPunctual.avgTime && workdays > mostPunctual.workdayCount);
-      
-      if (isBetter) {
-        mostPunctual = { user, workdayCount: workdays, avgTime };
-      }
     });
     
     // ===== CATEGORY 3: BEST SALES =====
@@ -1791,8 +1793,6 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
     });
     
     return {
-      earliestToday,
-      mostPunctual,
       bestSales,
       bestProcessing
     };
@@ -1835,28 +1835,45 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
     const currentYear = now.getFullYear();
     const currentMonth = now.getMonth();
     const monthStart = new Date(currentYear, currentMonth, 1);
-    const getDateKey = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
     
-    // User's workdays (unique days with at least one login, excluding Fridays)
+    // Get current user's approved leaves for date range checks
+    const userApprovedLeaves = approvedLeaves.filter(leave => leave.userId === user?.id);
+    
+    // Helper function to check if a date is within an approved leave
+    const isOnApprovedLeave = (dateString) => {
+      return userApprovedLeaves.some(leave => {
+        return dateString >= leave.startDate && dateString <= leave.endDate;
+      });
+    };
+    
+    // User's workdays (unique days with at least one login, excluding Fridays and approved leaves)
     const userWorkdaysSet = new Set();
     attendanceRecords.forEach(record => {
-      if (!record.loginTime) return;
-      const loginTime = record.loginTime.toDate ? record.loginTime.toDate() : new Date((record.loginTime.seconds || 0) * 1000);
-      // Adjust to Dhaka time using corrected UTC+6 formula
-      const dhakaTime = new Date(loginTime.getTime() + (6 * 60 * 60 * 1000));
+      if (!record.date) return;
       
-      // Only count if in current month and not Friday (5)
-      if (dhakaTime.getFullYear() === currentYear && dhakaTime.getMonth() === currentMonth && dhakaTime.getDay() !== 5) {
-        userWorkdaysSet.add(getDateKey(dhakaTime));
+      // Use the stored date field (YYYY-MM-DD format in Dhaka timezone)
+      const [year, month, day] = record.date.split('-').map(Number);
+      const recordDate = new Date(year, month - 1, day);
+      
+      // Only count if in current month and not Friday (5) and not on approved leave
+      if (recordDate.getFullYear() === currentYear && recordDate.getMonth() === currentMonth && recordDate.getDay() !== 5 && !isOnApprovedLeave(record.date)) {
+        userWorkdaysSet.add(record.date);
       }
     });
     
-    // Total workdays in month (1st to today, excluding Fridays)
+    // Total workdays in month (1st to today, excluding Fridays and approved leaves)
     let totalWorkdaysInMonth = 0;
-    const d = new Date(monthStart);
-    while (d <= now) {
+    const d = new Date(currentYear, currentMonth, 1);
+    const todayEnd = new Date(now);
+    todayEnd.setHours(23, 59, 59, 999);
+    
+    while (d <= todayEnd) {
       if (d.getDay() !== 5) { // Skip Friday
-        totalWorkdaysInMonth++;
+        const dateString = getDhakaTodayString(); // We need to format the date
+        const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        if (!isOnApprovedLeave(dateStr)) {
+          totalWorkdaysInMonth++;
+        }
       }
       d.setDate(d.getDate() + 1);
     }
@@ -1868,7 +1885,7 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
       daysWorked: userWorkdaysSet.size,
       totalWorkdaysMonth: totalWorkdaysInMonth
     };
-  }, [files, isFileCompleted, attendanceRecords]);
+  }, [files, isFileCompleted, attendanceRecords, approvedLeaves, user?.id]);
 
   const recentActivity = useMemo(() => {
     const allEvents = [];
@@ -1967,23 +1984,6 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
             </h3>
           </div>
           <div className="p-4 space-y-4">
-            {/* Earliest Today */}
-            <div className={`p-3 rounded-lg border ${darkMode ? 'border-blue-800/50 bg-blue-900/20' : 'border-blue-200 bg-blue-50'}`}>
-              <p className={`text-[10px] font-semibold ${darkMode ? 'text-blue-400' : 'text-blue-600'} uppercase tracking-wide mb-2`}>🌅 Earliest Today</p>
-              {honorsMetrics.earliestToday ? (
-                <p className={`text-sm font-semibold ${textMain}`}>{honorsMetrics.earliestToday.user}</p>
-              ) : (
-                <p className="text-xs text-slate-400">No activity today</p>
-              )}
-            </div>
-
-            {/* Most Punctual */}
-            <div className={`p-3 rounded-lg border ${darkMode ? 'border-green-800/50 bg-green-900/20' : 'border-green-200 bg-green-50'}`}>
-              <p className={`text-[10px] font-semibold ${darkMode ? 'text-green-400' : 'text-green-600'} uppercase tracking-wide mb-2`}>✓ Most Punctual</p>
-              <p className={`text-sm font-semibold ${textMain}`}>{honorsMetrics.mostPunctual.user}</p>
-              <p className={`text-xs ${textSub}`}>{honorsMetrics.mostPunctual.workdayCount} workdays this month</p>
-            </div>
-
             {/* Best Sales */}
             <div className={`p-3 rounded-lg border ${darkMode ? 'border-purple-800/50 bg-purple-900/20' : 'border-purple-200 bg-purple-50'}`}>
               <p className={`text-[10px] font-semibold ${darkMode ? 'text-purple-400' : 'text-purple-600'} uppercase tracking-wide mb-2`}>💰 Best Sales</p>
@@ -2577,15 +2577,34 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
 }
 
 function PipelineView({ files, darkMode }) {
+  const [filterCreatedBy, setFilterCreatedBy] = useState('ALL');
+  const [filterStatus, setFilterStatus] = useState('ALL');
+
   const groupedFiles = useMemo(() => {
     const groups = {};
     files.forEach(f => {
-      if (f.status === 'DONE') return; 
+      if (f.status === 'DONE') return;
+      
+      // Apply filters
+      if (filterCreatedBy !== 'ALL' && f.createdBy !== filterCreatedBy) return;
+      if (filterStatus !== 'ALL' && f.status !== filterStatus) return;
+      
       const assignee = f.assignedTo || 'Unassigned';
       if (!groups[assignee]) groups[assignee] = [];
       groups[assignee].push(f);
     });
     return groups;
+  }, [files, filterCreatedBy, filterStatus]);
+
+  // Get unique creators and statuses for filter dropdowns
+  const creators = useMemo(() => {
+    const unique = new Set(files.map(f => f.createdBy).filter(Boolean));
+    return Array.from(unique).sort();
+  }, [files]);
+
+  const statuses = useMemo(() => {
+    const unique = new Set(files.filter(f => f.status !== 'DONE').map(f => f.status));
+    return Array.from(unique).sort();
   }, [files]);
 
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
@@ -2599,6 +2618,30 @@ function PipelineView({ files, darkMode }) {
           <h2 className={`text-2xl font-bold ${textMain}`}>Work Pipeline</h2>
           <p className="text-slate-500">Current workload distribution by employee</p>
         </div>
+      </div>
+
+      <div className="flex gap-4 flex-wrap">
+        <select 
+          value={filterCreatedBy}
+          onChange={(e) => setFilterCreatedBy(e.target.value)}
+          className={`px-3 py-2 rounded-lg border text-sm font-medium ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-200' : 'bg-white border-slate-300 text-slate-800'}`}
+        >
+          <option value="ALL">All Users</option>
+          {creators.map(creator => (
+            <option key={creator} value={creator}>{creator}</option>
+          ))}
+        </select>
+
+        <select 
+          value={filterStatus}
+          onChange={(e) => setFilterStatus(e.target.value)}
+          className={`px-3 py-2 rounded-lg border text-sm font-medium ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-200' : 'bg-white border-slate-300 text-slate-800'}`}
+        >
+          <option value="ALL">All Statuses</option>
+          {statuses.map(status => (
+            <option key={status} value={status}>{STATUS[status]?.label || status}</option>
+          ))}
+        </select>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 overflow-x-auto pb-4">
@@ -2630,6 +2673,173 @@ function PipelineView({ files, darkMode }) {
         ))}
         {Object.keys(groupedFiles).length === 0 && (
            <div className="col-span-full text-center py-20 text-slate-400">No active files in the pipeline.</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LeavesPanel({ currentUser, leaveRequests, approvedLeaves, allUsers, darkMode, onApprove, onReject, onGrantDirect, onDeleteLeave, onRequestLeave }) {
+  const [showDirectLeaveForm, setShowDirectLeaveForm] = useState(false);
+  const [directLeaveForm, setDirectLeaveForm] = useState({ userName: '', startDate: '', endDate: '', reason: '' });
+  
+  const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
+  const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
+  const textSub = darkMode ? 'text-slate-400' : 'text-slate-500';
+
+  const pendingRequests = leaveRequests.filter(r => r.status === 'PENDING');
+  const userApprovedLeaves = approvedLeaves.filter(l => l.type === 'REQUESTED');
+
+  const handleGrantDirect = async (e) => {
+    e.preventDefault();
+    await onGrantDirect(directLeaveForm.userName, directLeaveForm.startDate, directLeaveForm.endDate, directLeaveForm.reason);
+    setDirectLeaveForm({ userName: '', startDate: '', endDate: '', reason: '' });
+    setShowDirectLeaveForm(false);
+  };
+
+  return (
+    <div className={`rounded-xl border p-8 ${cardClass}`}>
+      <div className="flex justify-between items-center mb-6">
+        <div>
+          <h2 className={`text-2xl font-bold ${textMain}`}>Leave Management</h2>
+          <p className={textSub}>Manage leave requests and approved leaves</p>
+        </div>
+        {currentUser.role !== ROLES.ADMIN && (
+          <button 
+            onClick={onRequestLeave}
+            className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-medium"
+          >
+            Request Leave
+          </button>
+        )}
+      </div>
+
+      {/* Admin Leave Request Approvals */}
+      {currentUser.role === ROLES.ADMIN && (
+        <div className={`mb-8 p-6 rounded-xl border ${darkMode ? 'bg-slate-800/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
+          <h3 className={`text-lg font-bold mb-4 ${textMain}`}>Pending Leave Requests</h3>
+          {pendingRequests.length === 0 ? (
+            <p className={textSub}>No pending leave requests</p>
+          ) : (
+            <div className="space-y-3">
+              {pendingRequests.map(req => (
+                <div key={req.id} className={`p-4 rounded-lg border ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
+                  <div className="flex justify-between items-start mb-2">
+                    <div>
+                      <p className={`font-bold ${textMain}`}>{req.userName}</p>
+                      <p className={`text-sm ${textSub}`}>{req.startDate} to {req.endDate}</p>
+                      {req.reason && <p className={`text-sm ${textSub} mt-1`}>Reason: {req.reason}</p>}
+                    </div>
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={() => onApprove(req.id, req)}
+                        className="px-3 py-1 bg-green-500 text-white rounded text-sm hover:bg-green-600"
+                      >
+                        Approve
+                      </button>
+                      <button 
+                        onClick={() => onReject(req.id)}
+                        className="px-3 py-1 bg-red-500 text-white rounded text-sm hover:bg-red-600"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Admin Direct Leave Grant */}
+      {currentUser.role === ROLES.ADMIN && (
+        <div className={`mb-8 p-6 rounded-xl border ${darkMode ? 'bg-slate-800/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
+          <div className="flex justify-between items-center mb-4">
+            <h3 className={`text-lg font-bold ${textMain}`}>Grant Direct Leave</h3>
+            <button 
+              onClick={() => setShowDirectLeaveForm(!showDirectLeaveForm)}
+              className="px-3 py-1 bg-blue-500 text-white rounded text-sm hover:bg-blue-600"
+            >
+              {showDirectLeaveForm ? 'Cancel' : 'Grant Leave'}
+            </button>
+          </div>
+          
+          {showDirectLeaveForm && (
+            <form onSubmit={handleGrantDirect} className="space-y-3">
+              <select 
+                value={directLeaveForm.userName}
+                onChange={(e) => setDirectLeaveForm({...directLeaveForm, userName: e.target.value})}
+                className={`w-full px-3 py-2 rounded-lg border ${darkMode ? 'bg-slate-900 border-slate-700 text-slate-100' : 'bg-white border-slate-300 text-slate-900'}`}
+              >
+                <option value="">Select Employee</option>
+                {allUsers.map(u => (
+                  <option key={u.id} value={u.fullName}>{u.fullName} ({u.role})</option>
+                ))}
+              </select>
+              <div className="grid grid-cols-2 gap-3">
+                <input 
+                  type="date"
+                  value={directLeaveForm.startDate}
+                  onChange={(e) => setDirectLeaveForm({...directLeaveForm, startDate: e.target.value})}
+                  className={`px-3 py-2 rounded-lg border ${darkMode ? 'bg-slate-900 border-slate-700 text-slate-100' : 'bg-white border-slate-300 text-slate-900'}`}
+                />
+                <input 
+                  type="date"
+                  value={directLeaveForm.endDate}
+                  onChange={(e) => setDirectLeaveForm({...directLeaveForm, endDate: e.target.value})}
+                  className={`px-3 py-2 rounded-lg border ${darkMode ? 'bg-slate-900 border-slate-700 text-slate-100' : 'bg-white border-slate-300 text-slate-900'}`}
+                />
+              </div>
+              <input 
+                type="text"
+                placeholder="Reason (optional)"
+                value={directLeaveForm.reason}
+                onChange={(e) => setDirectLeaveForm({...directLeaveForm, reason: e.target.value})}
+                className={`w-full px-3 py-2 rounded-lg border ${darkMode ? 'bg-slate-900 border-slate-700 text-slate-100' : 'bg-white border-slate-300 text-slate-900'}`}
+              />
+              <button type="submit" className="w-full px-3 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 font-medium">
+                Grant Leave
+              </button>
+            </form>
+          )}
+        </div>
+      )}
+
+      {/* Approved Leaves List */}
+      <div className={`p-6 rounded-xl border ${darkMode ? 'bg-slate-800/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
+        <h3 className={`text-lg font-bold mb-4 ${textMain}`}>Approved Leaves</h3>
+        {approvedLeaves.length === 0 ? (
+          <p className={textSub}>No approved leaves</p>
+        ) : (
+          <div className="space-y-3">
+            {approvedLeaves.map(leave => (
+              <div key={leave.id} className={`p-4 rounded-lg border ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
+                <div className="flex justify-between items-start">
+                  <div>
+                    <p className={`font-bold ${textMain}`}>{leave.userName}</p>
+                    <p className={`text-sm ${textSub}`}>{leave.startDate} to {leave.endDate}</p>
+                    {leave.reason && <p className={`text-sm ${textSub} mt-1`}>Reason: {leave.reason}</p>}
+                    <p className={`text-xs ${textSub} mt-1`}>Approved by: {leave.approvedBy} ({leave.type})</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className={`px-3 py-1 rounded-full text-xs font-bold ${leave.type === 'REQUESTED' ? (darkMode ? 'bg-blue-900/30 text-blue-400' : 'bg-blue-100 text-blue-700') : (darkMode ? 'bg-green-900/30 text-green-400' : 'bg-green-100 text-green-700')}`}>
+                      {leave.type}
+                    </span>
+                    {currentUser.role === ROLES.ADMIN && (
+                      <button
+                        onClick={() => onDeleteLeave(leave.id, leave.userName)}
+                        className="px-2 py-1 bg-red-500 text-white rounded text-xs hover:bg-red-600 transition-colors"
+                        title="Delete this leave"
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </div>
@@ -2678,7 +2888,7 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
   useEffect(() => {
     const attQ = query(
       collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
-      where('logoutTime', '==', null)
+      where('lastLogoutTime', '==', null)
     );
     const unsubscribe = onSnapshot(attQ, (snapshot) => {
       const sessions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -2789,7 +2999,7 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
       try {
         for (const session of activeSessions) {
           const ref = doc(db, 'artifacts', appId, 'public', 'data', 'attendance', session.id);
-          await updateDoc(ref, { logoutTime: serverTimestamp() });
+          await updateDoc(ref, { lastLogoutTime: serverTimestamp() });
         }
       } catch (err) {
         console.error('Error ending all sessions:', err);
@@ -4102,6 +4312,93 @@ function NoteModal({ isOpen, onClose, onConfirm, file, darkMode }) {
     );
 }
 
+function LeaveRequestModal({ isOpen, onClose, onSubmit, leaveFormData, setLeaveFormData, darkMode }) {
+    if (!isOpen) return null;
+
+    const cardClass = darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900';
+    const inputClass = darkMode 
+      ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
+      : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+    const labelClass = darkMode ? 'text-slate-300' : 'text-slate-700';
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        if (!leaveFormData.startDate || !leaveFormData.endDate) {
+            alert('Please select both start and end dates');
+            return;
+        }
+        if (new Date(leaveFormData.startDate) > new Date(leaveFormData.endDate)) {
+            alert('Start date cannot be after end date');
+            return;
+        }
+        onSubmit(e);
+    };
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+            <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
+                <h3 className="text-lg font-bold mb-4">Request Leave</h3>
+                
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <div>
+                        <label className={`block text-sm font-medium mb-2 ${labelClass}`}>
+                            Start Date
+                        </label>
+                        <input
+                            type="date"
+                            required
+                            value={leaveFormData.startDate}
+                            onChange={(e) => setLeaveFormData({ ...leaveFormData, startDate: e.target.value })}
+                            className={`w-full px-4 py-2 border rounded-xl focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                        />
+                    </div>
+
+                    <div>
+                        <label className={`block text-sm font-medium mb-2 ${labelClass}`}>
+                            End Date
+                        </label>
+                        <input
+                            type="date"
+                            required
+                            value={leaveFormData.endDate}
+                            onChange={(e) => setLeaveFormData({ ...leaveFormData, endDate: e.target.value })}
+                            className={`w-full px-4 py-2 border rounded-xl focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                        />
+                    </div>
+
+                    <div>
+                        <label className={`block text-sm font-medium mb-2 ${labelClass}`}>
+                            Reason (Optional)
+                        </label>
+                        <textarea
+                            value={leaveFormData.reason}
+                            onChange={(e) => setLeaveFormData({ ...leaveFormData, reason: e.target.value })}
+                            placeholder="Mention your reason for leave..."
+                            className={`w-full px-4 py-3 border rounded-xl focus:ring-2 focus:ring-blue-500 outline-none text-sm min-h-[100px] ${inputClass}`}
+                        />
+                    </div>
+
+                    <div className="flex justify-end gap-3 pt-4">
+                        <button 
+                            type="button"
+                            onClick={onClose} 
+                            className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium"
+                        >
+                            Cancel
+                        </button>
+                        <button 
+                            type="submit"
+                            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium transition-colors"
+                        >
+                            Request Leave
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    );
+}
+
 function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMode, allUsers, currentUser }) {
     const [editData, setEditData] = useState({});
     const [initialized, setInitialized] = useState(false);
@@ -4688,10 +4985,63 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
         if (!aDate) return false;
         
         return (userFilter === 'ALL' || a.userName === userFilter) && aDate >= start && aDate <= end;
-    }).sort((a,b) => b.loginTime?.seconds - a.loginTime?.seconds); 
+    }).sort((a,b) => b.firstLoginTime?.seconds - a.firstLoginTime?.seconds); 
 
     return reportData;
   }, [files, attendanceData, timeRange, userFilter, customStartDate, customEndDate]);
+
+  // Calculate profit by sales rep
+  const profitBySalesRep = useMemo(() => {
+    const start = getStartOf(timeRange, customStartDate ? new Date(customStartDate) : null);
+    const end = getEndOf(timeRange, customEndDate ? new Date(customEndDate) : null);
+    
+    if (!start || !end || isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return [];
+    }
+
+    const repData = {};
+
+    files.forEach(file => {
+      const fileCreationDate = file.createdAt?.toDate ? file.createdAt.toDate() : new Date(file.createdAt?.seconds * 1000 || 0);
+      
+      // Only include files from selected date range, created by sales users or admins only
+      if (fileCreationDate >= start && fileCreationDate <= end && file.createdBy) {
+        const creatorRole = allUsers.find(u => u.name === file.createdBy)?.role;
+        // Only count files created by sales users or admins
+        if (creatorRole !== ROLES.SALES && creatorRole !== ROLES.ADMIN) {
+          return;
+        }
+        
+        const repName = file.createdBy;
+        
+        if (!repData[repName]) {
+          repData[repName] = { name: repName, revenue: 0, cost: 0, files: 0 };
+        }
+
+        repData[repName].files++;
+
+        // Calculate revenue and cost based on file type
+        if (file.fileType === FILE_TYPES.VISA) {
+          repData[repName].revenue += Number(file.serviceCharge || 0);
+          repData[repName].cost += Number(file.cost || 0);
+        } else if (file.fileType === FILE_TYPES.AIR_TICKET) {
+          repData[repName].revenue += Number(file.airlineSalePrice || 0);
+          repData[repName].cost += Number(file.airlineCostPrice || 0);
+        } else if (file.fileType === FILE_TYPES.PACKAGE) {
+          repData[repName].revenue += Number(file.packageSalePrice || 0);
+          repData[repName].cost += Number(file.packageCostPrice || 0);
+        } else {
+          repData[repName].revenue += Number(file.serviceCharge || 0);
+          repData[repName].cost += Number(file.cost || 0);
+        }
+      }
+    });
+
+    // Calculate profit and sort by profit descending
+    return Object.values(repData)
+      .map(rep => ({ ...rep, profit: rep.revenue - rep.cost }))
+      .sort((a, b) => b.profit - a.profit);
+  }, [files, timeRange, customStartDate, customEndDate]);
 
   const handlePrint = () => {
     window.print();
@@ -4895,19 +5245,22 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
                         </thead>
                         <tbody className={textMain}>
                             {stats.attendance.map((att) => {
-                              const workHours = calculateWorkingHours(att.loginTime, att.logoutTime);
+                              const workHours = calculateWorkingHours(att.firstLoginTime, att.lastLogoutTime);
+                              const todayDate = getDhakaTodayString();
+                              const isToday = att.date === todayDate;
+                              const isActive = isToday && !att.lastLogoutTime;
                               return (
                                 <tr key={att.id} className={`border-b ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
                                     <td className="px-4 py-3 font-medium">{att.date}</td>
                                     {userFilter === 'ALL' && <td className="px-4 py-3 font-medium">{att.userName}</td>}
-                                    <td className="px-4 py-3 text-green-600 font-mono">{formatTimeOnly(att.loginTime)}</td>
-                                    <td className="px-4 py-3 text-red-500 font-mono">{att.logoutTime ? formatTimeOnly(att.logoutTime) : '-'}</td>
+                                    <td className="px-4 py-3 text-green-600 font-mono">{formatTimeOnly(att.firstLoginTime)}</td>
+                                    <td className="px-4 py-3 text-red-500 font-mono">{att.lastLogoutTime ? formatTimeOnly(att.lastLogoutTime) : '-'}</td>
                                     <td className="px-4 py-3 font-mono font-medium">{formatHours(workHours.hours)}</td>
                                     <td className={`px-4 py-3 font-mono font-medium ${darkMode ? 'text-blue-400' : 'text-blue-700'}`}>{formatHours(workHours.shift)}</td>
                                     <td className={`px-4 py-3 font-mono font-medium ${workHours.overtime > 0 ? (darkMode ? 'text-orange-400' : 'text-orange-700') : 'text-slate-400'}`}>{formatHours(workHours.overtime)}</td>
                                     <td className="px-4 py-3">
-                                        <span className={`px-2 py-1 rounded-full text-xs ${att.logoutTime ? (darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600') : 'bg-green-100 text-green-700'}`}>
-                                            {att.logoutTime ? 'Completed' : 'Active'}
+                                        <span className={`px-2 py-1 rounded-full text-xs ${isActive ? 'bg-green-100 text-green-700' : (darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600')}`}>
+                                            {isActive ? 'Active' : 'Completed'}
                                         </span>
                                     </td>
                                 </tr>
@@ -4980,6 +5333,40 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
             </div>
           )}
         </div>
+
+        {isAdmin && profitBySalesRep.length > 0 && (
+          <div className={`mb-8 p-6 rounded-xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+            <h3 className={`text-lg font-bold mb-4 flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
+              <TrendingUp className="h-5 w-5 text-green-500"/> Profit by Sales Rep
+            </h3>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm text-left">
+                <thead className={`text-xs uppercase ${darkMode ? 'text-slate-400 bg-slate-800' : 'text-slate-500 bg-slate-100'}`}>
+                  <tr>
+                    <th className="px-4 py-3 rounded-l-lg">Sales Rep</th>
+                    <th className="px-4 py-3 text-right">Files</th>
+                    <th className="px-4 py-3 text-right">Revenue</th>
+                    <th className="px-4 py-3 text-right">Cost</th>
+                    <th className="px-4 py-3 rounded-r-lg text-right">Profit</th>
+                  </tr>
+                </thead>
+                <tbody className={textMain}>
+                  {profitBySalesRep.map((rep) => (
+                    <tr key={rep.name} className={`border-b ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+                      <td className="px-4 py-3 font-medium">{rep.name}</td>
+                      <td className="px-4 py-3 text-right font-medium">{rep.files}</td>
+                      <td className="px-4 py-3 text-right text-green-600 font-mono">৳{rep.revenue.toFixed(2)}</td>
+                      <td className="px-4 py-3 text-right text-red-500 font-mono">৳{rep.cost.toFixed(2)}</td>
+                      <td className={`px-4 py-3 text-right font-bold font-mono ${rep.profit >= 0 ? (darkMode ? 'text-emerald-400' : 'text-emerald-700') : (darkMode ? 'text-red-400' : 'text-red-700')}`}>
+                        ৳{rep.profit.toFixed(2)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
 
         <div>
            <h3 className={`text-lg font-bold mb-4 ${textMain}`}>Activity Notes Log</h3>
@@ -5157,13 +5544,13 @@ function CustomReportModal({ isOpen, onClose, files, userFilter, timeRange, dark
             doc.text(`Employee: ${att.userName}`, margin + 5, yPosition);
             yPosition += 4;
           }
-          const loginTime = att.loginTime ? new Date(att.loginTime?.seconds * 1000).toLocaleTimeString() : 'N/A';
-          const logoutTime = att.logoutTime ? new Date(att.logoutTime?.seconds * 1000).toLocaleTimeString() : 'N/A';
+          const loginTime = att.firstLoginTime ? new Date(att.firstLoginTime?.seconds * 1000).toLocaleTimeString() : 'N/A';
+          const logoutTime = att.lastLogoutTime ? new Date(att.lastLogoutTime?.seconds * 1000).toLocaleTimeString() : 'N/A';
           doc.text(`Login: ${loginTime}`, margin + 5, yPosition);
           yPosition += 4;
           doc.text(`Logout: ${logoutTime}`, margin + 5, yPosition);
           yPosition += 4;
-          doc.text(`Status: ${att.logoutTime ? 'Completed' : 'Active'}`, margin + 5, yPosition);
+          doc.text(`Status: ${att.lastLogoutTime ? 'Completed' : 'Active'}`, margin + 5, yPosition);
           yPosition += 5;
         });
       }
