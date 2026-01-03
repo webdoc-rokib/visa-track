@@ -203,17 +203,71 @@ export const validateFileData = (fileData) => {
     else data.passportNo = passportVal.value;
   }
 
-  // Validate numeric fields
-  if (fileData.serviceCharge !== undefined) {
+  // Validate numeric fields for Visa and Air Ticket
+  if (fileData.serviceCharge !== undefined && fileData.serviceCharge !== '') {
     const chargeVal = validateNumericInput(fileData.serviceCharge, { min: 0 });
     if (!chargeVal.isValid) errors.serviceCharge = chargeVal.error;
     else data.serviceCharge = chargeVal.value;
   }
 
-  if (fileData.cost !== undefined) {
+  if (fileData.cost !== undefined && fileData.cost !== '') {
     const costVal = validateNumericInput(fileData.cost, { min: 0 });
     if (!costVal.isValid) errors.cost = costVal.error;
     else data.cost = costVal.value;
+  }
+
+  // Validate package-specific numeric fields
+  if (fileData.packageSalePrice !== undefined && fileData.packageSalePrice !== '') {
+    const salePriceVal = validateNumericInput(fileData.packageSalePrice, { min: 0 });
+    if (!salePriceVal.isValid) errors.packageSalePrice = salePriceVal.error;
+    else data.packageSalePrice = salePriceVal.value;
+  }
+
+  if (fileData.packageCostPrice !== undefined && fileData.packageCostPrice !== '') {
+    const costPriceVal = validateNumericInput(fileData.packageCostPrice, { min: 0 });
+    if (!costPriceVal.isValid) errors.packageCostPrice = costPriceVal.error;
+    else data.packageCostPrice = costPriceVal.value;
+  }
+
+  if (fileData.numberOfPersons !== undefined && fileData.numberOfPersons !== '') {
+    const personsVal = validateNumericInput(fileData.numberOfPersons, { min: 1, allowDecimal: false });
+    if (!personsVal.isValid) errors.numberOfPersons = personsVal.error;
+    else data.numberOfPersons = personsVal.value;
+  }
+
+  // Validate Pick & Drop-specific fields
+  if (fileData.fileType === 'Pick & Drop') {
+    if (fileData.pickupLocation !== undefined && fileData.pickupLocation !== '') {
+      if (fileData.pickupLocation.length < 3) {
+        errors.pickupLocation = 'Pickup location must be at least 3 characters';
+      } else if (fileData.pickupLocation.length > 100) {
+        errors.pickupLocation = 'Pickup location must not exceed 100 characters';
+      } else {
+        data.pickupLocation = fileData.pickupLocation;
+      }
+    }
+
+    if (fileData.dropoffLocation !== undefined && fileData.dropoffLocation !== '') {
+      if (fileData.dropoffLocation.length < 3) {
+        errors.dropoffLocation = 'Dropoff location must be at least 3 characters';
+      } else if (fileData.dropoffLocation.length > 100) {
+        errors.dropoffLocation = 'Dropoff location must not exceed 100 characters';
+      } else {
+        data.dropoffLocation = fileData.dropoffLocation;
+      }
+    }
+
+    if (fileData.salePrice !== undefined && fileData.salePrice !== '') {
+      const salePriceVal = validateNumericInput(fileData.salePrice, { min: 0 });
+      if (!salePriceVal.isValid) errors.salePrice = salePriceVal.error;
+      else data.salePrice = salePriceVal.value;
+    }
+
+    if (fileData.costPrice !== undefined && fileData.costPrice !== '') {
+      const costPriceVal = validateNumericInput(fileData.costPrice, { min: 0 });
+      if (!costPriceVal.isValid) errors.costPrice = costPriceVal.error;
+      else data.costPrice = costPriceVal.value;
+    }
   }
 
   return {

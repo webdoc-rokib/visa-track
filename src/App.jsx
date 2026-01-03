@@ -114,7 +114,8 @@ const ROLES = {
 const FILE_TYPES = {
   VISA: 'Visa',
   AIR_TICKET: 'Air Ticket',
-  PACKAGE: 'Package'
+  PACKAGE: 'Package',
+  PICK_DROP: 'Pick & Drop'
 };
 
 const AIR_TICKET_PORTALS = ['Ticket Lagbe', 'TripLover', 'FirstTrip', 'AkijAir'];
@@ -139,6 +140,11 @@ const STATUS = {
   HOTELS_BOOKED: { label: 'Hotels Booked', color: 'bg-purple-100 text-purple-800', darkColor: 'bg-purple-900/30 text-purple-200', icon: CheckCircle },
   PICKUP_DROPOFF_BOOKED: { label: 'Pick & Drop Booked', color: 'bg-indigo-100 text-indigo-800', darkColor: 'bg-indigo-900/30 text-indigo-200', icon: CheckCircle },
   PACKAGE_READY: { label: 'Package Ready', color: 'bg-green-100 text-green-800', darkColor: 'bg-green-900/30 text-green-200', icon: CheckCircle },
+  
+  // Pick & Drop statuses
+  PICKUP_DROP_INITIATED: { label: 'Pick & Drop Service Initiated', color: 'bg-blue-100 text-blue-800', darkColor: 'bg-blue-900/30 text-blue-200', icon: Briefcase },
+  PICKUP_DROP_CONFIRMED: { label: 'Pick & Drop Confirmed', color: 'bg-purple-100 text-purple-800', darkColor: 'bg-purple-900/30 text-purple-200', icon: CheckCircle },
+  PICKUP_DROP_COMPLETED: { label: 'Pick & Drop Completed', color: 'bg-green-100 text-green-800', darkColor: 'bg-green-900/30 text-green-200', icon: CheckCircle },
 };
 
 const RESULTS = {
@@ -538,6 +544,7 @@ export default function VisaTrackApp() {
   const [packageFlightIssuedModalOpen, setPackageFlightIssuedModalOpen] = useState(false);
   const [packageHotelsBookedModalOpen, setPackageHotelsBookedModalOpen] = useState(false);
   const [packagePickupDropoffModalOpen, setPackagePickupDropoffModalOpen] = useState(false);
+  const [pickDropConfirmedModalOpen, setPickDropConfirmedModalOpen] = useState(false);
   
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedAction, setSelectedAction] = useState(null);
@@ -999,6 +1006,22 @@ export default function VisaTrackApp() {
           timestamp: Date.now()
         }]
       };
+    } else if (data.fileType === FILE_TYPES.PICK_DROP) {
+      newFile = {
+        ...newFile,
+        pickupLocation: sanitizeInput(data.pickupLocation, { maxLength: 100 }),
+        dropoffLocation: sanitizeInput(data.dropoffLocation, { maxLength: 100 }),
+        numberOfPersons: Number(data.numberOfPersons) || 0,
+        salePrice: Number(data.salePrice) || 0,
+        costPrice: Number(data.costPrice) || 0,
+        status: 'PICKUP_DROP_INITIATED',
+        history: [{
+          action: 'Pick & Drop Service Initiated',
+          status: 'PICKUP_DROP_INITIATED',
+          performedBy: appUser.name,
+          timestamp: Date.now()
+        }]
+      };
     }
 
     await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'visa_files'), newFile);
@@ -1029,7 +1052,7 @@ export default function VisaTrackApp() {
     setSelectedAction(action); 
     
     // Route to specialized modals for specific statuses
-    const fileType = file.fileType;
+    const fileType = file.fileType || FILE_TYPES.VISA; // Default to VISA if fileType is missing
     
     if (fileType === FILE_TYPES.AIR_TICKET) {
       if (action === 'BOOKED') {
@@ -1049,7 +1072,14 @@ export default function VisaTrackApp() {
       } else {
         setModalOpen(true);
       }
+    } else if (fileType === FILE_TYPES.PICK_DROP) {
+      if (action === 'PICKUP_DROP_CONFIRMED') {
+        setPickDropConfirmedModalOpen(true);
+      } else {
+        setModalOpen(true);
+      }
     } else {
+      // Default to generic modal for VISA and any unrecognized types
       setModalOpen(true);
     }
   };
@@ -1117,6 +1147,8 @@ export default function VisaTrackApp() {
         if (specializedData.pnr) ticketUpdate.pnr = specializedData.pnr;
         if (specializedData.portal) ticketUpdate.portal = specializedData.portal;
         if (specializedData.bookingValidity) ticketUpdate.bookingValidity = specializedData.bookingValidity;
+        if (specializedData.airlineSalePrice !== undefined) ticketUpdate.airlineSalePrice = Number(specializedData.airlineSalePrice) || 0;
+        if (specializedData.airlineCostPrice !== undefined) ticketUpdate.airlineCostPrice = Number(specializedData.airlineCostPrice) || 0;
       }
 
       updateData = ticketUpdate;
@@ -1150,6 +1182,8 @@ export default function VisaTrackApp() {
         if (specializedData.hotelFromDate) packageUpdate.hotelFromDate = specializedData.hotelFromDate;
         if (specializedData.hotelToDate) packageUpdate.hotelToDate = specializedData.hotelToDate;
         if (specializedData.routes) packageUpdate.routes = specializedData.routes;
+        if (specializedData.packageSalePrice !== undefined) packageUpdate.packageSalePrice = Number(specializedData.packageSalePrice) || 0;
+        if (specializedData.packageCostPrice !== undefined) packageUpdate.packageCostPrice = Number(specializedData.packageCostPrice) || 0;
       }
 
       updateData = packageUpdate;
@@ -1281,6 +1315,10 @@ export default function VisaTrackApp() {
         updateData.numberOfPersons = Number(data.numberOfPersons) || 0;
         updateData.packageSalePrice = Number(data.packageSalePrice) || 0;
         updateData.packageCostPrice = Number(data.packageCostPrice) || 0;
+      } else if (selectedFile.fileType === FILE_TYPES.PICK_DROP) {
+        updateData.numberOfPersons = Number(data.numberOfPersons) || 0;
+        updateData.salePrice = Number(data.salePrice) || 0;
+        updateData.costPrice = Number(data.costPrice) || 0;
       }
       
       updateData.updatedAt = serverTimestamp();
@@ -1710,6 +1748,8 @@ function NavButton({ active, onClick, icon: Icon, children, darkMode, badge }) {
 
 function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode, onOpenInvoiceModal, allUsers, attendanceRecords, approvedLeaves }) {
   const [destFilter, setDestFilter] = useState('');
+  const [fileTypeFilter, setFileTypeFilter] = useState('');
+  const [showIncompleteCosts, setShowIncompleteCosts] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [currentTime, setCurrentTime] = useState(getDhakaDate());
   const itemsPerPage = 20;
@@ -1923,17 +1963,39 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
   
   const normalizedSearch = searchTerm.trim().toLowerCase();
   const filteredFiles = files.filter(f => {
-    if (!normalizedSearch) return destFilter ? f.destination === destFilter : true;
+    // Search filter
+    if (normalizedSearch) {
+      const matchesSearch = 
+        (f.applicantName && String(f.applicantName).toLowerCase().includes(normalizedSearch)) || 
+        (f.passportNo && String(f.passportNo).trim().toLowerCase().includes(normalizedSearch)) ||
+        (f.mainPersonPassport && String(f.mainPersonPassport).trim().toLowerCase().includes(normalizedSearch)) ||
+        (f.destination && String(f.destination).toLowerCase().includes(normalizedSearch)) ||
+        (f.fileId && String(f.fileId).toLowerCase().includes(normalizedSearch));
+      if (!matchesSearch) return false;
+    }
 
-    const matchesSearch = 
-      (f.applicantName && String(f.applicantName).toLowerCase().includes(normalizedSearch)) || 
-      (f.passportNo && String(f.passportNo).trim().toLowerCase().includes(normalizedSearch)) ||
-      (f.mainPersonPassport && String(f.mainPersonPassport).trim().toLowerCase().includes(normalizedSearch)) ||
-      (f.destination && String(f.destination).toLowerCase().includes(normalizedSearch)) ||
-      (f.fileId && String(f.fileId).toLowerCase().includes(normalizedSearch));
+    // Destination filter
+    if (destFilter && f.destination !== destFilter) return false;
 
-    const matchesDest = destFilter ? f.destination === destFilter : true;
-    return matchesSearch && matchesDest;
+    // File type filter
+    if (fileTypeFilter && f.fileType !== fileTypeFilter) return false;
+
+    // Incomplete costs filter - find files with sale/service price but zero cost
+    if (showIncompleteCosts) {
+      const hasIncompleteCost = 
+        (f.fileType === FILE_TYPES.VISA && 
+          (Number(f.serviceCharge) > 0 || Number(f.cost) > 0) && 
+          (Number(f.cost) === 0)) || // Has service charge/cost but cost is zero
+        (f.fileType === FILE_TYPES.AIR_TICKET && 
+          (Number(f.airlineSalePrice) > 0 || Number(f.airlineCostPrice) > 0) && 
+          (Number(f.airlineCostPrice) === 0)) || // Has sale price but cost price is zero
+        (f.fileType === FILE_TYPES.PACKAGE && 
+          (Number(f.packageSalePrice) > 0 || Number(f.packageCostPrice) > 0) && 
+          (Number(f.packageCostPrice) === 0)); // Has sale price but cost price is zero
+      if (!hasIncompleteCost) return false;
+    }
+
+    return true;
   });
 
   // Pagination Logic
@@ -2065,7 +2127,7 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
               <p className={`text-sm ${textSub}`}>Showing {currentFiles.length} of {filteredFiles.length} files</p>
             </div>
             
-            <div className="flex gap-2 w-full sm:w-auto">
+            <div className="flex gap-2 w-full sm:w-auto flex-wrap">
               <div className="relative flex-grow sm:flex-grow-0">
                 <Filter className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
                 <select
@@ -2077,6 +2139,31 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
                   {destinations.map(d => <option key={d} value={d}>{d}</option>)}
                 </select>
               </div>
+
+              <div className="relative flex-grow sm:flex-grow-0">
+                <Filter className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                <select
+                  value={fileTypeFilter}
+                  onChange={(e) => setFileTypeFilter(e.target.value)}
+                  className={`pl-10 pr-8 py-2 border rounded-lg appearance-none text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full sm:w-48 h-full ${inputClass}`}
+                >
+                  <option value="">All Types</option>
+                  {Object.values(FILE_TYPES).map(type => <option key={type} value={type}>{type}</option>)}
+                </select>
+              </div>
+
+              <button
+                onClick={() => setShowIncompleteCosts(!showIncompleteCosts)}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors whitespace-nowrap ${
+                  showIncompleteCosts
+                    ? 'bg-red-600 text-white hover:bg-red-700'
+                    : darkMode
+                    ? 'bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700'
+                    : 'bg-slate-200 text-slate-700 hover:bg-slate-300 border border-slate-300'
+                }`}
+              >
+                ⚠️ Incomplete Costs
+              </button>
 
               <div className="relative flex-grow sm:flex-grow-0">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400" />
@@ -2230,7 +2317,12 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
     packageSalePrice: '',
     packageCostPrice: '',
     numberOfPersons: '',
-    mainPersonPassport: ''
+    mainPersonPassport: '',
+    // Pick & Drop fields
+    pickupLocation: '',
+    dropoffLocation: '',
+    salePrice: '',
+    costPrice: ''
   });
   const [countries, setCountries] = useState([]);
 
@@ -2504,6 +2596,90 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
                   />
                 </div>
               </div>
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Contact Number</label>
+                <input 
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  placeholder="+880..."
+                  value={formData.contactNo}
+                  onChange={e => setFormData({...formData, contactNo: e.target.value})}
+                />
+              </div>
+            </>
+          )}
+
+          {fileType === FILE_TYPES.PICK_DROP && (
+            <>
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Pickup Location</label>
+                <input 
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  placeholder="e.g., Hotel ABC, Dhaka"
+                  value={formData.pickupLocation}
+                  onChange={e => setFormData({...formData, pickupLocation: e.target.value})}
+                />
+              </div>
+
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Dropoff Location</label>
+                <input 
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  placeholder="e.g., Hazrat Shahjalal Airport"
+                  value={formData.dropoffLocation}
+                  onChange={e => setFormData({...formData, dropoffLocation: e.target.value})}
+                />
+              </div>
+
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Number of Persons</label>
+                <input 
+                  type="number"
+                  min="1"
+                  required
+                  className={`w-full px-3 sm:px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                  placeholder="Enter number of persons"
+                  value={formData.numberOfPersons}
+                  onChange={e => setFormData({...formData, numberOfPersons: e.target.value})}
+                />
+              </div>
+
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Sale Price - ৳</label>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 text-sm font-bold">৳</span>
+                  <input 
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    required
+                    className={`w-full pl-10 pr-3 sm:pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                    placeholder="0.00"
+                    value={formData.salePrice}
+                    onChange={e => setFormData({...formData, salePrice: e.target.value})}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Cost Price - ৳</label>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400 text-sm font-bold">৳</span>
+                  <input 
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    required
+                    className={`w-full pl-10 pr-3 sm:pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm sm:text-base ${inputClass}`}
+                    placeholder="0.00"
+                    value={formData.costPrice}
+                    onChange={e => setFormData({...formData, costPrice: e.target.value})}
+                  />
+                </div>
+              </div>
+
               <div>
                 <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Contact Number</label>
                 <input 
@@ -3450,9 +3626,10 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
                  <h3 className={`text-lg font-bold ${textMain}`}>{file.applicantName}</h3>
                  <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${darkMode ? 'bg-slate-800 text-slate-400 border-slate-700' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>{file.fileId || 'NO-ID'}</span>
                  <span className={`text-[10px] px-2 py-0.5 rounded font-semibold ${
-                   file.fileType === FILE_TYPES.VISA ? (darkMode ? 'bg-blue-900/30 text-blue-400' : 'bg-blue-100 text-blue-700') :
-                   file.fileType === FILE_TYPES.AIR_TICKET ? (darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-100 text-purple-700') :
-                   file.fileType === FILE_TYPES.PACKAGE ? (darkMode ? 'bg-emerald-900/30 text-emerald-400' : 'bg-emerald-100 text-emerald-700') :
+                   (file.fileType || FILE_TYPES.VISA) === FILE_TYPES.VISA ? (darkMode ? 'bg-blue-900/30 text-blue-400' : 'bg-blue-100 text-blue-700') :
+                   (file.fileType || FILE_TYPES.VISA) === FILE_TYPES.AIR_TICKET ? (darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-100 text-purple-700') :
+                   (file.fileType || FILE_TYPES.VISA) === FILE_TYPES.PACKAGE ? (darkMode ? 'bg-emerald-900/30 text-emerald-400' : 'bg-emerald-100 text-emerald-700') :
+                   (file.fileType || FILE_TYPES.VISA) === FILE_TYPES.PICK_DROP ? (darkMode ? 'bg-orange-900/30 text-orange-400' : 'bg-orange-100 text-orange-700') :
                    ''
                  }`}>{file.fileType || FILE_TYPES.VISA}</span>
               </div>
@@ -3477,7 +3654,7 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
                   <>
                     <span className="flex items-center gap-1"><User className="h-3 w-3" /> {file.passportNo}</span>
                     <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {file.destination || 'N/A'}</span>
-                    {file.serviceCharge && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold\">৳</span> {file.serviceCharge}</span>}
+                    {file.serviceCharge && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold">৳</span> {file.serviceCharge}</span>}
                   </>
                 )}
                 <span className="flex items-center gap-1">📞 {file.contactNo}</span>
@@ -3874,6 +4051,8 @@ function AirTicketBookedModal({ isOpen, onClose, onConfirm, file, darkMode, port
   const [portal, setPortal] = useState(file?.portal || '');
   const [bookingDate, setBookingDate] = useState(file?.bookingValidity?.date || '');
   const [bookingTime, setBookingTime] = useState(file?.bookingValidity?.time || '');
+  const [salePrice, setSalePrice] = useState(file?.airlineSalePrice || '');
+  const [costPrice, setCostPrice] = useState(file?.airlineCostPrice || '');
 
   if (!isOpen) return null;
 
@@ -3884,14 +4063,16 @@ function AirTicketBookedModal({ isOpen, onClose, onConfirm, file, darkMode, port
 
   const handleSubmit = () => {
     if (!pnr || !portal || !bookingDate || !bookingTime) {
-      alert("Please fill in all fields");
+      alert("Please fill in all booking fields");
       return;
     }
-    onConfirm({ pnr, portal, bookingValidity: { date: bookingDate, time: bookingTime } });
+    onConfirm({ pnr, portal, bookingValidity: { date: bookingDate, time: bookingTime }, airlineSalePrice: salePrice, airlineCostPrice: costPrice });
     setPnr('');
     setPortal('');
     setBookingDate('');
     setBookingTime('');
+    setSalePrice('');
+    setCostPrice('');
   };
 
   return (
@@ -3943,6 +4124,32 @@ function AirTicketBookedModal({ isOpen, onClose, onConfirm, file, darkMode, port
               onChange={(e) => setBookingTime(e.target.value)}
             />
           </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Sale Price - ৳</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="0.00"
+              value={salePrice}
+              onChange={(e) => setSalePrice(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Cost Price - ৳</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="0.00"
+              value={costPrice}
+              onChange={(e) => setCostPrice(e.target.value)}
+            />
+          </div>
         </div>
 
         <div className="flex justify-end gap-3 pt-6">
@@ -3960,6 +4167,8 @@ function AirTicketIssuedModal({ isOpen, onClose, onConfirm, file, darkMode, port
   const [portal, setPortal] = useState(file?.portal || '');
   const [bookingDate, setBookingDate] = useState(file?.bookingValidity?.date || '');
   const [bookingTime, setBookingTime] = useState(file?.bookingValidity?.time || '');
+  const [salePrice, setSalePrice] = useState(file?.airlineSalePrice || '');
+  const [costPrice, setCostPrice] = useState(file?.airlineCostPrice || '');
 
   if (!isOpen) return null;
 
@@ -3973,11 +4182,13 @@ function AirTicketIssuedModal({ isOpen, onClose, onConfirm, file, darkMode, port
       alert("Please fill in all fields");
       return;
     }
-    onConfirm({ pnr, portal, bookingValidity: { date: bookingDate, time: bookingTime } });
+    onConfirm({ pnr, portal, bookingValidity: { date: bookingDate, time: bookingTime }, airlineSalePrice: salePrice, airlineCostPrice: costPrice });
     setPnr('');
     setPortal('');
     setBookingDate('');
     setBookingTime('');
+    setSalePrice('');
+    setCostPrice('');
   };
 
   return (
@@ -4029,6 +4240,32 @@ function AirTicketIssuedModal({ isOpen, onClose, onConfirm, file, darkMode, port
               onChange={(e) => setBookingTime(e.target.value)}
             />
           </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Sale Price - ৳</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="0.00"
+              value={salePrice}
+              onChange={(e) => setSalePrice(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Cost Price - ৳</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="0.00"
+              value={costPrice}
+              onChange={(e) => setCostPrice(e.target.value)}
+            />
+          </div>
         </div>
 
         <div className="flex justify-end gap-3 pt-6">
@@ -4044,6 +4281,8 @@ function AirTicketIssuedModal({ isOpen, onClose, onConfirm, file, darkMode, port
 function PackageFlightIssuedModal({ isOpen, onClose, onConfirm, file, darkMode, portals }) {
   const [pnr, setPnr] = useState(file?.flightPnr || '');
   const [portal, setPortal] = useState(file?.flightPortal || '');
+  const [salePrice, setSalePrice] = useState(file?.packageSalePrice || '');
+  const [costPrice, setCostPrice] = useState(file?.packageCostPrice || '');
 
   if (!isOpen) return null;
 
@@ -4057,9 +4296,11 @@ function PackageFlightIssuedModal({ isOpen, onClose, onConfirm, file, darkMode, 
       alert("Please fill in all fields");
       return;
     }
-    onConfirm({ flightPnr: pnr, flightPortal: portal });
+    onConfirm({ flightPnr: pnr, flightPortal: portal, packageSalePrice: salePrice, packageCostPrice: costPrice });
     setPnr('');
     setPortal('');
+    setSalePrice('');
+    setCostPrice('');
   };
 
   return (
@@ -4091,6 +4332,32 @@ function PackageFlightIssuedModal({ isOpen, onClose, onConfirm, file, darkMode, 
               {portals.map(p => <option key={p} value={p}>{p}</option>)}
             </select>
           </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Sale Price - ৳</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="0.00"
+              value={salePrice}
+              onChange={(e) => setSalePrice(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Cost Price - ৳</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="0.00"
+              value={costPrice}
+              onChange={(e) => setCostPrice(e.target.value)}
+            />
+          </div>
         </div>
 
         <div className="flex justify-end gap-3 pt-6">
@@ -4107,6 +4374,8 @@ function PackageHotelsBookedModal({ isOpen, onClose, onConfirm, file, darkMode }
   const [hotelName, setHotelName] = useState(file?.hotelName || '');
   const [fromDate, setFromDate] = useState(file?.hotelFromDate || '');
   const [toDate, setToDate] = useState(file?.hotelToDate || '');
+  const [salePrice, setSalePrice] = useState(file?.packageSalePrice || '');
+  const [costPrice, setCostPrice] = useState(file?.packageCostPrice || '');
 
   if (!isOpen) return null;
 
@@ -4120,10 +4389,12 @@ function PackageHotelsBookedModal({ isOpen, onClose, onConfirm, file, darkMode }
       alert("Please fill in all fields");
       return;
     }
-    onConfirm({ hotelName, hotelFromDate: fromDate, hotelToDate: toDate });
+    onConfirm({ hotelName, hotelFromDate: fromDate, hotelToDate: toDate, packageSalePrice: salePrice, packageCostPrice: costPrice });
     setHotelName('');
     setFromDate('');
     setToDate('');
+    setSalePrice('');
+    setCostPrice('');
   };
 
   return (
@@ -4163,6 +4434,32 @@ function PackageHotelsBookedModal({ isOpen, onClose, onConfirm, file, darkMode }
               onChange={(e) => setToDate(e.target.value)}
             />
           </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Sale Price - ৳</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="0.00"
+              value={salePrice}
+              onChange={(e) => setSalePrice(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Cost Price - ৳</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="0.00"
+              value={costPrice}
+              onChange={(e) => setCostPrice(e.target.value)}
+            />
+          </div>
         </div>
 
         <div className="flex justify-end gap-3 pt-6">
@@ -4179,6 +4476,8 @@ function PackagePickupDropoffModal({ isOpen, onClose, onConfirm, file, darkMode 
   const [numTrips, setNumTrips] = useState(1);
   const [showRouteForm, setShowRouteForm] = useState(false);
   const [routes, setRoutes] = useState(file?.routes || []);
+  const [salePrice, setSalePrice] = useState(file?.packageSalePrice || '');
+  const [costPrice, setCostPrice] = useState(file?.packageCostPrice || '');
 
   if (!isOpen) return null;
 
@@ -4207,10 +4506,12 @@ function PackagePickupDropoffModal({ isOpen, onClose, onConfirm, file, darkMode 
       alert("Please fill in all route details");
       return;
     }
-    onConfirm({ routes });
+    onConfirm({ routes, packageSalePrice: salePrice, packageCostPrice: costPrice });
     setRoutes([]);
     setNumTrips(1);
     setShowRouteForm(false);
+    setSalePrice('');
+    setCostPrice('');
   };
 
   return (
@@ -4233,6 +4534,32 @@ function PackagePickupDropoffModal({ isOpen, onClose, onConfirm, file, darkMode 
                   onChange={(e) => setNumTrips(parseInt(e.target.value) || 1)}
                 />
               </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2 opacity-80">Sale Price - ৳</label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                placeholder="0.00"
+                value={salePrice}
+                onChange={(e) => setSalePrice(e.target.value)}
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-2 opacity-80">Cost Price - ৳</label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                placeholder="0.00"
+                value={costPrice}
+                onChange={(e) => setCostPrice(e.target.value)}
+              />
             </div>
 
             <div className="flex justify-end gap-3 pt-4">
@@ -4406,7 +4733,9 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
     useEffect(() => {
         if (isOpen && file && !initialized) {
             // Only initialize once when modal opens
-            if (file.fileType === FILE_TYPES.VISA) {
+            const fileType = file.fileType || FILE_TYPES.VISA; // Default to VISA if missing
+            
+            if (fileType === FILE_TYPES.VISA) {
                 setEditData({
                     applicantName: file.applicantName || '',
                     passportNo: file.passportNo || '',
@@ -4417,7 +4746,7 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                     reminderDate: file.reminderDate || '',
                     createdBy: file.createdBy || ''
                 });
-            } else if (file.fileType === FILE_TYPES.AIR_TICKET) {
+            } else if (fileType === FILE_TYPES.AIR_TICKET) {
                 setEditData({
                     applicantName: file.applicantName || '',
                     contactNo: file.contactNo || '',
@@ -4428,7 +4757,7 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                     portal: file.portal || '',
                     createdBy: file.createdBy || ''
                 });
-            } else if (file.fileType === FILE_TYPES.PACKAGE) {
+            } else if (fileType === FILE_TYPES.PACKAGE) {
                 setEditData({
                     applicantName: file.applicantName || '',
                     contactNo: file.contactNo || '',
@@ -4440,6 +4769,17 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                     includesPickDrop: file.includesPickDrop || false,
                     packageSalePrice: file.packageSalePrice || '',
                     packageCostPrice: file.packageCostPrice || '',
+                    createdBy: file.createdBy || ''
+                });
+            } else if (fileType === FILE_TYPES.PICK_DROP) {
+                setEditData({
+                    applicantName: file.applicantName || '',
+                    contactNo: file.contactNo || '',
+                    pickupLocation: file.pickupLocation || '',
+                    dropoffLocation: file.dropoffLocation || '',
+                    numberOfPersons: file.numberOfPersons || '',
+                    salePrice: file.salePrice || '',
+                    costPrice: file.costPrice || '',
                     createdBy: file.createdBy || ''
                 });
             }
@@ -4676,6 +5016,61 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
         </>
     );
 
+    const renderPICK_DROPFields = () => (
+        <>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Applicant Name</label>
+                <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.applicantName} onChange={e => setEditData({...editData, applicantName: e.target.value})} />
+            </div>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Contact No</label>
+                <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} value={editData.contactNo} onChange={e => setEditData({...editData, contactNo: e.target.value})} />
+            </div>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Pickup Location</label>
+                <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} placeholder="e.g., Hotel ABC" value={editData.pickupLocation} onChange={e => setEditData({...editData, pickupLocation: e.target.value})} />
+            </div>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Dropoff Location</label>
+                <input className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} placeholder="e.g., Airport" value={editData.dropoffLocation} onChange={e => setEditData({...editData, dropoffLocation: e.target.value})} />
+            </div>
+            <div>
+                <label className="block text-sm font-medium mb-1 opacity-80">Number of Persons</label>
+                <input 
+                  type="number"
+                  min="1"
+                  className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                  value={editData.numberOfPersons} 
+                  onChange={e => setEditData({...editData, numberOfPersons: e.target.value})} 
+                />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Sale Price (৳)</label>
+                    <input 
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                      value={editData.salePrice} 
+                      onChange={e => setEditData({...editData, salePrice: e.target.value})} 
+                    />
+                </div>
+                <div>
+                    <label className="block text-sm font-medium mb-1 opacity-80">Cost Price (৳)</label>
+                    <input 
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
+                      value={editData.costPrice} 
+                      onChange={e => setEditData({...editData, costPrice: e.target.value})} 
+                    />
+                </div>
+            </div>
+        </>
+    );
+
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
             <div className={`rounded-2xl shadow-xl w-full max-w-lg p-6 animate-in fade-in zoom-in duration-200 max-h-[90vh] overflow-y-auto ${cardClass}`}>
@@ -4698,9 +5093,10 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                         </div>
                     )}
                     
-                    {file?.fileType === FILE_TYPES.VISA && renderVISAFields()}
+                    {(file?.fileType === FILE_TYPES.VISA || !file?.fileType) && renderVISAFields()}
                     {file?.fileType === FILE_TYPES.AIR_TICKET && renderAIR_TICKETFields()}
                     {file?.fileType === FILE_TYPES.PACKAGE && renderPACKAGEFields()}
+                    {file?.fileType === FILE_TYPES.PICK_DROP && renderPICK_DROPFields()}
                 </div>
                 <div className="flex justify-end gap-3 pt-6">
                     <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
