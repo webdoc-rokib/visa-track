@@ -35,7 +35,6 @@ import {
   Timestamp
 } from 'firebase/firestore';
 import confetti from 'canvas-confetti';
-import { jsPDF } from 'jspdf';
 import { 
   Briefcase, 
   FileText, 
@@ -78,11 +77,11 @@ import {
   Menu,
   Edit2,
   StickyNote,
+  BarChart3,
   CalendarDays,
   ChevronLeft,
   ChevronRight,
   Timer,
-  Monitor,
   Plane
 } from 'lucide-react';
 //vercel analytics
@@ -143,13 +142,30 @@ const STATUS = {
   
   // Pick & Drop statuses
   PICKUP_DROP_INITIATED: { label: 'Pick & Drop Service Initiated', color: 'bg-blue-100 text-blue-800', darkColor: 'bg-blue-900/30 text-blue-200', icon: Briefcase },
+  PICKUP_DROP_BOOKED: { label: 'Booked', color: 'bg-purple-100 text-purple-800', darkColor: 'bg-purple-900/30 text-purple-200', icon: CheckCircle },
   PICKUP_DROP_CONFIRMED: { label: 'Pick & Drop Confirmed', color: 'bg-purple-100 text-purple-800', darkColor: 'bg-purple-900/30 text-purple-200', icon: CheckCircle },
-  PICKUP_DROP_COMPLETED: { label: 'Pick & Drop Completed', color: 'bg-green-100 text-green-800', darkColor: 'bg-green-900/30 text-green-200', icon: CheckCircle },
+  PICKUP_DROP_COMPLETED: { label: 'Pick & Drop Completed', color: 'bg-green-100 text-green-800', darkColor: 'bg-green-900/30 text-purple-200', icon: CheckCircle },
 };
 
 const RESULTS = {
   APPROVED: { label: 'Visa Approved', color: 'text-green-600', icon: ThumbsUp },
   REJECTED: { label: 'Visa Rejected', color: 'text-red-600', icon: ThumbsDown },
+};
+
+const isFileCompleted = (file) => {
+  if (!file) return false;
+
+  if (file.fileType === FILE_TYPES.VISA) {
+    return ['DONE', 'FOLLOW_UP'].includes(file.status);
+  } else if (file.fileType === FILE_TYPES.AIR_TICKET) {
+    return file.status === 'ISSUED';
+  } else if (file.fileType === FILE_TYPES.PACKAGE) {
+    return file.status === 'PACKAGE_READY';
+  } else if (file.fileType === FILE_TYPES.PICK_DROP) {
+    return ['PICKUP_DROP_BOOKED', 'PICKUP_DROP_CONFIRMED', 'PICKUP_DROP_COMPLETED'].includes(file.status);
+  }
+
+  return false;
 };
 
 // --- Helper Functions ---
@@ -217,6 +233,36 @@ const formatHours = (hours) => {
   return `${wholeHours}h ${minutes}m`;
 };
 
+// Incentive calculation helper
+function calculateIncentive(profit, incentiveConfig) {
+  if (!incentiveConfig || profit <= 0) return 0;
+
+  const target = Number(incentiveConfig.target || 0);
+  let surplus = Math.max(0, profit - target);
+  if (surplus <= 0) return 0;
+
+  const tiers = Array.isArray(incentiveConfig.tiers) ? [...incentiveConfig.tiers] : [];
+  tiers.sort((a,b) => Number(a.amount) - Number(b.amount));
+
+  let incentive = 0;
+  let priorThreshold = 0;
+
+  tiers.forEach((tier) => {
+    if (surplus <= 0) return;
+    const tierAmount = Number(tier.amount) - priorThreshold;
+    if (tierAmount <= 0) {
+      priorThreshold = Number(tier.amount);
+      return;
+    }
+    const amountInTier = Math.min(surplus, tierAmount);
+    incentive += amountInTier * (Number(tier.percent || 0) / 100);
+    surplus -= amountInTier;
+    priorThreshold = Number(tier.amount);
+  });
+
+  return Math.round(incentive * 100) / 100;
+}
+
 // Animation Functions
 const triggerConfetti = () => {
   confetti({
@@ -249,236 +295,399 @@ const triggerConfettiExplosion = () => {
 
 // Company Details for Invoice
 const COMPANY_INFO = {
-  name: 'ALIF GLOBAL TOURS AND TRAVELS',
+  name: 'Alif Global Tours & Travels',
+  tagline: 'Connecting You to the World!',
+  iataCode: '42347056',
   tradeNum: 'TRAD/DNCC/046978/2023',
   caabNum: '0015752',
-  logo: '/src/assets/logo.jpg',
+  address: 'N.I Tower (9th Floor), House 01, Road 10, Block E, Banani, Dhaka 1213',
   phone: '+880 1901-467290',
-  email: 'info@alifglobaltoursandtravels.com.bd',
+  email: 'info@alifglobaltours.com',
+  website: 'alifglobaltours.com',
+  logo: logoImage,
 };
 
-// Invoice Generation Function
-const generateInvoice = async (file, paymentStatus, paidAmount = null) => {
-  try {
-    const pdf = new jsPDF({
-      orientation: 'portrait',
-      unit: 'mm',
-      format: 'a4'
-    });
-
-    const pageWidth = pdf.internal.pageSize.getWidth();
-    const pageHeight = pdf.internal.pageSize.getHeight();
-    let yPos = 10;
-
-    // Color scheme
-    const primaryColor = [52, 122, 197]; // Blue
-    const accentColor = [230, 126, 34]; // Orange
-    const darkGray = [45, 62, 80];
-    const lightGray = [236, 240, 241];
-
-    // Add elegant header background
-    pdf.setFillColor(...lightGray);
-    pdf.rect(0, 0, pageWidth, 45, 'F');
-
-    // Add premium border top
-    pdf.setFillColor(...primaryColor);
-    pdf.rect(0, 0, pageWidth, 2, 'F');
-
-    // Load and add logo as data URL for PDF
-    try {
-      const canvas = document.createElement('canvas');
-      const img = new Image();
-      img.crossOrigin = 'anonymous';
-      img.src = logoImage;
-      await new Promise((resolve, reject) => {
-        img.onload = () => {
-          try {
-            canvas.width = img.width;
-            canvas.height = img.height;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(img, 0, 0);
-            const imgData = canvas.toDataURL('image/jpeg');
-            pdf.addImage(imgData, 'JPEG', 12, 8, 20, 20);
-            resolve();
-          } catch (err) {
-            reject(err);
-          }
-        };
-        img.onerror = () => reject(new Error('Logo load failed'));
-      });
-    } catch (e) {
-      console.log('Logo not added to PDF (optional):', e.message);
-    }
-
-    // Company Header
-    pdf.setFont(undefined, 'bold');
-    pdf.setFontSize(14);
-    pdf.setTextColor(...primaryColor);
-    pdf.text(COMPANY_INFO.name, 35, 13, { align: 'left', maxWidth: 95 });
-
-    // Company details
-    pdf.setFont(undefined, 'normal');
-    pdf.setFontSize(7);
-    pdf.setTextColor(100, 100, 100);
-    pdf.text(`Trade License: ${COMPANY_INFO.tradeNum}`, 35, 19, { align: 'left' });
-    pdf.text(`CAAB No: ${COMPANY_INFO.caabNum}`, 35, 22, { align: 'left' });
-    pdf.text(`Mobile: ${COMPANY_INFO.phone} | Email: ${COMPANY_INFO.email}`, 35, 25, { align: 'left', maxWidth: 100 });
-
-    // Invoice badge on right
-    pdf.setFillColor(...accentColor);
-    pdf.rect(pageWidth - 45, 12, 40, 18, 'F');
-    pdf.setFont(undefined, 'bold');
-    pdf.setFontSize(11);
-    pdf.setTextColor(255, 255, 255);
-    pdf.text('INVOICE', pageWidth - 25, 19, { align: 'center' });
-    pdf.setFontSize(9);
-    pdf.text(file.fileId, pageWidth - 25, 25, { align: 'center' });
-
-    yPos = 52;
-
-    // Invoice Details Section
-    pdf.setFont(undefined, 'bold');
-    pdf.setFontSize(9);
-    pdf.setTextColor(...darkGray);
-    pdf.text('Invoice Details', 15, yPos);
-    yPos += 6;
-
-    pdf.setFont(undefined, 'normal');
-    pdf.setFontSize(8);
-    pdf.setTextColor(80, 80, 80);
-    const dhakaToday = getDhakaDate();
-    const today = dhakaToday.toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric'
-    });
-    pdf.text(`Date Issued: ${today}`, 15, yPos);
-    yPos += 5;
-    pdf.text(`Invoice #: ${file.fileId}`, 15, yPos);
-    yPos += 8;
-
-    // Client Information Section
-    pdf.setFillColor(...lightGray);
-    pdf.rect(15, yPos - 3, pageWidth - 30, 0.5, 'F');
-    pdf.setFont(undefined, 'bold');
-    pdf.setFontSize(9);
-    pdf.setTextColor(...primaryColor);
-    pdf.text('Client Information', 15, yPos + 2);
-    yPos += 8;
-
-    pdf.setFont(undefined, 'normal');
-    pdf.setFontSize(8);
-    pdf.setTextColor(60, 60, 60);
-    pdf.text(`Applicant: ${file.applicantName}`, 15, yPos);
-    yPos += 4;
-    pdf.text(`Passport: ${file.passportNo}`, 15, yPos);
-    yPos += 4;
-    pdf.text(`Contact: ${file.contactNo}`, 15, yPos);
-    yPos += 4;
-    pdf.text(`Destination Country: ${file.destination || 'N/A'}`, 15, yPos);
-    yPos += 10;
-
-    // Service Details Section
-    pdf.setFillColor(...lightGray);
-    pdf.rect(15, yPos - 3, pageWidth - 30, 0.5, 'F');
-    pdf.setFont(undefined, 'bold');
-    pdf.setFontSize(9);
-    pdf.setTextColor(...primaryColor);
-    pdf.text('Service Details', 15, yPos + 2);
-    yPos += 8;
-
-    // Service table header
-    pdf.setFillColor(...primaryColor);
-    pdf.rect(15, yPos - 3, pageWidth - 30, 6, 'F');
-    pdf.setFont(undefined, 'bold');
-    pdf.setFontSize(8);
-    pdf.setTextColor(255, 255, 255);
-    pdf.text('Service Description', 18, yPos);
-    pdf.text('Amount', pageWidth - 25, yPos, { align: 'right' });
-    yPos += 8;
-
-    // Service row
-    const serviceCharge = parseFloat(file.serviceCharge || 0);
-    pdf.setFont(undefined, 'normal');
-    pdf.setFontSize(8);
-    pdf.setTextColor(60, 60, 60);
-    const serviceDesc = `${file.destination} Visa Service Processing`;
-    pdf.text(serviceDesc, 18, yPos);
-    pdf.setFont(undefined, 'bold');
-    pdf.setTextColor(...accentColor);
-    pdf.text(`Tk ${serviceCharge.toFixed(2)}`, pageWidth - 25, yPos, { align: 'right' });
-    yPos += 10;
-
-    // Payment Status Section
-    pdf.setFillColor(...lightGray);
-    pdf.rect(15, yPos - 3, pageWidth - 30, 0.5, 'F');
-    pdf.setFont(undefined, 'bold');
-    pdf.setFontSize(9);
-    pdf.setTextColor(...primaryColor);
-    pdf.text('Payment Status', 15, yPos + 2);
-    yPos += 8;
-
-    // Status box
-    let statusColor = [52, 152, 219]; // Blue for unpaid
-    if (paymentStatus === 'Paid') statusColor = [46, 204, 113]; // Green
-    if (paymentStatus === 'Partially Paid') statusColor = [241, 196, 15]; // Yellow
-
-    pdf.setFillColor(...statusColor);
-    pdf.rect(15, yPos - 2, 40, 7, 'F');
-    pdf.setFont(undefined, 'bold');
-    pdf.setFontSize(8);
-    pdf.setTextColor(255, 255, 255);
-    pdf.text(paymentStatus.toUpperCase(), 17, yPos + 2);
-
-    yPos += 10;
-    pdf.setFont(undefined, 'normal');
-    pdf.setFontSize(8);
-    pdf.setTextColor(60, 60, 60);
-
-    if (paymentStatus === 'Partially Paid' && paidAmount !== null) {
-      const remaining = serviceCharge - paidAmount;
-      pdf.text(`Paid Amount: Tk ${parseFloat(paidAmount).toFixed(2)}`, 15, yPos);
-      yPos += 5;
-      pdf.text(`Remaining: Tk ${Math.max(0, remaining).toFixed(2)}`, 15, yPos);
-    } else if (paymentStatus === 'Paid') {
-      pdf.text(`Amount Paid: Tk ${serviceCharge.toFixed(2)}`, 15, yPos);
-    } else if (paymentStatus === 'Unpaid') {
-      pdf.text(`Amount Due: Tk ${serviceCharge.toFixed(2)}`, 15, yPos);
-    }
-
-    // Total amount box at bottom
-    yPos = pageHeight - 35;
-    pdf.setFillColor(...primaryColor);
-    pdf.rect(pageWidth - 55, yPos, 50, 15, 'F');
-    pdf.setFont(undefined, 'bold');
-    pdf.setFontSize(9);
-    pdf.setTextColor(255, 255, 255);
-    pdf.text('Total Amount:', pageWidth - 50, yPos + 4);
-    pdf.setFontSize(14);
-    pdf.text(`Tk ${serviceCharge.toFixed(2)}`, pageWidth - 50, yPos + 11);
-
-    // Footer
-    yPos = pageHeight - 18;
-    pdf.setDrawColor(...primaryColor);
-    pdf.line(15, yPos - 2, pageWidth - 15, yPos - 2);
-    
-    pdf.setFont(undefined, 'normal');
-    pdf.setFontSize(7);
-    pdf.setTextColor(80, 80, 80);
-    pdf.text(`Contact: ${COMPANY_INFO.phone} | ${COMPANY_INFO.email}`, pageWidth / 2, yPos + 2, { align: 'center' });
-    
-    pdf.setFont(undefined, 'italic');
-    pdf.setFontSize(7);
-    pdf.setTextColor(120, 120, 120);
-    pdf.text('Thank you for choosing Alif Global Tours and Travels!', pageWidth / 2, yPos + 5, { align: 'center' });
-    pdf.text(`Generated on ${today} | This is an official invoice`, pageWidth / 2, yPos + 8, { align: 'center' });
-
-    // Save PDF
-    pdf.save(`Invoice_${file.fileId}_${Date.now()}.pdf`);
-  } catch (error) {
-    console.error('Error generating invoice:', error);
-    alert('Failed to generate invoice. Please try again.');
+// Invoice helpers (fresh implementation)
+const getInvoiceAmount = (file) => {
+  if (!file) return 0;
+  if (file.fileType === FILE_TYPES.AIR_TICKET) {
+    return Number(file.airlineSalePrice || file.serviceCharge || 0) || 0;
   }
+  if (file.fileType === FILE_TYPES.PACKAGE) {
+    return Number(file.packageSalePrice || file.serviceCharge || 0) || 0;
+  }
+  if (file.fileType === FILE_TYPES.PICK_DROP) {
+    return Number(file.salePrice || file.serviceCharge || 0) || 0;
+  }
+  return Number(file.serviceCharge || 0) || 0;
+};
+
+const getInvoiceDescription = (file) => {
+  if (!file) return 'Service';
+  if (file.fileType === FILE_TYPES.VISA) {
+    const country = file.destination || file.packageCountries?.[0] || file.airlineRoute || 'Visa';
+    return `${country} Visa Processing`;
+  }
+  if (file.fileType === FILE_TYPES.AIR_TICKET) {
+    const route = file.airlineRoute || file.destination || 'Ticket';
+    return `${route} Air Ticket`;
+  }
+  if (file.fileType === FILE_TYPES.PACKAGE) {
+    const countries = file.packageCountries?.length ? file.packageCountries.join(', ') : file.destination || 'Tour';
+    return `${countries} Tour Package`;
+  }
+  if (file.fileType === FILE_TYPES.PICK_DROP) {
+    const from = file.pickupLocation || 'Origin';
+    const to = file.dropoffLocation || 'Destination';
+    return `${from} to ${to} Pick Drop Service`;
+  }
+  return file.destination || file.airlineRoute || 'Service';
+};
+
+const getFileComplianceInfo = (file) => {
+  const requiredFields = [];
+  if (!file) return { requiredCount: 0, missing: [], score: 1 };
+
+  if (file.fileType === FILE_TYPES.VISA) {
+    requiredFields.push('destination', 'passportNo', 'serviceCharge', 'invoiceNo');
+  } else if (file.fileType === FILE_TYPES.AIR_TICKET) {
+    requiredFields.push('airlineRoute', 'airlineSalePrice', 'airlineCostPrice', 'invoiceNo');
+  } else if (file.fileType === FILE_TYPES.PACKAGE) {
+    requiredFields.push('packageCountries', 'packageSalePrice', 'packageCostPrice', 'mainPersonPassport', 'invoiceNo');
+  } else if (file.fileType === FILE_TYPES.PICK_DROP) {
+    requiredFields.push('pickupLocation', 'dropoffLocation', 'salePrice', 'costPrice', 'invoiceNo');
+  } else {
+    requiredFields.push('serviceCharge', 'invoiceNo');
+  }
+
+  const missing = requiredFields.filter(key => {
+    const value = file[key];
+    if (value === undefined || value === null || value === '') return true;
+    if (Array.isArray(value) && value.length === 0) return true;
+    return false;
+  });
+
+  const score = requiredFields.length ? Math.max(0, 1 - missing.length / requiredFields.length) : 1;
+  return { requiredCount: requiredFields.length, missing, score };
+};
+
+const ACCOUNTING_CUTOFF_DATE = new Date('2026-08-09T00:00:00+06:00');
+
+const getTimestampDate = (value) => {
+  if (!value) return null;
+
+  if (typeof value === 'object' && typeof value.toDate === 'function') {
+    const parsed = value.toDate();
+    return parsed && !Number.isNaN(parsed.getTime()) ? parsed : null;
+  }
+
+  if (typeof value === 'object' && typeof value.seconds === 'number') {
+    const parsed = new Date(value.seconds * 1000);
+    return parsed && !Number.isNaN(parsed.getTime()) ? parsed : null;
+  }
+
+  const parsed = new Date(value);
+  return parsed && !Number.isNaN(parsed.getTime()) ? parsed : null;
+};
+
+const isAccountingEligibleFile = (file) => {
+  if (!file) return false;
+
+  const createdAt = getTimestampDate(file.createdAt);
+  const invoiceCreatedAt = getTimestampDate(file.invoiceCreatedAt);
+  const anchorDate = invoiceCreatedAt || createdAt;
+
+  if (!anchorDate) return true;
+  return anchorDate >= ACCOUNTING_CUTOFF_DATE;
+};
+
+const isAccountingEligibleMiscCost = (cost) => {
+  if (!cost) return false;
+
+  const dateValue = cost.date;
+  const createdAt = getTimestampDate(cost.createdAt);
+
+  if (dateValue) {
+    const parsedCostDate = new Date(`${dateValue}T00:00:00+06:00`);
+    if (!Number.isNaN(parsedCostDate.getTime())) {
+      return parsedCostDate >= ACCOUNTING_CUTOFF_DATE;
+    }
+  }
+
+  if (createdAt) {
+    return createdAt >= ACCOUNTING_CUTOFF_DATE;
+  }
+
+  return true;
+};
+
+const getInvoiceSummary = (file) => {
+  const amount = getInvoiceAmount(file);
+  const paidAmount = Number(file?.invoicePaidAmount || file?.invoice?.paidAmount || 0) || 0;
+  const paymentStatus = file?.invoicePaymentStatus || file?.invoice?.paymentStatus || 'Unpaid';
+  const resolvedPaid = paymentStatus === 'Paid' ? amount : paymentStatus === 'Partially Paid' ? paidAmount : 0;
+  const dueAmount = Math.max(amount - resolvedPaid, 0);
+  return { amount, paidAmount: resolvedPaid, dueAmount, paymentStatus };
+};
+
+const createInvoiceNumber = (fileId) => {
+  const now = getDhakaDate();
+  const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+  const random = String(Math.floor(1000 + Math.random() * 9000));
+  return `INV-${stamp}-${random}`;
+};
+
+const isCashPaymentMethod = (method) => String(method?.name || '').trim().toLowerCase() === 'cash';
+
+const buildCashPaymentMail = (file, payment, recipients) => {
+  const fileId = file.fileId || file.id || 'N/A';
+  const applicantName = file.applicantName || file.mainPersonName || 'N/A';
+  const country = file.destination || file.country || file.packageCountries?.join(', ') || file.airlineRoute || 'N/A';
+  const fileType = file.fileType || FILE_TYPES.VISA;
+  const receivedAt = payment.receivedAt?.toDate ? payment.receivedAt.toDate() : new Date();
+  const lines = [
+    'A cash payment has been received.',
+    '',
+    `Amount: ${formatCurrency(Number(payment.amount) || 0)}`,
+    `File ID: ${fileId}`,
+    `Name: ${applicantName}`,
+    `Country: ${country}`,
+    `File type: ${fileType}`,
+    `Received by: ${payment.receivedBy || 'N/A'}`,
+    `Received at: ${receivedAt.toLocaleString()}`
+  ];
+  return {
+    to: recipients,
+    message: {
+      subject: `Cash payment received - ${fileId}`,
+      text: lines.join('\n')
+    }
+  };
+};
+
+const buildInvoicePrintHtml = (file, invoice) => {
+  const amount = Number(invoice?.amount || getInvoiceAmount(file) || 0);
+  const paidAmount = Number(invoice?.paidAmount || 0);
+  const dueAmount = Math.max(amount - paidAmount, 0);
+  const statusLabel = invoice?.paymentStatus || 'Unpaid';
+  const paymentRecords = invoice?.invoicePayments || file?.invoicePayments || file?.invoice?.payments || [];
+  const latestPayment = paymentRecords[paymentRecords.length - 1];
+  const paymentMethodText = latestPayment
+    ? [latestPayment.methodName, latestPayment.institution, latestPayment.accountName, latestPayment.accountNumber].filter(Boolean).join(' · ')
+    : 'Not recorded for historical payments';
+  const invoiceNo = invoice?.invoiceNo || file?.invoiceNo || `INV-${file?.fileId || 'NEW'}`;
+  const issuedDate = getDhakaDate().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+  const customerName = file?.applicantName || 'Customer';
+  const passport = file?.passportNo || file?.mainPersonPassport || 'N/A';
+  const contact = file?.contactNo || 'N/A';
+  const invoiceCreatedBy = invoice?.invoiceCreatedBy || file?.invoiceCreatedBy || 'N/A';
+  const invoiceDescription = getInvoiceDescription(file);
+  const destination = file?.destination || file?.airlineRoute || file?.packageCountries?.join(', ') || 'N/A';
+  const notesText = invoice?.notes?.trim() || 'No additional notes provided.';
+  const termsText = `All payments are subject to our service policy. Embassy, government, airline, hotel, and third-party fees are non-refundable. Visa approval is solely at the discretion of the respective authority. Customers are responsible for providing genuine documents and verifying all travel documents upon receipt. Processing times are estimates only. Refunds, cancellations, and amendments are subject to the policies of the respective service providers. The company is not liable for visa refusals, delays, or force majeure events.`;
+
+  return `<!doctype html>
+  <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>${invoiceNo}</title>
+      <style>
+        :root {
+          color-scheme: light;
+          font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+        * { box-sizing: border-box; }
+        body { margin: 0; padding: 0; background: #ffffff; color: #111111; }
+        @page { size: A4 portrait; margin: 12mm; }
+        :root {
+          color-scheme: light;
+          font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+        * { box-sizing: border-box; }
+        html, body { min-height: 100%; }
+        body { margin: 0; padding: 0; background: #ffffff; color: #111111; }
+        .invoice-shell { width: 100%; padding: 10px; }
+        .invoice-card { background: #ffffff; border-radius: 12px; border: 1px solid #d1d5db; overflow: hidden; margin-bottom: 10px; }
+        .invoice-header { display: flex; justify-content: space-between; gap: 14px; padding: 18px 20px; background: #f3f4f6; color: #111111; }
+        .brand { display: flex; gap: 12px; align-items: center; }
+        .brand-logo { width: 58px; height: 58px; border-radius: 12px; overflow: hidden; background: #ffffff; display: grid; place-items: center; border: 1px solid #d1d5db; }
+        .brand-logo img { width: 54px; height: 54px; object-fit: contain; }
+        .brand-text { line-height: 1.05; }
+        .brand-text h1 { margin: 0; font-size: 18px; letter-spacing: -0.03em; }
+        .brand-text p { margin: -3px 0 0; color: #4b5563; font-size: 12px; }
+        .company-meta { display: flex; flex-direction: column; align-items: flex-end; justify-content: center; gap: 3px; text-align: right; font-size: 10px; color: #374151; }
+        .company-meta strong { display: block; font-weight: 700; color: #111111; }
+        .invoice-details { padding: 16px 20px 0; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        .invoice-title { margin: -3px 0 6px; font-size: 16px; font-weight: 700; letter-spacing: -0.03em; }
+        .tag { display: inline-flex; align-items: center; gap: 6px; background: #e5e7eb; color: #111111; padding: 6px 10px; border-radius: 999px; font-size: 10px; font-weight: 700; }
+        .section { padding: 16px 20px; }
+        .section-row { display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; margin-bottom: 12px; }
+        .section-row:last-child { margin-bottom: 0; }
+        .section-block { min-width: 0; }
+        .section-block h2 { margin: 0 0 4px; font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.1em; }
+        .section-block p, .section-block div { margin: 0; font-size: 12px; color: #111111; line-height: 1.5; }
+        .invoice-table { width: 100%; border-collapse: collapse; margin-top: 14px; }
+        .invoice-table th, .invoice-table td { padding: 10px 12px; border-bottom: 1px solid #d1d5db; }
+        .invoice-table th { background: #f9fafb; font-size: 11px; color: #374151; text-align: left; }
+        .invoice-table td { font-size: 12px; color: #111111; }
+        .total-row td { font-weight: 700; }
+        .summary { display: grid; grid-template-columns: 1fr auto; gap: 14px; align-items: end; margin-top: 18px; }
+        .summary-card { background: #f9fafb; border-radius: 12px; padding: 14px 18px; min-width: 200px; border: 1px solid #e5e7eb; }
+        .summary-card p { margin: 0; font-size: 11px; color: #4b5563; }
+        .summary-card strong { display: block; margin-top: 4px; font-size: 16px; color: #111111; }
+        .status-pill { display: inline-flex; align-items: center; justify-content: center; padding: 6px 10px; border-radius: 999px; font-size: 10px; font-weight: 700; letter-spacing: 0.02em; border: 1px solid #d1d5db; }
+        .status-paid { background: #ffffff; color: #111111; }
+        .status-partial { background: #f3f4f6; color: #111111; }
+        .status-unpaid { background: #f9fafb; color: #111111; }
+        .note-box { min-height: 52px; border: 1px solid #d1d5db; border-radius: 12px; padding: 12px 14px; background: #ffffff; color: #111111; white-space: pre-wrap; }
+        .terms { margin-top: 8px; font-size: 10px; color: #4b5563; line-height: 1.45; }
+        .footer { border-top: 1px solid #d1d5db; padding: 14px 20px 18px; display: flex; justify-content: space-between; gap: 14px; flex-wrap: wrap; font-size: 10px; color: #6b7280; }
+        .footer a { color: #111111; text-decoration: none; }
+        .copy-stamp { font-size: 9px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 0.12em; }
+        @media print {
+          body { background: #ffffff; }
+          .invoice-shell { padding: 0; }
+          .invoice-card { box-shadow: none; border-radius: 0; margin-bottom: 0; page-break-after: always; }
+          .invoice-header, .section, .footer { page-break-inside: avoid; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="invoice-shell">
+        ${buildInvoiceCopy('Office Copy')}
+        ${buildInvoiceCopy('Customer Copy')}
+      </div>
+    </body>
+  </html>`;
+
+  function buildInvoiceCopy(copyLabel) {
+    return `
+      <div class="invoice-card">
+        <div class="invoice-header">
+          <div class="brand">
+            <div class="brand-logo"><img src="${COMPANY_INFO.logo}" alt="Logo" /></div>
+            <div class="brand-text">
+              <h1>${COMPANY_INFO.name}</h1>
+              <p>${COMPANY_INFO.tagline}</p>
+            </div>
+          </div>
+          <div class="company-meta">
+            <div class="tag">${copyLabel}</div>
+            <strong>IATA ${COMPANY_INFO.iataCode}</strong>
+            <div>Trade License: ${COMPANY_INFO.tradeNum}</div>
+            <div>CAAB No: ${COMPANY_INFO.caabNum}</div>
+            <div>${COMPANY_INFO.address}</div>
+            <div>Hotline: ${COMPANY_INFO.phone}</div>
+            <div>Email: ${COMPANY_INFO.email}</div>
+            <div>Website: ${COMPANY_INFO.website}</div>
+          </div>
+        </div>
+
+        <div class="invoice-details">
+          <div class="section-block">
+            <h2>Invoice</h2>
+            <div><strong>#${invoiceNo}</strong></div>
+            <div style="margin-top:6px; color:#475569;">Issued ${issuedDate}</div>
+            <div style="margin-top:6px; color:#475569; font-size:12px;">VT ID: <strong>${file?.fileId || file?.id || '-'}</strong></div>
+            <div style="margin-top:6px; color:#475569; font-size:12px;">Created by: <strong>${invoiceCreatedBy}</strong></div>
+          </div>
+          <div class="section-block">
+            <h2>Payment Status</h2>
+            <div class="status-pill ${statusLabel === 'Paid' ? 'status-paid' : statusLabel === 'Partially Paid' ? 'status-partial' : 'status-unpaid'}">${statusLabel}</div>
+            <div style="margin-top:8px; color:#475569; font-size:12px;">Payment method: <strong>${paymentMethodText}</strong></div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-row">
+            <div class="section-block">
+              <h2>Bill To</h2>
+              <div>${customerName}</div>
+              <div>Passport: ${passport}</div>
+              <div>Contact: ${contact}</div>
+            </div>
+            <div class="section-block">
+              <h2>Service Details</h2>
+              <div>${invoiceDescription}</div>
+            </div>
+          </div>
+
+          <table class="invoice-table">
+            <thead>
+              <tr>
+                <th>Description</th>
+                <th style="text-align:right;">Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>${invoiceDescription}</td>
+                <td style="text-align:right;">৳${amount.toFixed(2)}</td>
+              </tr>
+            </tbody>
+            <tfoot>
+              <tr class="total-row">
+                <td>Total</td>
+                <td style="text-align:right;">৳${amount.toFixed(2)}</td>
+              </tr>
+            </tfoot>
+          </table>
+
+          <div class="summary">
+            <div class="summary-card">
+              <p>Amount Paid</p>
+              <strong>৳${paidAmount.toFixed(2)}</strong>
+            </div>
+            <div class="summary-card">
+              <p>Remaining Due</p>
+              <strong>৳${dueAmount.toFixed(2)}</strong>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-block">
+              <h2>Notes</h2>
+              <div class="note-box">${notesText}</div>
+            </div>
+          </div>
+
+          <div class="section">
+            <div class="section-block">
+              <h2>Terms & Conditions</h2>
+              <div class="terms">${termsText}</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="footer">
+          <div>${COMPANY_INFO.name} | ${COMPANY_INFO.tagline}</div>
+          <div>Hotline: ${COMPANY_INFO.phone} • ${COMPANY_INFO.email} • ${COMPANY_INFO.website}</div>
+        </div>
+      </div>
+    `;
+  }
+};
+
+const printInvoiceCopies = (file, invoice) => {
+  const notes = window.prompt('Add optional notes for this invoice before printing:', invoice?.notes || '');
+  if (notes === null) {
+    return;
+  }
+
+  const invoiceWithNotes = {
+    ...invoice,
+    notes: notes.trim()
+  };
+
+  const printWindow = window.open('', '_blank', 'width=900,height=1200');
+  if (!printWindow) {
+    alert('Please allow pop-ups to print invoice copies.');
+    return;
+  }
+  printWindow.document.write(buildInvoicePrintHtml(file, invoiceWithNotes));
+  printWindow.document.close();
+  printWindow.focus();
+  setTimeout(() => printWindow.print(), 250);
 };
 
 const triggerSadAnimation = () => {
@@ -507,9 +716,10 @@ export default function VisaTrackApp() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [files, setFiles] = useState([]);
   const [destinations, setDestinations] = useState([]); 
+  const [paymentMethods, setPaymentMethods] = useState([]);
+  const [cashPaymentNotificationEmails, setCashPaymentNotificationEmails] = useState([]);
   const [allPortals, setAllPortals] = useState(AIR_TICKET_PORTALS);
   const [allUsers, setAllUsers] = useState([]); 
-  const [attendanceRecords, setAttendanceRecords] = useState([]);
   const [leaveRequests, setLeaveRequests] = useState([]);
   const [approvedLeaves, setApprovedLeaves] = useState([]);
   const [cleanupComplete, setCleanupComplete] = useState(false);
@@ -544,6 +754,7 @@ export default function VisaTrackApp() {
   const [packageFlightIssuedModalOpen, setPackageFlightIssuedModalOpen] = useState(false);
   const [packageHotelsBookedModalOpen, setPackageHotelsBookedModalOpen] = useState(false);
   const [packagePickupDropoffModalOpen, setPackagePickupDropoffModalOpen] = useState(false);
+  const [pickDropBookedModalOpen, setPickDropBookedModalOpen] = useState(false);
   const [pickDropConfirmedModalOpen, setPickDropConfirmedModalOpen] = useState(false);
   
   const [selectedFile, setSelectedFile] = useState(null);
@@ -602,6 +813,19 @@ export default function VisaTrackApp() {
       if (docSnap.exists()) setDestinations(docSnap.data().items || []);
       else setDestinations(['Canada', 'UK', 'USA', 'Schengen Area', 'Australia', 'Dubai']);
     });
+    const paymentMethodsRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'payment_methods');
+    const unsubPaymentMethods = onSnapshot(paymentMethodsRef, (docSnap) => {
+      setPaymentMethods(docSnap.exists() ? docSnap.data().items || [] : []);
+    }, (error) => {
+      console.error('Error loading payment methods:', error);
+    });
+    const cashPaymentNotificationRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'cash_payment_notifications');
+    const unsubCashPaymentNotifications = onSnapshot(cashPaymentNotificationRef, (docSnap) => {
+      const recipients = docSnap.exists() ? docSnap.data().recipients : [];
+      setCashPaymentNotificationEmails(Array.isArray(recipients) ? recipients : []);
+    }, (error) => {
+      console.error('Error loading cash payment notification settings:', error);
+    });
     const portalsRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'portals');
     const unsubPortals = onSnapshot(portalsRef, (docSnap) => {
       if (docSnap.exists()) setAllPortals(docSnap.data().items || AIR_TICKET_PORTALS);
@@ -625,12 +849,6 @@ export default function VisaTrackApp() {
         }
       }
     });
-    const qAttendance = collection(db, 'artifacts', appId, 'public', 'data', 'attendance');
-    const unsubAttendance = onSnapshot(qAttendance, (snapshot) => {
-      const attendanceData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setAttendanceRecords(attendanceData);
-    });
-
     // Fetch leave requests
     const qLeaveRequests = collection(db, 'artifacts', appId, 'public', 'data', 'leave_requests');
     const unsubLeaveRequests = onSnapshot(qLeaveRequests, (snapshot) => {
@@ -645,22 +863,25 @@ export default function VisaTrackApp() {
       setApprovedLeaves(leaves);
     });
 
-    return () => { unsubFiles(); unsubDest(); unsubPortals(); unsubUsers(); unsubAttendance(); unsubLeaveRequests(); unsubApprovedLeaves(); };
+    return () => { unsubFiles(); unsubDest(); unsubPaymentMethods(); unsubCashPaymentNotifications(); unsubPortals(); unsubUsers(); unsubLeaveRequests(); unsubApprovedLeaves(); };
   }, [user, cleanupComplete]);
 
   const myTasks = useMemo(() => {
     if (!appUser || files.length === 0) return [];
-    // For Processing Agents: Show only files that are NOT acknowledged and NOT in terminal states
-    // Files disappear when: acknowledged by processing agent, submitted, or done
-    if (appUser.role === ROLES.PROCESSING) {
-      return files.filter(f => 
-        f.assignedTo === appUser.name && 
-        !['DONE', 'SUBMITTED'].includes(f.status) &&
-        !f.acknowledgedByProcessingAgent
-      );
-    }
-    // For others: Show files assigned to them that are not DONE
-    return files.filter(f => f.assignedTo === appUser.name && f.status !== 'DONE');
+
+    const isVisibleTask = (file) => {
+      if (!file || file.assignedTo !== appUser.name) return false;
+      if (isFileCompleted(file)) return false;
+
+      // Processing Agent-specific suppression for tracked terminal/moved-on statuses
+      if (appUser.role === ROLES.PROCESSING) {
+        return !['SUBMITTED'].includes(file.status) && !file.acknowledgedByProcessingAgent;
+      }
+
+      return true;
+    };
+
+    return files.filter(isVisibleTask);
   }, [files, appUser]);
 
   useEffect(() => {
@@ -673,23 +894,6 @@ export default function VisaTrackApp() {
   // Initialize app - check for existing user session
   useEffect(() => {
     const initializeApp = async () => {
-      // Delete old attendance records before 26/12/2025 - keep fresh data
-      try {
-        const allAttendance = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'));
-        const cutoffDate = '2025-12-26'; // YYYY-MM-DD format
-        
-        for (const docSnapshot of allAttendance.docs) {
-          const attendanceDate = docSnapshot.data().date;
-          // Only delete records before the cutoff date
-          if (attendanceDate && attendanceDate < cutoffDate) {
-            await deleteDoc(docSnapshot.ref);
-          }
-        }
-      } catch (e) {
-        console.error("Error cleaning up old attendance records:", e);
-      }
-      
-      // Mark cleanup as complete
       setCleanupComplete(true);
 
       const userProfile = getSecureUserSession();
@@ -724,8 +928,6 @@ export default function VisaTrackApp() {
   }, []);
 
   const handleLogin = async (userProfile) => {
-    const isTrustedDevice = localStorage.getItem('vt_trusted_device') === 'true';
-    // All users can log in from anywhere - attendance recording will be restricted to trusted devices only
     setAppUser(userProfile);
     storeSecureUserSession(userProfile);
     setHasCheckedIn(false);
@@ -734,54 +936,9 @@ export default function VisaTrackApp() {
     setTimeout(() => {
       triggerConfetti();
     }, 300);
-
-    // Record attendance ONLY for trusted devices - ONE record per user per day
-    if (isTrustedDevice) {
-        try {
-            const todayDate = getDhakaTodayString(); // YYYY-MM-DD in GMT+6
-            
-            // Check if attendance record already exists for this user today
-            const q = query(
-              collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
-              where('userName', '==', userProfile.name),
-              where('date', '==', todayDate)
-            );
-            const existingDocs = await getDocs(q);
-            
-            if (existingDocs.size === 0) {
-              // First login today - create new attendance record
-              await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'), {
-                userId: userProfile.id,
-                userName: userProfile.name,
-                role: userProfile.role,
-                date: todayDate,
-                firstLoginTime: serverTimestamp(),
-                lastLogoutTime: null
-              });
-            }
-            // If attendance record exists, do nothing (already counted for the day)
-        } catch (e) { console.error("Error recording attendance:", e); }
-    }
   };
 
   const handleLogout = async () => {
-    const isTrustedDevice = localStorage.getItem('vt_trusted_device') === 'true';
-    if (appUser && isTrustedDevice) {
-        try {
-            const todayDate = getDhakaTodayString(); // YYYY-MM-DD in GMT+6
-            
-            // Update the attendance record with last logout time
-            const q = query(
-              collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
-              where('userName', '==', appUser.name),
-              where('date', '==', todayDate)
-            );
-            const docs = await getDocs(q);
-            if (docs.size > 0) {
-              await updateDoc(docs.docs[0].ref, { lastLogoutTime: serverTimestamp() });
-            }
-        } catch(e) { console.error("Error recording logout:", e); }
-    }
     logoutUser();
     setAppUser(null);
     setActiveTab('dashboard'); 
@@ -1024,6 +1181,19 @@ export default function VisaTrackApp() {
       };
     }
 
+    const invoiceNumber = createInvoiceNumber(fileId);
+    newFile = {
+      ...newFile,
+      invoiceNo: invoiceNumber,
+      invoiceAmount: getInvoiceAmount(newFile),
+      invoicePaymentStatus: 'Unpaid',
+      invoicePaidAmount: 0,
+      invoiceCreatedAt: serverTimestamp(),
+      invoiceCreatedBy: appUser.name,
+      statusChangedAt: serverTimestamp(),
+      invoiceUpdatedAt: serverTimestamp()
+    };
+
     await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'visa_files'), newFile);
     
     // Trigger new file creation animation
@@ -1034,6 +1204,74 @@ export default function VisaTrackApp() {
     setTimeout(() => {
       setActiveTab('dashboard');
     }, 1500);
+  };
+
+  const generateInvoice = async (file, paymentStatus, paidAmount = null, paymentMethodId = '') => {
+    if (!file || !file.id) return;
+    const selectedMethod = paymentMethods.find(method => method.id === paymentMethodId);
+
+    try {
+      const fileDoc = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', file.id);
+      const result = await runTransaction(db, async transaction => {
+        const snapshot = await transaction.get(fileDoc);
+        if (!snapshot.exists()) throw new Error('Invoice file no longer exists.');
+        const current = { id: snapshot.id, ...snapshot.data() };
+        const amount = getInvoiceAmount(current) || 0;
+        const requestedPaid = paymentStatus === 'Paid'
+          ? amount
+          : paymentStatus === 'Partially Paid'
+            ? Math.min(Math.max(Number(paidAmount) || 0, 0), amount)
+            : 0;
+        const previousPaid = getInvoiceSummary(current).paidAmount;
+        const resolvedPaid = Math.max(previousPaid, requestedPaid);
+        const newlyCollected = Math.round(Math.max(0, resolvedPaid - previousPaid) * 100) / 100;
+        if (newlyCollected > 0 && !selectedMethod) throw new Error('Select a payment method for the new payment.');
+        const status = resolvedPaid >= amount ? 'Paid' : resolvedPaid > 0 ? 'Partially Paid' : 'Unpaid';
+        const invoiceNo = current.invoiceNo || createInvoiceNumber(current.fileId || `VT-${Date.now()}`);
+        const invoicePayments = Array.isArray(current.invoicePayments) ? current.invoicePayments : Array.isArray(current.invoice?.payments) ? current.invoice.payments : [];
+        const shouldNotifyCash = newlyCollected > 0 && isCashPaymentMethod(selectedMethod);
+        const recipients = Array.isArray(cashPaymentNotificationEmails) ? cashPaymentNotificationEmails : [];
+        const mailRef = shouldNotifyCash && recipients.length > 0 ? doc(collection(db, 'mail')) : null;
+        const payment = newlyCollected > 0 ? {
+          id: `payment-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          amount: newlyCollected,
+          receivedAt: Timestamp.now(),
+          receivedBy: appUser.name,
+          methodId: selectedMethod.id,
+          methodName: selectedMethod.name || '',
+          institution: selectedMethod.institution || '',
+          accountName: selectedMethod.accountName || '',
+          accountNumber: selectedMethod.accountNumber || ''
+        } : null;
+        const invoiceData = {
+          invoiceNo,
+          invoiceAmount: amount,
+          invoicePaymentStatus: status,
+          invoicePaidAmount: resolvedPaid,
+          invoiceCreatedBy: current.invoiceCreatedBy || current.invoice?.invoiceCreatedBy || appUser.name,
+          invoiceUpdatedAt: serverTimestamp(),
+          ...(payment ? { invoicePayments: [...invoicePayments, payment] } : {})
+        };
+        transaction.update(fileDoc, invoiceData);
+        if (mailRef && payment) {
+          transaction.set(mailRef, { ...buildCashPaymentMail(current, payment, recipients), createdAt: serverTimestamp() });
+        }
+        return {
+          file: { ...current, ...invoiceData },
+          invoice: { ...invoiceData, amount, paidAmount: resolvedPaid, paymentStatus: status },
+          cashNotificationMissingRecipients: shouldNotifyCash && recipients.length === 0
+        };
+      });
+      setFiles(prev => prev.map(item => item.id === file.id ? result.file : item));
+      printInvoiceCopies(result.file, result.invoice);
+      setResultMessage(`Invoice ${result.invoice.invoiceNo} has been prepared.${result.cashNotificationMissingRecipients ? ' Cash payment was recorded, but no notification recipient emails are configured.' : ''}`);
+      setResultModalOpen(true);
+      return true;
+    } catch (err) {
+      console.error('Error updating invoice:', err);
+      alert(`Failed to save invoice details: ${err.message || 'See console for details.'}`);
+      return false;
+    }
   };
 
   const requestDeleteFile = (fileId) => { setFileToDelete(fileId); setDeleteConfirmOpen(true); };
@@ -1073,7 +1311,9 @@ export default function VisaTrackApp() {
         setModalOpen(true);
       }
     } else if (fileType === FILE_TYPES.PICK_DROP) {
-      if (action === 'PICKUP_DROP_CONFIRMED') {
+      if (action === 'PICKUP_DROP_BOOKED') {
+        setPickDropBookedModalOpen(true);
+      } else if (action === 'PICKUP_DROP_CONFIRMED') {
         setPickDropConfirmedModalOpen(true);
       } else {
         setModalOpen(true);
@@ -1086,7 +1326,7 @@ export default function VisaTrackApp() {
   const openNoteModal = (file) => { setSelectedFile(file); setNoteModalOpen(true); };
   const openEditModal = (file) => { setSelectedFile(file); setEditModalOpen(true); };
 
-  const handleStatusUpdate = async (note, result = null, newAssignee = null, reminderDate = null, cost = null, acknowledgeProcessing = false, specializedData = null) => {
+  const handleStatusUpdate = async (note, result = null, newAssignee = null, reminderDate = null, cost = null, acknowledgeProcessing = false, specializedData = null, trackingData = null) => {
     if (!appUser || !selectedFile) return;
     
     let updateData = {
@@ -1096,33 +1336,40 @@ export default function VisaTrackApp() {
 
     // Handle "Send to Processing" action
     if (selectedAction === 'SEND_TO_PROCESSING' && newAssignee) {
+      const docsProvided = Boolean(trackingData?.documentsProvidedToProcessing);
       const newHistoryItem = {
-        action: `File Sent to Processing - Assigned to: ${newAssignee}${note ? ` - Note: ${note}` : ''}`,
-        status: 'HANDOVER_PROCESSING',
+        action: `File Sent to Processing - Assigned to: ${newAssignee} - Required documents provided to processing agent: ${docsProvided ? 'Yes' : 'No'}${note ? ` - Note: ${note}` : ''}`,
+        status: docsProvided ? 'HANDOVER_PROCESSING' : 'DOCS_PENDING',
         performedBy: appUser.name,
         timestamp: Date.now()
       };
       updateData = {
         ...updateData,
-        status: 'HANDOVER_PROCESSING',
+        status: docsProvided ? 'HANDOVER_PROCESSING' : 'DOCS_PENDING',
         assignedTo: newAssignee,
         acknowledgedByProcessingAgent: false,
+        salesRepDocumentsProvided: docsProvided,
+        documentsProvidedToProcessing: docsProvided,
         history: [newHistoryItem, ...selectedFile.history]
       };
     }
     // Handle "Acknowledge Processing" action
     else if (selectedAction === 'ACKNOWLEDGE_PROCESSING') {
+      const docsReceived = Boolean(trackingData?.documentsReceivedFromSales);
+      const nextStatus = docsReceived ? 'HANDOVER_PROCESSING' : 'DOCS_PENDING';
       const newHistoryItem = {
-        action: `Processing Agent Acknowledged - Started Processing${note ? ` - Note: ${note}` : ''}`,
-        status: 'HANDOVER_PROCESSING',
+        action: `Processing Agent Acknowledged - Started Processing - All required documents received from sales rep: ${docsReceived ? 'Yes' : 'No'}${note ? ` - Note: ${note}` : ''}`,
+        status: nextStatus,
         performedBy: appUser.name,
         timestamp: Date.now()
       };
       updateData = {
         ...updateData,
-        status: 'HANDOVER_PROCESSING',
+        status: nextStatus,
         assignedTo: appUser.name,
-        acknowledgedByProcessingAgent: true,
+        acknowledgedByProcessingAgent: docsReceived,
+        documentsReceivedFromSalesRep: docsReceived,
+        processingDocumentsReceived: docsReceived,
         history: [newHistoryItem, ...selectedFile.history]
       };
     }
@@ -1152,6 +1399,31 @@ export default function VisaTrackApp() {
       }
 
       updateData = ticketUpdate;
+    }
+    // Handle Pick & Drop status updates
+    else if (selectedFile.fileType === FILE_TYPES.PICK_DROP && selectedAction) {
+      let actionText = `Updated to ${STATUS[selectedAction].label}`;
+      const newHistoryItem = {
+        action: note ? `${actionText} - Note: ${note}` : actionText,
+        status: selectedAction,
+        performedBy: appUser.name,
+        timestamp: Date.now()
+      };
+
+      const pickDropUpdate = {
+        ...updateData,
+        status: selectedAction,
+        history: [newHistoryItem, ...selectedFile.history]
+      };
+
+      if (specializedData) {
+        if (specializedData.pickupLocation) pickDropUpdate.pickupLocation = sanitizeInput(specializedData.pickupLocation, { maxLength: 100 });
+        if (specializedData.dropoffLocation) pickDropUpdate.dropoffLocation = sanitizeInput(specializedData.dropoffLocation, { maxLength: 100 });
+        if (specializedData.salePrice !== undefined) pickDropUpdate.salePrice = Number(specializedData.salePrice) || 0;
+        if (specializedData.costPrice !== undefined) pickDropUpdate.costPrice = Number(specializedData.costPrice) || 0;
+      }
+
+      updateData = pickDropUpdate;
     }
     // Handle Package status updates
     else if (selectedFile.fileType === FILE_TYPES.PACKAGE && selectedAction) {
@@ -1242,6 +1514,10 @@ export default function VisaTrackApp() {
       if (cost) updateData.cost = Number(cost);
     }
 
+    if (updateData.status && updateData.status !== selectedFile.status) {
+      updateData.statusChangedAt = serverTimestamp();
+    }
+
     const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id);
     await updateDoc(fileRef, updateData);
     setModalOpen(false);
@@ -1250,6 +1526,8 @@ export default function VisaTrackApp() {
     setPackageFlightIssuedModalOpen(false);
     setPackageHotelsBookedModalOpen(false);
     setPackagePickupDropoffModalOpen(false);
+    setPickDropBookedModalOpen(false);
+    setPickDropConfirmedModalOpen(false);
   };
 
   const handleAddNote = async (note) => {
@@ -1434,6 +1712,7 @@ export default function VisaTrackApp() {
                  {appUser.role !== ROLES.ACCOUNTS && (
                    <>
                      <NavButton active={activeTab === 'pipeline'} onClick={() => setActiveTab('pipeline')} icon={List} darkMode={darkMode}>Pipeline</NavButton>
+                     <NavButton active={activeTab === 'processing'} onClick={() => setActiveTab('processing')} icon={Activity} darkMode={darkMode}>Tracker</NavButton>
                      <NavButton active={activeTab === 'add'} onClick={() => setActiveTab('add')} icon={Plus} darkMode={darkMode}>New File</NavButton>
                      <NavButton active={activeTab === 'reports'} onClick={() => setActiveTab('reports')} icon={Activity} darkMode={darkMode}>Stats</NavButton>
                    </>
@@ -1486,6 +1765,7 @@ export default function VisaTrackApp() {
                 {appUser.role !== ROLES.ACCOUNTS && (
                   <>
                     <NavItem id="pipeline" icon={List} label="Work Pipeline" />
+                    <NavItem id="processing" icon={Activity} label="Processing Tracker" />
                     <NavItem id="add" icon={Plus} label="Register New File" />
                     <NavItem id="reports" icon={Activity} label="Statistical Reports" />
                   </>
@@ -1519,8 +1799,6 @@ export default function VisaTrackApp() {
             user={appUser} 
             destinations={destinations}
             allUsers={allUsers}
-            attendanceRecords={attendanceRecords}
-            approvedLeaves={approvedLeaves}
             onOpenUpdateModal={openUpdateModal} 
             onOpenNoteModal={openNoteModal}
             onOpenEditModal={openEditModal}
@@ -1533,7 +1811,30 @@ export default function VisaTrackApp() {
             onOpenInvoiceModal={(f) => { setInvoiceFile(f); setInvoiceModalOpen(true); }}
           />
         )}
-        {activeTab === 'pipeline' && <PipelineView files={files} darkMode={darkMode} />}
+        {activeTab === 'pipeline' && (
+          <PipelineView
+            files={files}
+            darkMode={darkMode}
+            onOpenFile={(file) => {
+              if (file?.fileId) {
+                setSearchTerm(file.fileId);
+                setActiveTab('dashboard');
+              }
+            }}
+          />
+        )}
+        {activeTab === 'processing' && appUser.role !== ROLES.ACCOUNTS && (
+          <ProcessingTracker
+            files={files}
+            darkMode={darkMode}
+            onOpenFile={(file) => {
+              if (file?.fileId) {
+                setSearchTerm(file.fileId);
+                setActiveTab('dashboard');
+              }
+            }}
+          />
+        )}
         {activeTab === 'add' && (
           <AddFileForm 
             destinations={destinations} 
@@ -1544,13 +1845,13 @@ export default function VisaTrackApp() {
         )}
         {activeTab === 'reports' && <StatisticalReports files={files} currentUser={appUser} darkMode={darkMode} onOpenInvoiceModal={(f) => { setInvoiceFile(f); setInvoiceModalOpen(true); }} />}
         {activeTab === 'accounting' && (appUser.role === ROLES.ADMIN || appUser.role === ROLES.ACCOUNTS) && (
-          <AccountingPanel currentUser={appUser} files={files} miscCosts={miscCosts} onAddMiscCost={addMiscCost} onDeleteMiscCost={deleteMiscCost} darkMode={darkMode} isAdmin={appUser.role === ROLES.ADMIN} />
+          <AccountingPanel currentUser={appUser} files={files} miscCosts={miscCosts} paymentMethods={paymentMethods} cashPaymentNotificationEmails={cashPaymentNotificationEmails} onAddMiscCost={addMiscCost} onDeleteMiscCost={deleteMiscCost} darkMode={darkMode} isAdmin={appUser.role === ROLES.ADMIN} />
         )}
         {activeTab === 'leaves' && (
           <LeavesPanel currentUser={appUser} leaveRequests={leaveRequests} approvedLeaves={approvedLeaves} allUsers={allUsers} darkMode={darkMode} onApprove={approveLeaveRequest} onReject={rejectLeaveRequest} onGrantDirect={grantDirectLeave} onDeleteLeave={deleteApprovedLeave} onRequestLeave={() => setShowLeaveRequestModal(true)} />
         )}
         {activeTab === 'admin' && appUser.role === ROLES.ADMIN && (
-          <AdminPanel currentUser={appUser} destinations={destinations} darkMode={darkMode} />
+          <AdminPanel currentUser={appUser} destinations={destinations} paymentMethods={paymentMethods} darkMode={darkMode} />
         )}
       </main>
 
@@ -1648,6 +1949,8 @@ export default function VisaTrackApp() {
             setInvoiceFile(null);
           }}
           file={invoiceFile}
+          paymentMethods={paymentMethods}
+          cashPaymentNotificationEmails={cashPaymentNotificationEmails}
           darkMode={darkMode}
           onGenerateInvoice={generateInvoice}
         />
@@ -1721,6 +2024,19 @@ export default function VisaTrackApp() {
           darkMode={darkMode}
         />
       )}
+
+      {pickDropBookedModalOpen && (
+        <PickDropBookedModal
+          isOpen={pickDropBookedModalOpen}
+          onClose={() => setPickDropBookedModalOpen(false)}
+          onConfirm={(data) => {
+            handleStatusUpdate(null, null, null, null, null, false, data);
+            setPickDropBookedModalOpen(false);
+          }}
+          file={selectedFile}
+          darkMode={darkMode}
+        />
+      )}
     </div>
     </ErrorBoundary>
   );
@@ -1746,13 +2062,23 @@ function NavButton({ active, onClick, icon: Icon, children, darkMode, badge }) {
   );
 }
 
-function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode, onOpenInvoiceModal, allUsers, attendanceRecords, approvedLeaves }) {
+function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteModal, onOpenEditModal, searchTerm, setSearchTerm, setActiveTab, myTasks, onDeleteFile, darkMode, onOpenInvoiceModal, allUsers }) {
   const [destFilter, setDestFilter] = useState('');
   const [fileTypeFilter, setFileTypeFilter] = useState('');
   const [showIncompleteCosts, setShowIncompleteCosts] = useState(false);
+  const [dateFromFilter, setDateFromFilter] = useState('');
+  const [dateToFilter, setDateToFilter] = useState('');
+  const [showLowCostOnly, setShowLowCostOnly] = useState(false);
+  const [registeredByFilter, setRegisteredByFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const [currentTime, setCurrentTime] = useState(getDhakaDate());
   const itemsPerPage = 20;
+  const isAdmin = user?.role === ROLES.ADMIN;
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [destFilter, fileTypeFilter, showIncompleteCosts, dateFromFilter, dateToFilter, showLowCostOnly, registeredByFilter, statusFilter, searchTerm]);
 
   // Update clock every second
   useEffect(() => {
@@ -1836,18 +2162,7 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
       bestSales,
       bestProcessing
     };
-  }, [files, allUsers, attendanceRecords]);
-
-  const isFileCompleted = (file) => {
-    if (file.fileType === FILE_TYPES.VISA) {
-      return ['DONE', 'FOLLOW_UP'].includes(file.status);
-    } else if (file.fileType === FILE_TYPES.AIR_TICKET) {
-      return file.status === 'ISSUED';
-    } else if (file.fileType === FILE_TYPES.PACKAGE) {
-      return file.status === 'PACKAGE_READY';
-    }
-    return false;
-  };
+  }, [files, allUsers]);
 
   const stats = useMemo(() => {
     const today = getStartOf('today');
@@ -1870,62 +2185,12 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
       if (submittedAction) submittedToday++;
     });
 
-    // Calculate workdays for current user this month
-    const now = getDhakaDate();
-    const currentYear = now.getFullYear();
-    const currentMonth = now.getMonth();
-    const monthStart = new Date(currentYear, currentMonth, 1);
-    
-    // Get current user's approved leaves for date range checks
-    const userApprovedLeaves = approvedLeaves.filter(leave => leave.userId === user?.id);
-    
-    // Helper function to check if a date is within an approved leave
-    const isOnApprovedLeave = (dateString) => {
-      return userApprovedLeaves.some(leave => {
-        return dateString >= leave.startDate && dateString <= leave.endDate;
-      });
-    };
-    
-    // User's workdays (unique days with at least one login, excluding Fridays and approved leaves)
-    const userWorkdaysSet = new Set();
-    attendanceRecords.forEach(record => {
-      if (!record.date) return;
-      
-      // Use the stored date field (YYYY-MM-DD format in Dhaka timezone)
-      const [year, month, day] = record.date.split('-').map(Number);
-      const recordDate = new Date(year, month - 1, day);
-      
-      // Only count if in current month and not Friday (5) and not on approved leave
-      if (recordDate.getFullYear() === currentYear && recordDate.getMonth() === currentMonth && recordDate.getDay() !== 5 && !isOnApprovedLeave(record.date)) {
-        userWorkdaysSet.add(record.date);
-      }
-    });
-    
-    // Total workdays in month (1st to today, excluding Fridays and approved leaves)
-    let totalWorkdaysInMonth = 0;
-    const d = new Date(currentYear, currentMonth, 1);
-    const todayEnd = new Date(now);
-    todayEnd.setHours(23, 59, 59, 999);
-    
-    while (d <= todayEnd) {
-      if (d.getDay() !== 5) { // Skip Friday
-        const dateString = getDhakaTodayString(); // We need to format the date
-        const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-        if (!isOnApprovedLeave(dateStr)) {
-          totalWorkdaysInMonth++;
-        }
-      }
-      d.setDate(d.getDate() + 1);
-    }
-
     return { 
       salesToday, 
       submittedToday, 
-      inProcess,
-      daysWorked: userWorkdaysSet.size,
-      totalWorkdaysMonth: totalWorkdaysInMonth
+      inProcess
     };
-  }, [files, isFileCompleted, attendanceRecords, approvedLeaves, user?.id]);
+  }, [files, isFileCompleted]);
 
   const recentActivity = useMemo(() => {
     const allEvents = [];
@@ -1961,16 +2226,44 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
         .slice(0, 5); 
   }, [files]);
   
+  const getFileCreatedDate = (file) => {
+    if (!file.createdAt) return null;
+    return file.createdAt.toDate ? file.createdAt.toDate() : new Date(file.createdAt);
+  };
+
+  const getFileSaleAndCost = (file) => {
+    if (file.fileType === FILE_TYPES.VISA) {
+      return { sale: Number(file.serviceCharge) || 0, cost: Number(file.cost) || 0 };
+    }
+    if (file.fileType === FILE_TYPES.AIR_TICKET) {
+      return { sale: Number(file.airlineSalePrice) || 0, cost: Number(file.airlineCostPrice) || 0 };
+    }
+    if (file.fileType === FILE_TYPES.PACKAGE) {
+      return { sale: Number(file.packageSalePrice) || 0, cost: Number(file.packageCostPrice) || 0 };
+    }
+    if (file.fileType === FILE_TYPES.PICK_DROP) {
+      return { sale: Number(file.salePrice) || 0, cost: Number(file.costPrice) || 0 };
+    }
+    return { sale: Number(file.serviceCharge) || 0, cost: Number(file.cost) || 0 };
+  };
+
+  const registrars = Array.from(new Set(files.map(f => f.createdBy).filter(Boolean))).sort();
+  const fileStatuses = Array.from(new Set(files.map(f => f.status).filter(Boolean))).sort();
+
   const normalizedSearch = searchTerm.trim().toLowerCase();
   const filteredFiles = files.filter(f => {
     // Search filter
-    if (normalizedSearch) {
+      if (normalizedSearch) {
       const matchesSearch = 
         (f.applicantName && String(f.applicantName).toLowerCase().includes(normalizedSearch)) || 
         (f.passportNo && String(f.passportNo).trim().toLowerCase().includes(normalizedSearch)) ||
         (f.mainPersonPassport && String(f.mainPersonPassport).trim().toLowerCase().includes(normalizedSearch)) ||
         (f.destination && String(f.destination).toLowerCase().includes(normalizedSearch)) ||
-        (f.fileId && String(f.fileId).toLowerCase().includes(normalizedSearch));
+        (f.fileId && String(f.fileId).toLowerCase().includes(normalizedSearch)) ||
+        (f.invoiceNo && String(f.invoiceNo).toLowerCase().includes(normalizedSearch)) ||
+        (f.invoice && f.invoice.invoiceNo && String(f.invoice.invoiceNo).toLowerCase().includes(normalizedSearch)) ||
+        (f.invoice && f.invoice.invoiceId && String(f.invoice.invoiceId).toLowerCase().includes(normalizedSearch)) ||
+        (f.invoicePaymentStatus && String(f.invoicePaymentStatus).toLowerCase().includes(normalizedSearch));
       if (!matchesSearch) return false;
     }
 
@@ -1980,19 +2273,31 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
     // File type filter
     if (fileTypeFilter && f.fileType !== fileTypeFilter) return false;
 
-    // Incomplete costs filter - find files with sale/service price but zero cost
-    if (showIncompleteCosts) {
-      const hasIncompleteCost = 
-        (f.fileType === FILE_TYPES.VISA && 
-          (Number(f.serviceCharge) > 0 || Number(f.cost) > 0) && 
-          (Number(f.cost) === 0)) || // Has service charge/cost but cost is zero
-        (f.fileType === FILE_TYPES.AIR_TICKET && 
-          (Number(f.airlineSalePrice) > 0 || Number(f.airlineCostPrice) > 0) && 
-          (Number(f.airlineCostPrice) === 0)) || // Has sale price but cost price is zero
-        (f.fileType === FILE_TYPES.PACKAGE && 
-          (Number(f.packageSalePrice) > 0 || Number(f.packageCostPrice) > 0) && 
-          (Number(f.packageCostPrice) === 0)); // Has sale price but cost price is zero
-      if (!hasIncompleteCost) return false;
+    // Cost filters
+    const { cost } = getFileSaleAndCost(f);
+    if (showIncompleteCosts && cost > 0) return false;
+    if (showLowCostOnly) {
+      if (f.fileType === FILE_TYPES.VISA) return false;
+      const { sale, cost } = getFileSaleAndCost(f);
+      if (sale <= 0 || cost < 0 || cost >= sale * 0.5) return false;
+    }
+
+    // Registrar and status filters (admin only)
+    if (isAdmin && registeredByFilter && f.createdBy !== registeredByFilter) return false;
+    if (isAdmin && statusFilter && f.status !== statusFilter) return false;
+
+    // Date range filter (admin only)
+    if (isAdmin && dateFromFilter) {
+      const startDate = new Date(dateFromFilter);
+      startDate.setHours(0, 0, 0, 0);
+      const fileDate = getFileCreatedDate(f);
+      if (!fileDate || fileDate < startDate) return false;
+    }
+    if (isAdmin && dateToFilter) {
+      const endDate = new Date(dateToFilter);
+      endDate.setHours(23, 59, 59, 999);
+      const fileDate = getFileCreatedDate(f);
+      if (!fileDate || fileDate > endDate) return false;
     }
 
     return true;
@@ -2065,31 +2370,10 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
 
       {/* Main Content Area */}
       <div className="lg:col-span-3 space-y-8">
-        {/* Clock, Date and Workdays - Compact Top Card */}
+        {/* Clock and Date - Compact Top Card */}
         <div className={`rounded-xl border ${darkMode ? 'bg-slate-900/50 border-slate-700' : 'bg-white border-slate-200'}`}>
-          <div className="grid grid-cols-5 gap-0">
-            {/* Clock - Left (wider: 3 columns) */}
-            <div className={`col-span-3 px-10 py-4 border-r ${darkMode ? 'border-slate-700' : 'border-slate-200'} flex flex-col items-center justify-center min-h-[200px]`}>
-              <DhakaClock />
-            </div>
-
-            {/* Workdays - Right (2 columns) */}
-            <div className={`col-span-2 px-10 py-4 flex flex-col items-center justify-center gap-6`}>
-              <div className="flex items-center gap-4">
-                <div className={`${darkMode ? 'bg-slate-800 text-blue-400' : 'bg-blue-100 text-blue-600'} p-3 rounded`}>
-                  <Calendar className="h-8 w-8" />
-                </div>
-                <div className="text-left">
-                  <p className={`text-base font-semibold uppercase tracking-wide ${textSub}`}>Workdays</p>
-                  <p className={`text-4xl font-bold ${textMain} leading-none`}>
-                    <span className="text-green-500">{stats.daysWorked || 0}</span>
-                    <span className={`text-slate-400 mx-2`}>/</span>
-                    <span className={`${textSub}`}>{stats.totalWorkdaysMonth || 0}</span>
-                  </p>
-                </div>
-              </div>
-              <p className={`text-base font-semibold text-green-500`}>Attendance: {stats.daysWorked ? Math.round((stats.daysWorked / stats.totalWorkdaysMonth) * 100) : 0}%</p>
-            </div>
+          <div className="flex items-center justify-center px-10 py-6 min-h-[200px]">
+            <DhakaClock />
           </div>
         </div>
 
@@ -2164,6 +2448,65 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
               >
                 ⚠️ Incomplete Costs
               </button>
+
+              {isAdmin && (
+                <>
+                  <div className="relative flex-grow sm:flex-grow-0">
+                    <input
+                      type="date"
+                      value={dateFromFilter}
+                      onChange={(e) => setDateFromFilter(e.target.value)}
+                      className={`px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full sm:w-40 ${inputClass}`}
+                    />
+                  </div>
+
+                  <div className="relative flex-grow sm:flex-grow-0">
+                    <input
+                      type="date"
+                      value={dateToFilter}
+                      onChange={(e) => setDateToFilter(e.target.value)}
+                      className={`px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full sm:w-40 ${inputClass}`}
+                    />
+                  </div>
+
+                  <div className="relative flex-grow sm:flex-grow-0">
+                    <select
+                      value={registeredByFilter}
+                      onChange={(e) => setRegisteredByFilter(e.target.value)}
+                      className={`px-3 py-2 border rounded-lg appearance-none text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full sm:w-48 ${inputClass}`}
+                    >
+                      <option value="">All Registrars</option>
+                      {registrars.map(name => <option key={name} value={name}>{name}</option>)}
+                    </select>
+                  </div>
+
+                  <div className="relative flex-grow sm:flex-grow-0">
+                    <select
+                      value={statusFilter}
+                      onChange={(e) => setStatusFilter(e.target.value)}
+                      className={`px-3 py-2 border rounded-lg appearance-none text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full sm:w-48 ${inputClass}`}
+                    >
+                      <option value="">All Statuses</option>
+                      {fileStatuses.map(status => (
+                        <option key={status} value={status}>{STATUS[status]?.label || status}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <button
+                    onClick={() => setShowLowCostOnly(!showLowCostOnly)}
+                    className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors whitespace-nowrap ${
+                      showLowCostOnly
+                        ? 'bg-amber-600 text-white hover:bg-amber-700'
+                        : darkMode
+                        ? 'bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700'
+                        : 'bg-slate-200 text-slate-700 hover:bg-slate-300 border border-slate-300'
+                    }`}
+                  >
+                    📉 Low Cost
+                  </button>
+                </>
+              )}
 
               <div className="relative flex-grow sm:flex-grow-0">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400" />
@@ -2752,7 +3095,7 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
   );
 }
 
-function PipelineView({ files, darkMode }) {
+function PipelineView({ files, darkMode, onOpenFile }) {
   const [filterCreatedBy, setFilterCreatedBy] = useState('ALL');
   const [filterStatus, setFilterStatus] = useState('ALL');
 
@@ -2833,7 +3176,19 @@ function PipelineView({ files, darkMode }) {
              
              <div className="space-y-3 overflow-y-auto pr-2 custom-scrollbar flex-1">
                {userFiles.map(file => (
-                 <div key={file.id} className={`p-3 rounded-lg border transition-shadow ${cardClass}`}>
+                 <div
+                   key={file.id}
+                   className={`p-3 rounded-lg border transition-shadow cursor-pointer hover:ring-2 hover:ring-blue-500 ${cardClass}`}
+                   onClick={() => onOpenFile?.(file)}
+                   role="button"
+                   tabIndex={0}
+                   onKeyDown={(e) => {
+                     if (e.key === 'Enter' || e.key === ' ') {
+                       e.preventDefault();
+                       onOpenFile?.(file);
+                     }
+                   }}
+                 >
                     <div className="flex justify-between items-start mb-1">
                       <span className="text-xs font-mono text-slate-400">{file.fileId}</span>
                       <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${darkMode && STATUS[file.status].darkColor ? STATUS[file.status].darkColor : STATUS[file.status].color}`}>{STATUS[file.status].label}</span>
@@ -2850,6 +3205,171 @@ function PipelineView({ files, darkMode }) {
         {Object.keys(groupedFiles).length === 0 && (
            <div className="col-span-full text-center py-20 text-slate-400">No active files in the pipeline.</div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function ProcessingTracker({ files, darkMode, onOpenFile }) {
+  const [assigneeFilter, setAssigneeFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [now, setNow] = useState(null);
+
+  useEffect(() => {
+    const updateClock = () => setNow(Date.now());
+    const initialTimer = setTimeout(updateClock, 0);
+    const timer = setInterval(updateClock, 60_000);
+    return () => {
+      clearTimeout(initialTimer);
+      clearInterval(timer);
+    };
+  }, []);
+
+  const trackedFiles = useMemo(() => files
+    .filter(file => {
+      if (!file.status) return false;
+      if (file.fileType === FILE_TYPES.VISA) {
+        return !['RECEIVED_SALES', 'DONE'].includes(file.status);
+      }
+      return !isFileCompleted(file);
+    })
+    .map(file => {
+      let statusDate = getTimestampDate(file.statusChangedAt);
+      if (!statusDate) {
+        const statusHistory = (file.history || [])
+          .filter(entry =>
+            entry.status === file.status &&
+            !entry.action?.startsWith('Note Added:') &&
+            !entry.action?.startsWith('Sales Rep changed')
+          )
+          .map(entry => getTimestampDate(entry.timestamp))
+          .filter(Boolean)
+          .sort((a, b) => b.getTime() - a.getTime());
+        statusDate = statusHistory[0] || getTimestampDate(file.createdAt);
+      }
+      const daysInStatus = statusDate && now !== null
+        ? Math.floor(Math.max(0, now - statusDate.getTime()) / 86_400_000)
+        : null;
+      return { ...file, statusDate, daysInStatus };
+    })
+    .sort((a, b) => (b.daysInStatus ?? -1) - (a.daysInStatus ?? -1)), [files, now]);
+
+  const assignees = Array.from(new Set(trackedFiles.map(file => file.assignedTo || 'Unassigned'))).sort();
+  const statuses = Array.from(new Set(trackedFiles.map(file => file.status))).sort();
+  const normalizedSearch = searchTerm.trim().toLowerCase();
+  const visibleFiles = trackedFiles.filter(file => {
+    if (assigneeFilter && (file.assignedTo || 'Unassigned') !== assigneeFilter) return false;
+    if (statusFilter && file.status !== statusFilter) return false;
+    if (normalizedSearch && !`${file.fileId || ''} ${file.applicantName || ''}`.toLowerCase().includes(normalizedSearch)) return false;
+    return true;
+  });
+  const stalledCount = trackedFiles.filter(file => file.daysInStatus !== null && file.daysInStatus >= 7).length;
+  const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
+  const textSub = darkMode ? 'text-slate-400' : 'text-slate-500';
+  const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
+  const inputClass = darkMode
+    ? 'bg-slate-950 border-slate-700 text-slate-100'
+    : 'bg-white border-slate-300 text-slate-900';
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className={`text-2xl font-bold ${textMain}`}>Processing Tracker</h2>
+        <p className={textSub}>Active files by assignee, status, and time in the current status.</p>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className={`rounded-xl border p-4 ${cardClass}`}>
+          <p className={`text-sm ${textSub}`}>Files in processing</p>
+          <p className={`text-2xl font-bold ${textMain}`}>{trackedFiles.length}</p>
+        </div>
+        <div className={`rounded-xl border p-4 ${cardClass}`}>
+          <p className={`text-sm ${textSub}`}>In current status for 7+ days</p>
+          <p className={`text-2xl font-bold ${stalledCount ? 'text-amber-500' : textMain}`}>{stalledCount}</p>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap gap-3">
+        <select
+          value={assigneeFilter}
+          onChange={event => setAssigneeFilter(event.target.value)}
+          className={`rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+          aria-label="Filter by assignee"
+        >
+          <option value="">All Assignees</option>
+          {assignees.map(assignee => <option key={assignee} value={assignee}>{assignee}</option>)}
+        </select>
+        <select
+          value={statusFilter}
+          onChange={event => setStatusFilter(event.target.value)}
+          className={`rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+          aria-label="Filter by status"
+        >
+          <option value="">All Statuses</option>
+          {statuses.map(status => <option key={status} value={status}>{STATUS[status]?.label || status}</option>)}
+        </select>
+        <input
+          type="search"
+          value={searchTerm}
+          onChange={event => setSearchTerm(event.target.value)}
+          placeholder="Search file ID or customer"
+          className={`min-w-[220px] rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+        />
+      </div>
+
+      <div className={`overflow-hidden rounded-xl border ${cardClass}`}>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[760px] text-left text-sm">
+            <thead className={darkMode ? 'bg-slate-800 text-slate-300' : 'bg-slate-50 text-slate-600'}>
+              <tr>
+                <th className="px-4 py-3">File</th>
+                <th className="px-4 py-3">Customer</th>
+                <th className="px-4 py-3">Type</th>
+                <th className="px-4 py-3">Assigned To</th>
+                <th className="px-4 py-3">Status</th>
+                <th className="px-4 py-3">Status Since</th>
+                <th className="px-4 py-3">Days Unchanged</th>
+              </tr>
+            </thead>
+            <tbody className={textMain}>
+              {visibleFiles.map(file => (
+                <tr key={file.id} className={`border-t ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+                  <td className="px-4 py-3">
+                    <button
+                      onClick={() => onOpenFile?.(file)}
+                      className="font-mono text-blue-500 hover:underline"
+                    >
+                      {file.fileId || file.id}
+                    </button>
+                  </td>
+                  <td className="px-4 py-3">{file.applicantName || '-'}</td>
+                  <td className="px-4 py-3">{file.fileType || FILE_TYPES.VISA}</td>
+                  <td className="px-4 py-3">{file.assignedTo || 'Unassigned'}</td>
+                  <td className="px-4 py-3">{STATUS[file.status]?.label || file.status}</td>
+                  <td className="px-4 py-3">{file.statusDate ? file.statusDate.toLocaleDateString() : 'Unknown'}</td>
+                  <td className={`px-4 py-3 font-semibold ${
+                    file.daysInStatus !== null && file.daysInStatus >= 7
+                      ? 'text-amber-500'
+                      : textMain
+                  }`}>
+                    {file.daysInStatus === null ? 'Unknown' : `${file.daysInStatus} ${file.daysInStatus === 1 ? 'day' : 'days'}`}
+                  </td>
+                </tr>
+              ))}
+              {visibleFiles.length === 0 && (
+                <tr>
+                  <td colSpan="7" className={`px-4 py-10 text-center ${textSub}`}>
+                    {trackedFiles.length === 0 ? 'No files are currently in processing.' : 'No files match these filters.'}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className={`border-t px-4 py-3 text-xs ${textSub}`}>
+          Showing {visibleFiles.length} of {trackedFiles.length} processing files
+        </div>
       </div>
     </div>
   );
@@ -3022,17 +3542,23 @@ function LeavesPanel({ currentUser, leaveRequests, approvedLeaves, allUsers, dar
   );
 }
 
-function AdminPanel({ currentUser, destinations, darkMode }) {
+function AdminPanel({ currentUser, destinations, paymentMethods = [], darkMode }) {
   const [users, setUsers] = useState([]);
   const [userForm, setUserForm] = useState({ fullName: '', username: '', password: '', role: ROLES.SALES });
   const [newDest, setNewDest] = useState('');
   const [newPortal, setNewPortal] = useState('');
   const [portals, setPortals] = useState([]);
-  const [isTrusted, setIsTrusted] = useState(() => localStorage.getItem('vt_trusted_device') === 'true');
-  const [activeSessions, setActiveSessions] = useState([]);
+  const [paymentMethodForm, setPaymentMethodForm] = useState({ id: '', name: '', institution: '', accountName: '', accountNumber: '' });
+  const [editingPaymentMethodId, setEditingPaymentMethodId] = useState('');
+  const [cashNotificationEmailText, setCashNotificationEmailText] = useState('');
+  const [savingCashNotificationEmails, setSavingCashNotificationEmails] = useState(false);
   const [holidays, setHolidays] = useState([]);
   const [showHolidayForm, setShowHolidayForm] = useState(false);
   const [holidayForm, setHolidayForm] = useState({ startDate: '', endDate: '', reason: '' });
+  const [incentiveSettings, setIncentiveSettings] = useState([]);
+  const [selectedIncentiveUser, setSelectedIncentiveUser] = useState('');
+  const [incentiveTarget, setIncentiveTarget] = useState('');
+  const [incentiveTiers, setIncentiveTiers] = useState([{ amount: '', percent: '' }]);
   
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
@@ -3041,13 +3567,88 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
     : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
 
   useEffect(() => {
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'cash_payment_notifications');
+    const unsubscribe = onSnapshot(docRef, snapshot => {
+      const recipients = snapshot.exists() ? snapshot.data().recipients : [];
+      setCashNotificationEmailText(Array.isArray(recipients) ? recipients.join('\n') : '');
+    }, error => {
+      console.error('Failed to load cash payment notification recipients:', error);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const saveCashNotificationEmails = async (e) => {
+    e.preventDefault();
+    const recipients = [...new Set(cashNotificationEmailText.split(/[\s,;]+/).map(email => email.trim().toLowerCase()).filter(Boolean))];
+    const invalid = recipients.filter(email => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email));
+    if (invalid.length > 0) {
+      alert(`Invalid email address${invalid.length === 1 ? '' : 'es'}: ${invalid.join(', ')}`);
+      return;
+    }
+    setSavingCashNotificationEmails(true);
+    try {
+      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'cash_payment_notifications'), { recipients });
+    } catch (error) {
+      console.error('Failed to save cash payment notification recipients:', error);
+      alert('Failed to save notification recipients. See console for details.');
+    } finally {
+      setSavingCashNotificationEmails(false);
+    }
+  };
+
+  const savePaymentMethod = async (e) => {
+    e.preventDefault();
+    if (!paymentMethodForm.name.trim()) {
+      alert('Enter a payment method name.');
+      return;
+    }
+    const item = {
+      id: editingPaymentMethodId || `payment-${Date.now()}`,
+      name: paymentMethodForm.name.trim(),
+      institution: paymentMethodForm.institution.trim(),
+      accountName: paymentMethodForm.accountName.trim(),
+      accountNumber: paymentMethodForm.accountNumber.trim()
+    };
+    const items = editingPaymentMethodId
+      ? paymentMethods.map(method => method.id === editingPaymentMethodId ? item : method)
+      : [...paymentMethods, item];
+    try {
+      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'payment_methods'), { items });
+      setPaymentMethodForm({ id: '', name: '', institution: '', accountName: '', accountNumber: '' });
+      setEditingPaymentMethodId('');
+    } catch (error) {
+      console.error('Failed to save payment method:', error);
+      alert('Failed to save payment method. See console for details.');
+    }
+  };
+
+  const removePaymentMethod = async (methodId) => {
+    if (!confirm('Remove this payment method? Existing payment records will retain their saved account details.')) return;
+    try {
+      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'payment_methods'), {
+        items: paymentMethods.filter(method => method.id !== methodId)
+      });
+      if (editingPaymentMethodId === methodId) {
+        setEditingPaymentMethodId('');
+        setPaymentMethodForm({ id: '', name: '', institution: '', accountName: '', accountNumber: '' });
+      }
+    } catch (error) {
+      console.error('Failed to remove payment method:', error);
+      alert('Failed to remove payment method. See console for details.');
+    }
+  };
+
+  useEffect(() => {
     const q = collection(db, 'artifacts', appId, 'public', 'data', 'agency_users');
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const usersData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setUsers(usersData);
+      if (!selectedIncentiveUser && usersData.length > 0) {
+        setSelectedIncentiveUser(usersData[0].fullName);
+      }
     });
     return () => unsubscribe();
-  }, []);
+  }, [selectedIncentiveUser]);
 
   useEffect(() => {
     const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'portals');
@@ -3057,18 +3658,6 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
       } else {
         setPortals(AIR_TICKET_PORTALS);
       }
-    });
-    return () => unsubscribe();
-  }, []);
-
-  useEffect(() => {
-    const attQ = query(
-      collection(db, 'artifacts', appId, 'public', 'data', 'attendance'),
-      where('lastLogoutTime', '==', null)
-    );
-    const unsubscribe = onSnapshot(attQ, (snapshot) => {
-      const sessions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setActiveSessions(sessions);
     });
     return () => unsubscribe();
   }, []);
@@ -3084,6 +3673,37 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
     });
     return () => unsubscribe();
   }, []);
+
+  useEffect(() => {
+    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'incentives');
+    const unsubscribe = onSnapshot(docRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const saved = snapshot.data().users || [];
+        setIncentiveSettings(saved);
+        if (!selectedIncentiveUser && saved.length > 0) {
+          setSelectedIncentiveUser(saved[0].name);
+        }
+      } else {
+        setIncentiveSettings([]);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!selectedIncentiveUser) return;
+    const config = incentiveSettings.find(item => item.name === selectedIncentiveUser);
+    if (config) {
+      setIncentiveTarget(String(config.target || ''));
+      setIncentiveTiers(config.tiers?.length > 0 ? config.tiers.map((tier) => ({
+        amount: String(tier.amount || ''),
+        percent: String(tier.percent || '')
+      })) : [{ amount: '', percent: '' }]);
+    } else {
+      setIncentiveTarget('');
+      setIncentiveTiers([{ amount: '', percent: '' }]);
+    }
+  }, [selectedIncentiveUser, incentiveSettings]);
 
   const handleAddUser = async (e) => {
     e.preventDefault();
@@ -3148,42 +3768,6 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
     }
   };
 
-  const toggleTrust = () => {
-    if (isTrusted) {
-        localStorage.removeItem('vt_trusted_device');
-        setIsTrusted(false);
-    } else {
-        localStorage.setItem('vt_trusted_device', 'true');
-        setIsTrusted(true);
-    }
-  };
-
-  const endSessionForUser = async (sessionId, userName) => {
-    if (confirm(`End attendance session for ${userName}?`)) {
-      try {
-        const ref = doc(db, 'artifacts', appId, 'public', 'data', 'attendance', sessionId);
-        await updateDoc(ref, { logoutTime: serverTimestamp() });
-      } catch (err) {
-        console.error('Error ending session:', err);
-        alert('Failed to end session');
-      }
-    }
-  };
-
-  const endAllActiveSessions = async () => {
-    if (confirm(`End all ${activeSessions.length} active attendance sessions?`)) {
-      try {
-        for (const session of activeSessions) {
-          const ref = doc(db, 'artifacts', appId, 'public', 'data', 'attendance', session.id);
-          await updateDoc(ref, { lastLogoutTime: serverTimestamp() });
-        }
-      } catch (err) {
-        console.error('Error ending all sessions:', err);
-        alert('Failed to end some sessions');
-      }
-    }
-  };
-
   const handleAddHoliday = async (e) => {
     e.preventDefault();
     if (!holidayForm.startDate || !holidayForm.endDate) {
@@ -3214,6 +3798,53 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
     }
   };
 
+  const prepareIncentiveConfig = () => {
+    return incentiveTiers
+      .filter(t => t.amount.trim() !== '' && t.percent.trim() !== '')
+      .map(t => ({ amount: Number(t.amount) || 0, percent: Number(t.percent) || 0 }));
+  };
+
+  const handleSaveIncentiveConfig = async (e) => {
+    e.preventDefault();
+    if (!selectedIncentiveUser) {
+      alert('Please choose a user to save incentive settings.');
+      return;
+    }
+
+    const preparedTiers = prepareIncentiveConfig();
+    const updatedSettings = [...incentiveSettings.filter(item => item.name !== selectedIncentiveUser), {
+      name: selectedIncentiveUser,
+      target: Number(incentiveTarget) || 0,
+      tiers: preparedTiers
+    }];
+
+    try {
+      const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'incentives');
+      await setDoc(docRef, { users: updatedSettings, lastUpdated: serverTimestamp() }, { merge: true });
+      setIncentiveSettings(updatedSettings);
+      alert('Incentive settings saved successfully.');
+    } catch (err) {
+      console.error('Error saving incentive settings:', err);
+      alert(`Failed to save incentive settings: ${err?.message || JSON.stringify(err) || err}`);
+    }
+  };
+
+  const handleAddIncentiveTier = () => {
+    setIncentiveTiers([...incentiveTiers, { amount: '', percent: '' }]);
+  };
+
+  const handleRemoveIncentiveTier = (index) => {
+    setIncentiveTiers(incentiveTiers.filter((_, idx) => idx !== index));
+  };
+
+  const handleIncentiveTierChange = (index, field, value) => {
+    setIncentiveTiers(incentiveTiers.map((tier, idx) => idx === index ? { ...tier, [field]: value } : tier));
+  };
+
+  const handleIncentiveUserChange = (userName) => {
+    setSelectedIncentiveUser(userName);
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">
@@ -3221,19 +3852,6 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
            <h2 className={`text-2xl font-bold ${textMain}`}>Admin Control Panel</h2>
            <p className="text-slate-500">Manage system settings and user access</p>
         </div>
-      </div>
-
-      {/* Device Auth Card */}
-      <div className={`p-6 rounded-xl border mb-6 ${darkMode ? 'bg-blue-900/20 border-blue-800' : 'bg-blue-50 border-blue-100'}`}>
-        <h3 className={`font-bold mb-2 flex items-center gap-2 ${darkMode ? 'text-blue-200' : 'text-blue-800'}`}>
-            <Monitor className="h-5 w-5"/> Device Authorization
-        </h3>
-        <p className={`text-sm opacity-80 mb-4 ${darkMode ? 'text-blue-300' : 'text-blue-600'}`}>
-            Current Status: <strong>{isTrusted ? "✅ Trusted Office PC" : "🚫 Unregistered Device"}</strong>
-        </p>
-        <button onClick={toggleTrust} className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition-colors">
-            {isTrusted ? "Revoke Authorization" : "Authorize This Device"}
-        </button>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -3344,6 +3962,60 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
           </div>
         </div>
 
+        {/* Payment Account Settings */}
+        <div className={`rounded-xl border h-fit ${cardClass}`}>
+          <div className={`px-6 py-4 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
+            <h3 className={`font-bold ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>Payment Methods &amp; Accounts</h3>
+          </div>
+          <form onSubmit={savePaymentMethod} className={`p-4 space-y-2 border-b ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+            <input className={`w-full px-3 py-2 border rounded-lg text-sm ${inputClass}`} placeholder="Payment method name (e.g. Bank Transfer)" required value={paymentMethodForm.name} onChange={e => setPaymentMethodForm({ ...paymentMethodForm, name: e.target.value })} />
+            <input className={`w-full px-3 py-2 border rounded-lg text-sm ${inputClass}`} placeholder="Bank / provider" value={paymentMethodForm.institution} onChange={e => setPaymentMethodForm({ ...paymentMethodForm, institution: e.target.value })} />
+            <input className={`w-full px-3 py-2 border rounded-lg text-sm ${inputClass}`} placeholder="Account holder" value={paymentMethodForm.accountName} onChange={e => setPaymentMethodForm({ ...paymentMethodForm, accountName: e.target.value })} />
+            <input className={`w-full px-3 py-2 border rounded-lg text-sm ${inputClass}`} placeholder="Account details / number" value={paymentMethodForm.accountNumber} onChange={e => setPaymentMethodForm({ ...paymentMethodForm, accountNumber: e.target.value })} />
+            <div className="flex gap-2">
+              <button type="submit" className="flex-1 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm">{editingPaymentMethodId ? 'Save Changes' : 'Add Payment Method'}</button>
+              {editingPaymentMethodId && <button type="button" onClick={() => { setEditingPaymentMethodId(''); setPaymentMethodForm({ id: '', name: '', institution: '', accountName: '', accountNumber: '' }); }} className="px-3 py-2 rounded-lg text-sm border">Cancel</button>}
+            </div>
+          </form>
+          <div className="p-3 space-y-2">
+            {paymentMethods.map(method => (
+              <div key={method.id} className={`p-3 rounded-lg border flex items-start justify-between gap-2 ${darkMode ? 'border-slate-700 bg-slate-800/50' : 'border-slate-200 bg-slate-50'}`}>
+                <div className="min-w-0">
+                  <div className={`font-medium text-sm ${textMain}`}>{method.name}</div>
+                  <div className="text-xs text-slate-500">{[method.institution, method.accountName, method.accountNumber].filter(Boolean).join(' · ') || 'No account details'}</div>
+                </div>
+                <div className="flex gap-2 shrink-0">
+                  <button type="button" className="text-blue-500 text-xs" onClick={() => { setEditingPaymentMethodId(method.id); setPaymentMethodForm({ ...method }); }}>Edit</button>
+                  <button type="button" className="text-red-500 text-xs" onClick={() => removePaymentMethod(method.id)}>Remove</button>
+                </div>
+              </div>
+            ))}
+            {paymentMethods.length === 0 && <p className="text-sm text-slate-500">No payment methods configured.</p>}
+          </div>
+        </div>
+
+        {/* Cash Payment Email Notifications */}
+        <div className={`rounded-xl border h-fit ${cardClass}`}>
+          <div className={`px-6 py-4 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
+            <h3 className={`font-bold ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>Cash Payment Email Alerts</h3>
+          </div>
+          <form onSubmit={saveCashNotificationEmails} className="p-4 space-y-3">
+            <p className="text-sm text-slate-500">Send an email whenever a payment method named “Cash” is used. Enter one or more recipient addresses, separated by commas, spaces, or new lines.</p>
+            <textarea
+              value={cashNotificationEmailText}
+              onChange={e => setCashNotificationEmailText(e.target.value)}
+              rows={4}
+              maxLength={3000}
+              placeholder="accounts@example.com&#10;manager@example.com"
+              className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}
+            />
+            <button type="submit" disabled={savingCashNotificationEmails} className="w-full bg-blue-600 disabled:opacity-50 text-white px-3 py-2 rounded-lg text-sm">
+              {savingCashNotificationEmails ? 'Saving…' : 'Save Notification Emails'}
+            </button>
+            <p className="text-xs text-slate-500">Email delivery also requires the Firebase Trigger Email extension to be configured with your Hostinger SMTP credentials.</p>
+          </form>
+        </div>
+
         {/* Portal Settings Section */}
         <div className={`rounded-xl border h-fit ${cardClass}`}>
           <div className={`px-6 py-4 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
@@ -3373,6 +4045,108 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
           </div>
         </div>
 
+      </div>
+
+      <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
+        <div className={`px-6 py-4 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
+          <h3 className={`font-bold flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}><Sparkles className="h-5 w-5"/> Incentive Targets</h3>
+        </div>
+        <div className={`p-6 space-y-4 ${darkMode ? 'bg-slate-900' : 'bg-slate-50'} `}>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div className="md:col-span-1">
+              <label className={`block text-sm font-medium mb-2 ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Staff Member</label>
+              <select
+                value={selectedIncentiveUser}
+                onChange={(e) => handleIncentiveUserChange(e.target.value)}
+                className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}
+              >
+                {users.length > 0 ? users.map(u => (
+                  <option key={u.id} value={u.fullName}>{u.fullName}</option>
+                )) : <option value="">No users available</option>}
+              </select>
+            </div>
+            <div className="md:col-span-2">
+              <label className={`block text-sm font-medium mb-2 ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Profit Target (৳)</label>
+              <input
+                type="number"
+                min="0"
+                value={incentiveTarget}
+                onChange={(e) => setIncentiveTarget(e.target.value)}
+                className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}
+                placeholder="Target profit before incentive"
+              />
+            </div>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <p className={`text-sm font-medium ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>Tiered Incentive Plan</p>
+                <p className={`text-xs ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Define above-target profit ranges and payout percentages.</p>
+              </div>
+              <button
+                type="button"
+                onClick={handleAddIncentiveTier}
+                className="inline-flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"
+              >
+                <Plus className="h-4 w-4"/> Add Tier
+              </button>
+            </div>
+            <div className="space-y-3">
+              {incentiveTiers.map((tier, index) => (
+                <div key={index} className="grid grid-cols-12 gap-2 items-end">
+                  <div className="col-span-5">
+                    <label className={`block text-xs font-semibold mb-1 ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Above Profit (৳)</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={tier.amount}
+                      onChange={(e) => handleIncentiveTierChange(index, 'amount', e.target.value)}
+                      className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}
+                      placeholder="Range threshold"
+                    />
+                  </div>
+                  <div className="col-span-5">
+                    <label className={`block text-xs font-semibold mb-1 ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Payout %</label>
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      value={tier.percent}
+                      onChange={(e) => handleIncentiveTierChange(index, 'percent', e.target.value)}
+                      className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}
+                      placeholder="Percent"
+                    />
+                  </div>
+                  <div className="col-span-2 flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveIncentiveTier(index)}
+                      className="p-2 rounded-lg bg-red-600 text-white hover:bg-red-700"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {incentiveTiers.length === 0 && (
+                <div className={`p-3 rounded-lg border ${darkMode ? 'border-slate-700 bg-slate-950' : 'border-slate-200 bg-white'}`}>
+                  <p className={darkMode ? 'text-slate-400' : 'text-slate-500'}>No incentive tiers defined yet.</p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={handleSaveIncentiveConfig}
+              className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700"
+            >
+              Save Incentive Settings
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Holiday Period Management Section */}
@@ -3457,51 +4231,6 @@ function AdminPanel({ currentUser, destinations, darkMode }) {
         </div>
       </div>
 
-      {/* Attendance Sessions Management Section */}
-      <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
-        <div className={`px-6 py-4 border-b flex justify-between items-center ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
-          <h3 className={`font-bold flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
-            <Clock className="h-5 w-5"/> Active Attendance Sessions
-          </h3>
-          <span className={`text-xs px-2 py-1 rounded-full ${darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600'}`}>{activeSessions.length} Active</span>
-        </div>
-        
-        {activeSessions.length === 0 ? (
-          <div className={`p-6 text-center ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-            <p className="text-sm">No active attendance sessions</p>
-          </div>
-        ) : (
-          <>
-            <div className={`p-4 border-b flex gap-2 ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-100 bg-slate-50'}`}>
-              <button
-                onClick={endAllActiveSessions}
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-medium text-sm"
-              >
-                <LogOut className="h-4 w-4"/> End All Sessions
-              </button>
-            </div>
-
-            <div className={`divide-y max-h-80 overflow-y-auto ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-              {activeSessions.map(session => (
-                <div key={session.id} className={`p-4 flex items-center justify-between transition-colors ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`}>
-                  <div className="flex-1">
-                    <p className={`font-medium ${textMain}`}>{session.userName}</p>
-                    <p className={`text-xs ${darkMode ? 'text-slate-500' : 'text-slate-400'}`}>
-                      Login: {formatTimeOnly(session.loginTime)} • Date: {session.date}
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => endSessionForUser(session.id, session.userName)}
-                    className="px-3 py-1.5 bg-red-500 text-white text-sm rounded-lg hover:bg-red-600 transition-colors"
-                  >
-                    End
-                  </button>
-                </div>
-              ))}
-            </div>
-          </>
-        )}
-      </div>
     </div>
   );
 }
@@ -3571,6 +4300,14 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
       return actions_pkg;
     }
     
+    // Pick & Drop workflow - user can mark service as booked, completing that processing flow
+    if (file.fileType === FILE_TYPES.PICK_DROP) {
+      if (file.status === 'PICKUP_DROP_INITIATED') {
+        actions.push({ key: 'PICKUP_DROP_BOOKED', label: STATUS['PICKUP_DROP_BOOKED'].label, isSpecial: true });
+      }
+      return actions;
+    }
+
     // Visa workflow (existing logic)
     // Sales Rep can send to processing
     if (user.role === ROLES.SALES && file.status === 'RECEIVED_SALES') {
@@ -3610,8 +4347,15 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
   const textSub = darkMode ? 'text-slate-400' : 'text-slate-500';
   const statusColor = (darkMode && STATUS[file.status].darkColor) ? STATUS[file.status].darkColor : STATUS[file.status].color;
+  const invoiceSummary = getInvoiceSummary(file);
+  const invoiceBadgeClass = invoiceSummary.paymentStatus === 'Paid'
+    ? (darkMode ? 'bg-green-900/30 text-green-400 border-green-800' : 'bg-green-100 text-green-700 border-green-200')
+    : invoiceSummary.paymentStatus === 'Partially Paid'
+      ? (darkMode ? 'bg-amber-900/30 text-amber-400 border-amber-800' : 'bg-amber-100 text-amber-700 border-amber-200')
+      : (darkMode ? 'bg-blue-900/30 text-blue-400 border-blue-800' : 'bg-blue-100 text-blue-700 border-blue-200');
   const iconColor = statusColor.split(' ')[1] || 'text-slate-600';
   const iconBg = statusColor.split(' ')[0] || 'bg-slate-100';
+  const canViewCosts = user?.role === ROLES.ADMIN;
 
   return (
     <div className={`rounded-xl border overflow-hidden transition-all hover:shadow-md ${cardClass}`}>
@@ -3644,21 +4388,30 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
                     {file.mainPersonPassport && <span className="flex items-center gap-1"><User className="h-3 w-3" /> Passport: {file.mainPersonPassport}</span>}
                     {file.packageCountries && file.packageCountries.length > 0 && <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {file.packageCountries.join(', ')}</span>}
                     {file.packageSalePrice && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold">৳</span> {file.packageSalePrice}</span>}
+                    {canViewCosts && file.packageCostPrice && <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400"><span className="text-sm font-bold">Cost</span> ৳{file.packageCostPrice}</span>}
                   </>
                 ) : file.fileType === FILE_TYPES.AIR_TICKET ? (
                   <>
                     {file.airlineRoute && <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {file.airlineRoute}</span>}
                     {file.airlineSalePrice && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold">৳</span> {file.airlineSalePrice}</span>}
+                    {canViewCosts && file.airlineCostPrice && <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400"><span className="text-sm font-bold">Cost</span> ৳{file.airlineCostPrice}</span>}
                   </>
                 ) : (
                   <>
                     <span className="flex items-center gap-1"><User className="h-3 w-3" /> {file.passportNo}</span>
                     <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {file.destination || 'N/A'}</span>
                     {file.serviceCharge && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold">৳</span> {file.serviceCharge}</span>}
+                    {canViewCosts && file.cost && <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400"><span className="text-sm font-bold">Cost</span> ৳{file.cost}</span>}
                   </>
                 )}
                 <span className="flex items-center gap-1">📞 {file.contactNo}</span>
                 {file.reminderDate && <span className="flex items-center gap-1 text-orange-500"><Clock className="h-3 w-3"/> {formatSimpleDate(file.reminderDate)}</span>}
+                {invoiceSummary.amount > 0 && (
+                  <span className={`text-[10px] sm:text-xs px-2 py-0.5 rounded border flex items-center gap-1 ${invoiceBadgeClass}`}>
+                    <FileText className="h-3 w-3" />
+                    {file.invoiceNo || 'Invoice'} • {invoiceSummary.paymentStatus} • ৳{invoiceSummary.paidAmount}/{invoiceSummary.amount}
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -3862,6 +4615,8 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
     const [assignee, setAssignee] = useState(''); 
     const [reminderDate, setReminderDate] = useState(''); 
     const [cost, setCost] = useState('');
+    const [salesDocsProvided, setSalesDocsProvided] = useState(null);
+    const [processingDocsReceived, setProcessingDocsReceived] = useState(null);
   
     if (!isOpen) return null;
   
@@ -3869,6 +4624,7 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
     const isAcknowledgeProcessing = newStatus === 'ACKNOWLEDGE_PROCESSING';
     const isDone = newStatus === 'DONE';
     const isSubmitted = newStatus === 'SUBMITTED';
+    const isVisaFile = (file?.fileType || FILE_TYPES.VISA) === FILE_TYPES.VISA;
     const isAdminOrProcessor = userRole === ROLES.ADMIN || userRole === ROLES.PROCESSING;
 
     const cardClass = darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900';
@@ -3886,11 +4642,21 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
          alert("Please select a processing agent to assign this file");
          return;
        }
+
+       if (isVisaFile && isSendToProcessing && salesDocsProvided === null) {
+         alert("Please confirm whether the sales rep provided all required documents to processing");
+         return;
+       }
+
+       if (isVisaFile && isAcknowledgeProcessing && processingDocsReceived === null) {
+         alert("Please confirm whether the processing team received all required documents from the sales rep");
+         return;
+       }
        
        if (isSendToProcessing) {
-         onConfirm(note, null, assignee, null, null, false);
+         onConfirm(note, null, assignee, null, null, false, null, { documentsProvidedToProcessing: salesDocsProvided });
        } else if (isAcknowledgeProcessing) {
-         onConfirm(note, null, null, null, null, true);
+         onConfirm(note, null, null, null, null, true, null, { documentsReceivedFromSales: processingDocsReceived });
        } else {
          onConfirm(note, result, assignee, reminderDate, cost, false);
        }
@@ -3948,24 +4714,46 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
 
              {/* Send to Processing - Show only Processing Agents dropdown */}
              {isSendToProcessing && (
-                <div>
-                   <label className="block text-sm font-medium mb-2 opacity-80">Assign to Processing Agent</label>
-                   <div className="relative">
-                      <UserPlus className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
-                      <select
-                         className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
-                         value={assignee}
-                         onChange={(e) => setAssignee(e.target.value)}
-                      >
-                         <option value="">Select Agent</option>
-                         {allUsers.filter(u => u.role === ROLES.PROCESSING).map(u => (
-                            <option key={u.id} value={u.fullName || u.username}>
-                               {u.fullName} ({u.role})
-                            </option>
-                         ))}
-                      </select>
+                <div className="space-y-4">
+                   <div>
+                     <label className="block text-sm font-medium mb-2 opacity-80">Assign to Processing Agent</label>
+                     <div className="relative">
+                        <UserPlus className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                        <select
+                           className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+                           value={assignee}
+                           onChange={(e) => setAssignee(e.target.value)}
+                        >
+                           <option value="">Select Agent</option>
+                           {allUsers.filter(u => u.role === ROLES.PROCESSING).map(u => (
+                              <option key={u.id} value={u.fullName || u.username}>
+                                 {u.fullName} ({u.role})
+                              </option>
+                           ))}
+                        </select>
+                     </div>
                    </div>
+
+                   {isVisaFile && (
+                     <div>
+                       <label className="block text-sm font-medium mb-2 opacity-80">Have all required documents been provided to the processing agent?</label>
+                       <div className="grid grid-cols-2 gap-3">
+                         <button type="button" onClick={() => setSalesDocsProvided(true)} className={`p-2 rounded-lg border ${salesDocsProvided === true ? 'border-emerald-500 bg-emerald-500/10 text-emerald-600' : ''}`}>Yes</button>
+                         <button type="button" onClick={() => setSalesDocsProvided(false)} className={`p-2 rounded-lg border ${salesDocsProvided === false ? 'border-red-500 bg-red-500/10 text-red-600' : ''}`}>No / Docs pending</button>
+                       </div>
+                     </div>
+                   )}
                 </div>
+             )}
+
+             {isAcknowledgeProcessing && isVisaFile && (
+               <div>
+                 <label className="block text-sm font-medium mb-2 opacity-80">Did the processing agent receive all required documents from the sales rep?</label>
+                 <div className="grid grid-cols-2 gap-3">
+                   <button type="button" onClick={() => setProcessingDocsReceived(true)} className={`p-2 rounded-lg border ${processingDocsReceived === true ? 'border-emerald-500 bg-emerald-500/10 text-emerald-600' : ''}`}>Yes, complete</button>
+                   <button type="button" onClick={() => setProcessingDocsReceived(false)} className={`p-2 rounded-lg border ${processingDocsReceived === false ? 'border-red-500 bg-red-500/10 text-red-600' : ''}`}>No / Docs pending</button>
+                 </div>
+               </div>
              )}
 
              {/* Cost Input (Only for Submission & Admin/Processor) */}
@@ -4043,6 +4831,97 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
         </div>
       </div>
     );
+}
+
+function PickDropBookedModal({ isOpen, onClose, onConfirm, file, darkMode }) {
+  const [pickupLocation, setPickupLocation] = useState(file?.pickupLocation || '');
+  const [dropoffLocation, setDropoffLocation] = useState(file?.dropoffLocation || '');
+  const [salePrice, setSalePrice] = useState(file?.salePrice || '');
+  const [costPrice, setCostPrice] = useState(file?.costPrice || '');
+
+  if (!isOpen) return null;
+
+  const cardClass = darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900';
+  const inputClass = darkMode
+    ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500'
+    : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+
+  const handleSubmit = () => {
+    if (!pickupLocation || !dropoffLocation || !salePrice || !costPrice) {
+      alert('Please fill in all Pick & Drop booking details');
+      return;
+    }
+
+    onConfirm({ pickupLocation, dropoffLocation, salePrice, costPrice });
+    setPickupLocation('');
+    setDropoffLocation('');
+    setSalePrice('');
+    setCostPrice('');
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
+        <h3 className="text-lg font-bold mb-2">Pick & Drop Booked</h3>
+        <p className="text-sm text-slate-500 mb-6">Enter booking details for <b>{file?.applicantName}</b></p>
+
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Pickup Location</label>
+            <input
+              type="text"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="e.g., Hotel ABC, Dhaka"
+              value={pickupLocation}
+              onChange={(e) => setPickupLocation(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Dropoff Location</label>
+            <input
+              type="text"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="e.g., Hazrat Shahjalal Airport"
+              value={dropoffLocation}
+              onChange={(e) => setDropoffLocation(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Sale Price - ৳</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="0.00"
+              value={salePrice}
+              onChange={(e) => setSalePrice(e.target.value)}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2 opacity-80">Cost Price - ৳</label>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
+              placeholder="0.00"
+              value={costPrice}
+              onChange={(e) => setCostPrice(e.target.value)}
+            />
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-3 pt-6">
+          <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
+          <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">Save Booking</button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // Air Ticket - BOOKED Status Modal
@@ -5211,9 +6090,11 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
   const [userFilter, setUserFilter] = useState(currentUser.name);
   const [allUsers, setAllUsers] = useState([]);
   const [attendanceData, setAttendanceData] = useState([]);
+  const [incentiveSettings, setIncentiveSettings] = useState([]);
   const [customReportOpen, setCustomReportOpen] = useState(false);
   const [customStartDate, setCustomStartDate] = useState('');
   const [customEndDate, setCustomEndDate] = useState('');
+  const [kpiNow, setKpiNow] = useState(null);
 
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-lg';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
@@ -5221,6 +6102,16 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
   const inputClass = darkMode 
     ? 'bg-slate-950 border-slate-700 text-slate-100' 
     : 'bg-white border-slate-200 text-slate-900';
+
+  useEffect(() => {
+    const updateClock = () => setKpiNow(Date.now());
+    const initialTimer = setTimeout(updateClock, 0);
+    const timer = setInterval(updateClock, 60_000);
+    return () => {
+      clearTimeout(initialTimer);
+      clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     const q = collection(db, 'artifacts', appId, 'public', 'data', 'agency_users');
@@ -5235,9 +6126,19 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
        setAttendanceData(att);
     });
 
+    const incentiveRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'incentives');
+    const unsubscribeIncentives = onSnapshot(incentiveRef, (snapshot) => {
+      if (snapshot.exists()) {
+        setIncentiveSettings(snapshot.data().users || []);
+      } else {
+        setIncentiveSettings([]);
+      }
+    });
+
     return () => {
         unsubscribeUsers();
         unsubscribeAtt();
+        unsubscribeIncentives();
     };
   }, []);
 
@@ -5276,7 +6177,11 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
       finances: {
         revenue: 0,
         cost: 0,
-        profit: 0
+        profit: 0,
+        totalDue: 0,
+        unpaidCount: 0,
+        partiallyPaidCount: 0,
+        paidCount: 0
       },
       notes: [],
       attendance: []
@@ -5310,6 +6215,17 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
            reportData.finances.revenue += Number(file.serviceCharge || 0);
            reportData.finances.cost += Number(file.cost || 0);
          }
+
+        // Invoice due calculations
+        try {
+          const inv = getInvoiceSummary(file);
+          reportData.finances.totalDue += Number(inv.dueAmount || 0);
+          if (inv.paymentStatus === 'Paid') reportData.finances.paidCount++;
+          else if (inv.paymentStatus === 'Partially Paid') reportData.finances.partiallyPaidCount++;
+          else reportData.finances.unpaidCount++;
+        } catch (e) {
+          // ignore malformed invoice data
+        }
       }
 
       // New Deals count: based on createdBy field (which sales rep created the file)
@@ -5381,10 +6297,93 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
         if (!aDate) return false;
         
         return (userFilter === 'ALL' || a.userName === userFilter) && aDate >= start && aDate <= end;
-    }).sort((a,b) => b.firstLoginTime?.seconds - a.firstLoginTime?.seconds); 
+    }).sort((a,b) => b.firstLoginTime?.seconds - a.firstLoginTime?.seconds);
+
+    const userStats = allUsers.reduce((acc, user) => {
+      acc[user.name] = {
+        name: user.name,
+        role: user.role,
+        filesCreated: 0,
+        actions: 0,
+        invoices: 0,
+        complianceTotal: 0,
+        complianceCount: 0,
+        incompleteFiles: 0,
+      };
+      return acc;
+    }, {});
+
+    files.forEach(file => {
+      const fileCreator = file.createdBy || 'Unknown';
+      const compliance = getFileComplianceInfo(file);
+      if (!userStats[fileCreator]) {
+        userStats[fileCreator] = {
+          name: fileCreator,
+          role: 'Unknown',
+          filesCreated: 0,
+          actions: 0,
+          invoices: 0,
+          complianceTotal: 0,
+          complianceCount: 0,
+          incompleteFiles: 0,
+        };
+      }
+
+      userStats[fileCreator].filesCreated += 1;
+      userStats[fileCreator].complianceTotal += compliance.score;
+      userStats[fileCreator].complianceCount += 1;
+      if (compliance.missing.length > 0) {
+        userStats[fileCreator].incompleteFiles += 1;
+        reportData.missingFiles = reportData.missingFiles || [];
+        reportData.missingFiles.push({ file, missing: compliance.missing });
+      }
+      if (file.invoiceNo) {
+        userStats[fileCreator].invoices += 1;
+      }
+    });
+
+    files.forEach(file => {
+      if (file.history && Array.isArray(file.history)) {
+        file.history.forEach(entry => {
+          if (!entry || !entry.timestamp) return;
+          const entryTime = new Date(entry.timestamp);
+          if (entryTime >= start && entryTime <= end) {
+            const performer = entry.performedBy || 'Unknown';
+            if (!userStats[performer]) {
+              userStats[performer] = {
+                name: performer,
+                role: 'Unknown',
+                filesCreated: 0,
+                actions: 0,
+                invoices: 0,
+                complianceTotal: 0,
+                complianceCount: 0,
+                incompleteFiles: 0,
+              };
+            }
+            userStats[performer].actions += 1;
+          }
+        });
+      }
+    });
+
+    const userUsage = Object.values(userStats).map(user => ({
+      ...user,
+      complianceScore: user.complianceCount ? Math.round((user.complianceTotal / user.complianceCount) * 100) : 100,
+      invoiceCompletion: user.filesCreated ? Math.round((user.invoices / user.filesCreated) * 100) : 0,
+    })).sort((a, b) => b.actions - a.actions);
+
+    reportData.userUsage = userUsage;
+    reportData.missingFiles = reportData.missingFiles || [];
+    reportData.missingInvoiceCount = reportData.missingFiles.filter(item => !item.file.invoiceNo).length;
+    reportData.inactiveUsers = userUsage.filter(u => u.filesCreated === 0 && u.actions === 0);
 
     return reportData;
-  }, [files, attendanceData, timeRange, userFilter, customStartDate, customEndDate]);
+  }, [files, attendanceData, timeRange, userFilter, customStartDate, customEndDate, allUsers]);
+
+  const incentiveConfigMap = useMemo(() => {
+    return new Map((incentiveSettings || []).map(item => [item.name, item]));
+  }, [incentiveSettings]);
 
   // Calculate profit by sales rep
   const profitBySalesRep = useMemo(() => {
@@ -5435,9 +6434,151 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
 
     // Calculate profit and sort by profit descending
     return Object.values(repData)
-      .map(rep => ({ ...rep, profit: rep.revenue - rep.cost }))
+      .map(rep => {
+        const profit = rep.revenue - rep.cost;
+        const config = incentiveConfigMap.get(rep.name);
+        return {
+          ...rep,
+          profit,
+          incentiveTarget: config?.target || 0,
+          incentive: calculateIncentive(profit, config)
+        };
+      })
       .sort((a, b) => b.profit - a.profit);
-  }, [files, timeRange, customStartDate, customEndDate]);
+  }, [files, timeRange, customStartDate, customEndDate, allUsers, incentiveConfigMap]);
+
+  const roleKpis = useMemo(() => {
+    const start = getStartOf(timeRange, customStartDate ? new Date(customStartDate) : null);
+    const end = getEndOf(timeRange, customEndDate ? new Date(customEndDate) : null);
+    if (!start || !end || Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      return { sales: [], processing: [] };
+    }
+
+    const roleUsers = allUsers.filter(user =>
+      [ROLES.SALES, ROLES.PROCESSING].includes(user.role) &&
+      (currentUser.role === ROLES.ADMIN
+        ? userFilter === 'ALL' || user.name === userFilter
+        : user.name === currentUser.name)
+    );
+    if (![ROLES.SALES, ROLES.PROCESSING].includes(currentUser.role) &&
+        currentUser.role !== ROLES.ADMIN && !roleUsers.some(user => user.name === currentUser.name)) {
+      return { sales: [], processing: [] };
+    }
+    if (currentUser.role !== ROLES.ADMIN &&
+        [ROLES.SALES, ROLES.PROCESSING].includes(currentUser.role) &&
+        !roleUsers.some(user => user.name === currentUser.name)) {
+      roleUsers.push({ name: currentUser.name, role: currentUser.role });
+    }
+
+    const metrics = new Map(roleUsers.map(user => [user.name, {
+      name: user.name,
+      role: user.role,
+      files: 0,
+      followUps: 0,
+      revenue: 0,
+      cost: 0,
+      completenessTotal: 0,
+      completenessCount: 0,
+      activeAssigned: 0,
+      statusActions: 0,
+      submitted: 0,
+      completed: 0,
+      approved: 0,
+      rejected: 0,
+      currentStatusDaysTotal: 0,
+      currentStatusDaysCount: 0
+    }]));
+    files.forEach(file => {
+      const createdAt = getTimestampDate(file.createdAt);
+      const creator = metrics.get(file.createdBy);
+      if (creator?.role === ROLES.SALES && createdAt && createdAt >= start && createdAt <= end && file.isNewSale !== false) {
+        creator.files++;
+        const compliance = getFileComplianceInfo(file);
+        creator.completenessTotal += compliance.score;
+        creator.completenessCount++;
+        if (file.fileType === FILE_TYPES.VISA) {
+          creator.revenue += Number(file.serviceCharge) || 0;
+          creator.cost += Number(file.cost) || 0;
+        } else if (file.fileType === FILE_TYPES.AIR_TICKET) {
+          creator.revenue += Number(file.airlineSalePrice) || 0;
+          creator.cost += Number(file.airlineCostPrice) || 0;
+        } else if (file.fileType === FILE_TYPES.PACKAGE) {
+          creator.revenue += Number(file.packageSalePrice) || 0;
+          creator.cost += Number(file.packageCostPrice) || 0;
+        } else if (file.fileType === FILE_TYPES.PICK_DROP) {
+          creator.revenue += Number(file.salePrice) || 0;
+          creator.cost += Number(file.costPrice) || 0;
+        }
+      }
+
+      const assignee = metrics.get(file.assignedTo);
+      if (assignee?.role === ROLES.PROCESSING && file.status &&
+          (file.fileType === FILE_TYPES.VISA
+            ? file.status !== 'DONE'
+            : !isFileCompleted(file))) {
+        assignee.activeAssigned++;
+        let statusDate = getTimestampDate(file.statusChangedAt);
+        if (!statusDate) {
+          const matchingStatusEvents = (file.history || [])
+            .filter(entry =>
+              entry.status === file.status &&
+              !entry.action?.startsWith('Note Added:') &&
+              !entry.action?.startsWith('Sales Rep changed')
+            )
+            .map(entry => getTimestampDate(entry.timestamp))
+            .filter(Boolean)
+            .sort((a, b) => b.getTime() - a.getTime());
+          statusDate = matchingStatusEvents[0] || createdAt;
+        }
+        if (statusDate && kpiNow !== null) {
+          assignee.currentStatusDaysTotal += Math.max(0, kpiNow - statusDate.getTime()) / 86_400_000;
+          assignee.currentStatusDaysCount++;
+        }
+      }
+
+      (file.history || []).forEach(entry => {
+        const performedAt = getTimestampDate(entry.timestamp);
+        if (!performedAt || performedAt < start || performedAt > end || !entry.status ||
+            entry.action?.startsWith('Note Added:') ||
+            entry.action?.startsWith('Sales Rep changed')) return;
+
+        const performer = metrics.get(entry.performedBy);
+        if (!performer) return;
+        if (performer.role === ROLES.SALES) {
+          if (['FOLLOW_UP', 'DOCS_PENDING'].includes(entry.status)) performer.followUps++;
+          return;
+        }
+
+        performer.statusActions++;
+        if (entry.status === 'SUBMITTED') performer.submitted++;
+        if (
+          (file.fileType === FILE_TYPES.VISA && entry.status === 'DONE') ||
+          (file.fileType === FILE_TYPES.AIR_TICKET && entry.status === 'ISSUED') ||
+          (file.fileType === FILE_TYPES.PACKAGE && entry.status === 'PACKAGE_READY') ||
+          (file.fileType === FILE_TYPES.PICK_DROP && entry.status === 'PICKUP_DROP_COMPLETED')
+        ) performer.completed++;
+        if (entry.status === 'DONE' && entry.result === 'APPROVED') performer.approved++;
+        if (entry.status === 'DONE' && entry.result === 'REJECTED') performer.rejected++;
+      });
+    });
+
+    const rows = Array.from(metrics.values()).map(user => ({
+      ...user,
+      profit: user.revenue - user.cost,
+      completeness: user.completenessCount
+        ? Math.round((user.completenessTotal / user.completenessCount) * 100)
+        : 0,
+      averageStatusDays: user.currentStatusDaysCount
+        ? user.currentStatusDaysTotal / user.currentStatusDaysCount
+        : 0
+    }));
+    return {
+      sales: rows.filter(user => user.role === ROLES.SALES).sort((a, b) => a.name.localeCompare(b.name)),
+      processing: rows.filter(user => user.role === ROLES.PROCESSING).sort((a, b) => a.name.localeCompare(b.name))
+    };
+  }, [files, timeRange, customStartDate, customEndDate, allUsers, currentUser, userFilter, kpiNow]);
+
+  
 
   const handlePrint = () => {
     window.print();
@@ -5523,6 +6664,8 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
              </div>
            )}
 
+          
+
            <button 
              onClick={handlePrint}
              className="flex items-center gap-2 px-4 py-2 bg-slate-800 text-white rounded-lg hover:bg-slate-900"
@@ -5550,123 +6693,7 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
           <hr className="my-4"/>
         </div>
 
-        {/* Financial Overview (Admins Only) */}
-        {currentUser.role === ROLES.ADMIN && (
-            <div className="grid grid-cols-3 gap-4 mb-8">
-                <div className={`p-4 rounded-xl border ${darkMode ? 'bg-emerald-900/20 border-emerald-800' : 'bg-emerald-50 border-emerald-100'}`}>
-                    <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-emerald-400' : 'text-emerald-800'}`}>Total Revenue</p>
-                    <p className={`text-2xl font-bold ${darkMode ? 'text-emerald-200' : 'text-emerald-900'}`}>{formatCurrency(stats.finances.revenue)}</p>
-                </div>
-                <div className={`p-4 rounded-xl border ${darkMode ? 'bg-red-900/20 border-red-800' : 'bg-red-50 border-red-100'}`}>
-                    <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-red-400' : 'text-red-800'}`}>Total Cost</p>
-                    <p className={`text-2xl font-bold ${darkMode ? 'text-red-200' : 'text-red-900'}`}>{formatCurrency(stats.finances.cost)}</p>
-                </div>
-                <div className={`p-4 rounded-xl border ${darkMode ? 'bg-blue-900/20 border-blue-800' : 'bg-blue-50 border-blue-100'}`}>
-                    <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-blue-400' : 'text-blue-800'}`}>Net Profit</p>
-                    <p className={`text-2xl font-bold ${darkMode ? 'text-blue-200' : 'text-blue-900'}`}>{formatCurrency(stats.finances.profit)}</p>
-                </div>
-            </div>
-        )}
-
-        {/* Working Hours Summary */}
-        {stats.attendance.length > 0 && (
-          <div className="mb-8 grid grid-cols-1 md:grid-cols-4 gap-4">
-            {(() => {
-              let totalHours = 0, totalShift = 0, totalOvertime = 0, daysWorked = 0;
-              const uniqueDays = new Set(); // Track unique days worked
-              
-              stats.attendance.forEach(att => {
-                if (att.logoutTime) {
-                  // Extract date from loginTime (YYYY-MM-DD format for unique day tracking)
-                  const loginDate = att.loginTime?.toDate ? att.loginTime.toDate() : new Date(att.loginTime?.seconds * 1000);
-                  const dateKey = `${loginDate.getFullYear()}-${loginDate.getMonth()}-${loginDate.getDate()}`;
-                  uniqueDays.add(dateKey); // Add to set to track unique days
-                  
-                  const workHours = calculateWorkingHours(att.loginTime, att.logoutTime);
-                  totalHours += workHours.hours;
-                  totalShift += workHours.shift;
-                  totalOvertime += workHours.overtime;
-                }
-              });
-              
-              daysWorked = uniqueDays.size; // Count unique days only
-              
-              return (
-                <>
-                  <div className={`p-5 rounded-xl border ${darkMode ? 'bg-blue-900/20 border-blue-800' : 'bg-blue-50 border-blue-100'}`}>
-                    <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-blue-400' : 'text-blue-700'}`}>Days Worked</p>
-                    <p className={`text-2xl font-bold ${darkMode ? 'text-blue-300' : 'text-blue-900'}`}>{daysWorked}</p>
-                  </div>
-                  
-                  <div className={`p-5 rounded-xl border ${darkMode ? 'bg-green-900/20 border-green-800' : 'bg-green-50 border-green-100'}`}>
-                    <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-green-400' : 'text-green-700'}`}>Total Hours</p>
-                    <p className={`text-2xl font-bold ${darkMode ? 'text-green-300' : 'text-green-900'}`}>{formatHours(totalHours)}</p>
-                  </div>
-                  
-                  <div className={`p-5 rounded-xl border ${darkMode ? 'bg-indigo-900/20 border-indigo-800' : 'bg-indigo-50 border-indigo-100'}`}>
-                    <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-indigo-400' : 'text-indigo-700'}`}>Shift Hours</p>
-                    <p className={`text-2xl font-bold ${darkMode ? 'text-indigo-300' : 'text-indigo-900'}`}>{formatHours(totalShift)}</p>
-                  </div>
-                  
-                  <div className={`p-5 rounded-xl border ${totalOvertime > 0 ? (darkMode ? 'bg-orange-900/20 border-orange-800' : 'bg-orange-50 border-orange-100') : (darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-100 border-slate-200')}`}>
-                    <p className={`text-xs font-semibold uppercase mb-1 ${totalOvertime > 0 ? (darkMode ? 'text-orange-400' : 'text-orange-700') : 'text-slate-500'}`}>Overtime</p>
-                    <p className={`text-2xl font-bold ${totalOvertime > 0 ? (darkMode ? 'text-orange-300' : 'text-orange-900') : (darkMode ? 'text-slate-400' : 'text-slate-500')}`}>{formatHours(totalOvertime)}</p>
-                  </div>
-                </>
-              );
-            })()}
-          </div>
-        )}
-
-        <div className={`mb-8 p-6 rounded-xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
-            <h3 className={`text-lg font-bold mb-4 flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
-                <Timer className="h-5 w-5 text-blue-500"/> Attendance Log
-            </h3>
-            {stats.attendance.length === 0 ? (
-                <p className={`text-sm ${textSub}`}>No attendance records found for this period.</p>
-            ) : (
-                <div className="overflow-x-auto">
-                    <table className="w-full text-sm text-left">
-                        <thead className={`text-xs uppercase ${darkMode ? 'text-slate-400 bg-slate-800' : 'text-slate-500 bg-slate-100'}`}>
-                            <tr>
-                                <th className="px-4 py-3 rounded-l-lg">Date</th>
-                                {userFilter === 'ALL' && <th className="px-4 py-3">Employee</th>}
-                                <th className="px-4 py-3">Login Time</th>
-                                <th className="px-4 py-3">Logout Time</th>
-                                <th className="px-4 py-3">Total Hours</th>
-                                <th className="px-4 py-3">Shift (8h)</th>
-                                <th className="px-4 py-3">Overtime</th>
-                                <th className="px-4 py-3 rounded-r-lg">Status</th>
-                            </tr>
-                        </thead>
-                        <tbody className={textMain}>
-                            {stats.attendance.map((att) => {
-                              const workHours = calculateWorkingHours(att.firstLoginTime, att.lastLogoutTime);
-                              const todayDate = getDhakaTodayString();
-                              const isToday = att.date === todayDate;
-                              const isActive = isToday && !att.lastLogoutTime;
-                              return (
-                                <tr key={att.id} className={`border-b ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
-                                    <td className="px-4 py-3 font-medium">{att.date}</td>
-                                    {userFilter === 'ALL' && <td className="px-4 py-3 font-medium">{att.userName}</td>}
-                                    <td className="px-4 py-3 text-green-600 font-mono">{formatTimeOnly(att.firstLoginTime)}</td>
-                                    <td className="px-4 py-3 text-red-500 font-mono">{att.lastLogoutTime ? formatTimeOnly(att.lastLogoutTime) : '-'}</td>
-                                    <td className="px-4 py-3 font-mono font-medium">{formatHours(workHours.hours)}</td>
-                                    <td className={`px-4 py-3 font-mono font-medium ${darkMode ? 'text-blue-400' : 'text-blue-700'}`}>{formatHours(workHours.shift)}</td>
-                                    <td className={`px-4 py-3 font-mono font-medium ${workHours.overtime > 0 ? (darkMode ? 'text-orange-400' : 'text-orange-700') : 'text-slate-400'}`}>{formatHours(workHours.overtime)}</td>
-                                    <td className="px-4 py-3">
-                                        <span className={`px-2 py-1 rounded-full text-xs ${isActive ? 'bg-green-100 text-green-700' : (darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600')}`}>
-                                            {isActive ? 'Active' : 'Completed'}
-                                        </span>
-                                    </td>
-                                </tr>
-                              );
-                            })}
-                        </tbody>
-                    </table>
-                </div>
-            )}
-        </div>
+        
 
         <div className="grid grid-cols-2 gap-6 mb-8">
           
@@ -5730,32 +6757,177 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
           )}
         </div>
 
-        {isAdmin && profitBySalesRep.length > 0 && (
+        {(roleKpis.sales.length > 0 || roleKpis.processing.length > 0) && (
+          <section className={`mb-8 rounded-xl border p-6 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+            <div className="mb-5">
+              <h3 className={`text-lg font-bold ${textMain}`}>Role KPI Scorecard</h3>
+              <p className={`mt-1 text-sm ${textSub}`}>
+                Metrics for the selected period. No targets or composite score are applied.
+                Current workload and status age reflect assignments now.
+              </p>
+            </div>
+
+            {roleKpis.sales.length > 0 && (
+              <div className="mb-6">
+                <h4 className={`mb-3 font-semibold ${textMain}`}>Sales</h4>
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[760px] text-sm text-left">
+                    <thead className={`text-xs uppercase ${darkMode ? 'bg-slate-800 text-slate-400' : 'bg-white text-slate-500'}`}>
+                      <tr>
+                        <th className="px-3 py-2">Sales User</th>
+                        <th className="px-3 py-2 text-right">Files / Deals</th>
+                        <th className="px-3 py-2 text-right">Client Follow-ups</th>
+                        <th className="px-3 py-2 text-right">Revenue</th>
+                        <th className="px-3 py-2 text-right">Profit</th>
+                        <th className="px-3 py-2 text-right">Avg. Completeness</th>
+                      </tr>
+                    </thead>
+                    <tbody className={textMain}>
+                      {roleKpis.sales.map(user => (
+                        <tr key={user.name} className={`border-t ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+                          <td className="px-3 py-3 font-medium">{user.name}</td>
+                          <td className="px-3 py-3 text-right">{user.files}</td>
+                          <td className="px-3 py-3 text-right">{user.followUps}</td>
+                          <td className="px-3 py-3 text-right font-mono">৳{user.revenue.toFixed(2)}</td>
+                          <td className={`px-3 py-3 text-right font-mono ${user.profit < 0 ? 'text-red-500' : ''}`}>৳{user.profit.toFixed(2)}</td>
+                          <td className="px-3 py-3 text-right">{user.completeness}%</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {roleKpis.processing.length > 0 && (
+              <div>
+                <h4 className={`mb-3 font-semibold ${textMain}`}>Processing</h4>
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[860px] text-sm text-left">
+                    <thead className={`text-xs uppercase ${darkMode ? 'bg-slate-800 text-slate-400' : 'bg-white text-slate-500'}`}>
+                      <tr>
+                        <th className="px-3 py-2">Processing User</th>
+                        <th className="px-3 py-2 text-right">Active Assigned</th>
+                        <th className="px-3 py-2 text-right">Status Changes</th>
+                        <th className="px-3 py-2 text-right">Submitted</th>
+                        <th className="px-3 py-2 text-right">Completed</th>
+                        <th className="px-3 py-2 text-right">Approved</th>
+                        <th className="px-3 py-2 text-right">Rejected</th>
+                        <th className="px-3 py-2 text-right">Avg. Current Status Age</th>
+                      </tr>
+                    </thead>
+                    <tbody className={textMain}>
+                      {roleKpis.processing.map(user => (
+                        <tr key={user.name} className={`border-t ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+                          <td className="px-3 py-3 font-medium">{user.name}</td>
+                          <td className="px-3 py-3 text-right">{user.activeAssigned}</td>
+                          <td className="px-3 py-3 text-right">{user.statusActions}</td>
+                          <td className="px-3 py-3 text-right">{user.submitted}</td>
+                          <td className="px-3 py-3 text-right">{user.completed}</td>
+                          <td className="px-3 py-3 text-right">{user.approved}</td>
+                          <td className="px-3 py-3 text-right">{user.rejected}</td>
+                          <td className="px-3 py-3 text-right">
+                            {user.currentStatusDaysCount ? `${user.averageStatusDays.toFixed(1)} days` : '-'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
+        {isAdmin && (
           <div className={`mb-8 p-6 rounded-xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
-            <h3 className={`text-lg font-bold mb-4 flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
-              <TrendingUp className="h-5 w-5 text-green-500"/> Profit by Sales Rep
+            <h3 className={`text-lg font-bold mb-2 flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
+              <Sparkles className="h-5 w-5 text-sky-500"/> Incentive Tracker & Profit Summary
             </h3>
+            <p className={`text-sm mb-4 ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+              Track sales rep profit versus configured incentive targets and see payable incentive amounts for this reporting period.
+            </p>
+            {profitBySalesRep.length === 0 ? (
+              <div className={`rounded-xl border p-4 ${darkMode ? 'bg-slate-950 border-slate-800' : 'bg-white border-slate-200'}`}>
+                <p className={`text-sm ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>
+                  No sales incentive data available for the selected period. Please confirm sales files are attributed to reps and incentive settings are configured.
+                </p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm text-left">
+                  <thead className={`text-xs uppercase ${darkMode ? 'text-slate-400 bg-slate-800' : 'text-slate-500 bg-slate-100'}`}>
+                    <tr>
+                      <th className="px-4 py-3 rounded-l-lg">Sales Rep</th>
+                      <th className="px-4 py-3 text-right">Files</th>
+                      <th className="px-4 py-3 text-right">Revenue</th>
+                      <th className="px-4 py-3 text-right">Cost</th>
+                      <th className="px-4 py-3 text-right">Target</th>
+                      <th className="px-4 py-3 text-right">Profit</th>
+                      <th className="px-4 py-3 rounded-r-lg text-right">Incentive</th>
+                    </tr>
+                  </thead>
+                  <tbody className={textMain}>
+                    {profitBySalesRep.map((rep) => (
+                      <tr key={rep.name} className={`border-b ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+                        <td className="px-4 py-3 font-medium">{rep.name}</td>
+                        <td className="px-4 py-3 text-right font-medium">{rep.files}</td>
+                        <td className="px-4 py-3 text-right text-green-600 font-mono">৳{rep.revenue.toFixed(2)}</td>
+                        <td className="px-4 py-3 text-right text-red-500 font-mono">৳{rep.cost.toFixed(2)}</td>
+                        <td className="px-4 py-3 text-right font-medium font-mono">৳{rep.incentiveTarget.toFixed(2)}</td>
+                        <td className={`px-4 py-3 text-right font-bold font-mono ${rep.profit >= 0 ? (darkMode ? 'text-emerald-400' : 'text-emerald-700') : (darkMode ? 'text-red-400' : 'text-red-700')}`}>
+                          ৳{rep.profit.toFixed(2)}
+                        </td>
+                        <td className={`px-4 py-3 text-right font-bold font-mono ${rep.incentive > 0 ? (darkMode ? 'text-blue-300' : 'text-blue-700') : (darkMode ? 'text-slate-500' : 'text-slate-600')}`}>
+                          ৳{rep.incentive.toFixed(2)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+
+        {isAdmin && stats.userUsage.length > 0 && (
+          <div className={`mb-8 p-6 rounded-xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+            <h3 className={`text-lg font-bold mb-4 flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}><Users className="h-5 w-5 text-indigo-500"/> Usage & Compliance</h3>
+            <div className="grid grid-cols-3 gap-4 mb-4">
+              <div className={`p-4 rounded-xl border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+                <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Active Staff</p>
+                <p className={`text-2xl font-bold ${darkMode ? 'text-slate-100' : 'text-slate-900'}`}>{stats.userUsage.filter(u => u.actions > 0 || u.filesCreated > 0).length}</p>
+              </div>
+              <div className={`p-4 rounded-xl border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+                <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Incomplete Files</p>
+                <p className={`text-2xl font-bold ${darkMode ? 'text-slate-100' : 'text-slate-900'}`}>{stats.missingFiles.length}</p>
+              </div>
+              <div className={`p-4 rounded-xl border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+                <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Missing Invoices</p>
+                <p className={`text-2xl font-bold ${darkMode ? 'text-slate-100' : 'text-slate-900'}`}>{stats.missingInvoiceCount}</p>
+              </div>
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
                 <thead className={`text-xs uppercase ${darkMode ? 'text-slate-400 bg-slate-800' : 'text-slate-500 bg-slate-100'}`}>
                   <tr>
-                    <th className="px-4 py-3 rounded-l-lg">Sales Rep</th>
-                    <th className="px-4 py-3 text-right">Files</th>
-                    <th className="px-4 py-3 text-right">Revenue</th>
-                    <th className="px-4 py-3 text-right">Cost</th>
-                    <th className="px-4 py-3 rounded-r-lg text-right">Profit</th>
+                    <th className="px-4 py-3 rounded-l-lg">Employee</th>
+                    <th className="px-4 py-3 text-right">Files Created</th>
+                    <th className="px-4 py-3 text-right">Actions</th>
+                    <th className="px-4 py-3 text-right">Compliance</th>
+                    <th className="px-4 py-3 text-right">Invoice Rate</th>
+                    <th className="px-4 py-3 rounded-r-lg text-right">Incomplete Files</th>
                   </tr>
                 </thead>
                 <tbody className={textMain}>
-                  {profitBySalesRep.map((rep) => (
-                    <tr key={rep.name} className={`border-b ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
-                      <td className="px-4 py-3 font-medium">{rep.name}</td>
-                      <td className="px-4 py-3 text-right font-medium">{rep.files}</td>
-                      <td className="px-4 py-3 text-right text-green-600 font-mono">৳{rep.revenue.toFixed(2)}</td>
-                      <td className="px-4 py-3 text-right text-red-500 font-mono">৳{rep.cost.toFixed(2)}</td>
-                      <td className={`px-4 py-3 text-right font-bold font-mono ${rep.profit >= 0 ? (darkMode ? 'text-emerald-400' : 'text-emerald-700') : (darkMode ? 'text-red-400' : 'text-red-700')}`}>
-                        ৳{rep.profit.toFixed(2)}
-                      </td>
+                  {stats.userUsage.map(user => (
+                    <tr key={user.name} className={`border-b ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+                      <td className="px-4 py-3 font-medium">{user.name}</td>
+                      <td className="px-4 py-3 text-right">{user.filesCreated}</td>
+                      <td className="px-4 py-3 text-right">{user.actions}</td>
+                      <td className="px-4 py-3 text-right">{user.complianceScore}%</td>
+                      <td className="px-4 py-3 text-right">{user.invoiceCompletion}%</td>
+                      <td className="px-4 py-3 text-right">{user.incompleteFiles}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -6414,9 +7586,10 @@ function LoginScreen({ onLogin, darkMode, toggleDarkMode }) {
 }
 
 // Invoice Modal Component
-function InvoiceModal({ isOpen, onClose, file, darkMode, onGenerateInvoice }) {
+function InvoiceModal({ isOpen, onClose, file, paymentMethods = [], cashPaymentNotificationEmails = [], darkMode, onGenerateInvoice }) {
   const [paymentStatus, setPaymentStatus] = useState('Unpaid');
   const [paidAmount, setPaidAmount] = useState('');
+  const [paymentMethodId, setPaymentMethodId] = useState('');
   const [showPaidAmountInput, setShowPaidAmountInput] = useState(false);
 
   if (!isOpen || !file) return null;
@@ -6427,22 +7600,36 @@ function InvoiceModal({ isOpen, onClose, file, darkMode, onGenerateInvoice }) {
   };
 
   const handleGenerateInvoice = async () => {
+    const requestedAmount = paymentStatus === 'Paid'
+      ? invoiceAmount
+      : paymentStatus === 'Partially Paid'
+        ? Math.min(Number(paidAmount) || 0, invoiceAmount)
+        : 0;
+    if (requestedAmount > getInvoiceSummary(file).paidAmount && !paymentMethodId) {
+      alert('Select a payment method for the payment.');
+      return;
+    }
+    let saved;
     if (paymentStatus === 'Partially Paid') {
-      if (!paidAmount || parseFloat(paidAmount) < 0) {
+      if (!paidAmount || !Number.isFinite(Number(paidAmount)) || Number(paidAmount) < 0) {
         alert('Please enter a valid paid amount');
         return;
       }
-      await onGenerateInvoice(file, paymentStatus, paidAmount);
+      saved = await onGenerateInvoice(file, paymentStatus, paidAmount, paymentMethodId);
     } else {
-      await onGenerateInvoice(file, paymentStatus);
+      saved = await onGenerateInvoice(file, paymentStatus, null, paymentMethodId);
     }
-    onClose();
+    if (saved) onClose();
   };
 
   const bgClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
   const textSub = darkMode ? 'text-slate-400' : 'text-slate-500';
   const inputClass = darkMode ? 'bg-slate-950 border-slate-700 text-slate-100' : 'bg-white border-slate-300 text-slate-900';
+  const invoiceAmount = getInvoiceAmount(file) || 0;
+  const requestedPaidAmount = paymentStatus === 'Paid' ? invoiceAmount : paymentStatus === 'Partially Paid' ? Number(paidAmount) || 0 : 0;
+  const recordsNewPayment = requestedPaidAmount > getInvoiceSummary(file).paidAmount;
+  const selectedMethod = paymentMethods.find(method => method.id === paymentMethodId);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
@@ -6468,7 +7655,7 @@ function InvoiceModal({ isOpen, onClose, file, darkMode, onGenerateInvoice }) {
           {/* Amount */}
           <div>
             <p className={`text-sm font-semibold ${textSub} uppercase tracking-wider mb-2`}>Service Charge</p>
-            <p className={`text-2xl font-bold text-green-600`}>৳{(parseFloat(file.serviceCharge) || 0).toFixed(2)}</p>
+            <p className={`text-2xl font-bold text-green-600`}>৳{invoiceAmount.toFixed(2)}</p>
           </div>
 
           {/* Payment Status */}
@@ -6509,6 +7696,17 @@ function InvoiceModal({ isOpen, onClose, file, darkMode, onGenerateInvoice }) {
               />
             </div>
           )}
+          {recordsNewPayment && (
+            <div>
+              <label className={`block text-sm font-semibold ${textSub} uppercase tracking-wider mb-2`}>Payment Method / Account</label>
+              <select value={paymentMethodId} onChange={e => setPaymentMethodId(e.target.value)} className={`w-full px-3 py-2 rounded-lg border ${inputClass}`} required>
+                <option value="">Select payment method</option>
+                {paymentMethods.map(method => <option key={method.id} value={method.id}>{[method.name, method.institution, method.accountNumber].filter(Boolean).join(' — ')}</option>)}
+              </select>
+              {paymentMethods.length === 0 && <p className="text-xs text-red-500 mt-1">An admin must configure a payment method before recording a payment.</p>}
+              {isCashPaymentMethod(selectedMethod) && cashPaymentNotificationEmails.length === 0 && <p className="text-xs text-amber-600 mt-1">No cash payment notification email recipients are configured.</p>}
+            </div>
+          )}
         </div>
 
         {/* Footer */}
@@ -6536,7 +7734,7 @@ function InvoiceModal({ isOpen, onClose, file, darkMode, onGenerateInvoice }) {
   );
 }
 
-function AccountingPanel({ currentUser, files, miscCosts, onAddMiscCost, onDeleteMiscCost, darkMode, isAdmin }) {
+function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], cashPaymentNotificationEmails = [], onAddMiscCost, onDeleteMiscCost, darkMode, isAdmin }) {
   const [newMiscCost, setNewMiscCost] = useState({
     description: '',
     amount: '',
@@ -6545,6 +7743,54 @@ function AccountingPanel({ currentUser, files, miscCosts, onAddMiscCost, onDelet
     notes: ''
   });
 
+  const today = new Date();
+  const [reportMonth, setReportMonth] = useState(today.getMonth() + 1);
+  const [reportYear, setReportYear] = useState(today.getFullYear());
+  const [reportType, setReportType] = useState('monthly'); // 'monthly' or 'yearly'
+
+  // Invoice / Accounting quick-search state (moved from Reports)
+  const [invoiceSearchTerm, setInvoiceSearchTerm] = useState('');
+  const [invoiceSearchResult, setInvoiceSearchResult] = useState(null);
+  const [invoiceSearchLoading, setInvoiceSearchLoading] = useState(false);
+  const [invoiceSearchError, setInvoiceSearchError] = useState('');
+  const [invoiceModalOpen, setInvoiceModalOpen] = useState(false);
+  const [selectedInvoice, setSelectedInvoice] = useState(null);
+  const [paymentAmount, setPaymentAmount] = useState('');
+  const [paymentNote, setPaymentNote] = useState('');
+  const [paymentMethodId, setPaymentMethodId] = useState('');
+  const [paymentProcessing, setPaymentProcessing] = useState(false);
+  const [collectionPeriod, setCollectionPeriod] = useState('daily');
+  const [collectionDate, setCollectionDate] = useState(getDhakaTodayString());
+  const [collectionStartDate, setCollectionStartDate] = useState(getDhakaTodayString());
+  const [collectionEndDate, setCollectionEndDate] = useState(getDhakaTodayString());
+
+  const accountingFiles = useMemo(() => {
+    return files.filter(isAccountingEligibleFile);
+  }, [files]);
+
+  const accountingMiscCosts = useMemo(() => {
+    return miscCosts.filter(isAccountingEligibleMiscCost);
+  }, [miscCosts]);
+
+  const invoiceStats = useMemo(() => {
+    let totalDue = 0;
+    let paid = 0;
+    let partial = 0;
+    let unpaid = 0;
+    accountingFiles.forEach(f => {
+      try {
+        const inv = getInvoiceSummary(f);
+        totalDue += Number(inv.dueAmount || 0);
+        if (inv.paymentStatus === 'Paid') paid++;
+        else if (inv.paymentStatus === 'Partially Paid') partial++;
+        else unpaid++;
+      } catch (e) {
+        // ignore malformed
+      }
+    });
+    return { totalDue, paid, partial, unpaid };
+  }, [accountingFiles]);
+
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-lg';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
   const textSub = darkMode ? 'text-slate-400' : 'text-slate-500';
@@ -6552,25 +7798,261 @@ function AccountingPanel({ currentUser, files, miscCosts, onAddMiscCost, onDelet
     ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
     : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
 
-  // Calculate financial totals including all file types
-  const totalRevenue = files.reduce((sum, f) => {
+  const collectionReport = useMemo(() => {
+    const currentYearMonth = collectionDate.slice(0, 7);
+    const currentYear = collectionDate.slice(0, 4);
+    let total = 0;
+    let legacyPaid = 0;
+    let currentDue = 0;
+    const accounts = new Map();
+    paymentMethods.forEach(method => {
+      const key = JSON.stringify([method.id, method.name, method.institution, method.accountName, method.accountNumber]);
+      accounts.set(key, { key, methodId: method.id, methodName: method.name || 'Payment method', institution: method.institution || '', accountName: method.accountName || '', accountNumber: method.accountNumber || '', amount: 0 });
+    });
+    accountingFiles.forEach(file => {
+      const summary = getInvoiceSummary(file);
+      currentDue += summary.dueAmount;
+      const payments = Array.isArray(file.invoicePayments) ? file.invoicePayments : Array.isArray(file.invoice?.payments) ? file.invoice.payments : [];
+      const recordedPaid = payments.reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0);
+      legacyPaid += Math.max(0, summary.paidAmount - recordedPaid);
+      payments.forEach(payment => {
+        const receivedAt = payment.receivedAt;
+        const receivedDate = receivedAt?.toDate
+          ? receivedAt.toDate()
+          : receivedAt instanceof Date
+            ? receivedAt
+            : receivedAt?.seconds
+              ? new Date(receivedAt.seconds * 1000)
+              : new Date(receivedAt);
+        if (!Number.isFinite(receivedDate.getTime())) return;
+        const dateKey = new Date(receivedDate.getTime() + 6 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const inPeriod = collectionPeriod === 'daily'
+          ? dateKey === collectionDate
+          : collectionPeriod === 'monthly'
+            ? dateKey.startsWith(currentYearMonth)
+            : collectionPeriod === 'yearly'
+              ? dateKey.startsWith(currentYear)
+              : Boolean(collectionStartDate && collectionEndDate && collectionStartDate <= collectionEndDate && dateKey >= collectionStartDate && dateKey <= collectionEndDate);
+        if (!inPeriod) return;
+        const amount = Number(payment.amount) || 0;
+        total += amount;
+        const details = {
+          methodId: payment.methodId || '',
+          methodName: payment.methodName || 'Unspecified legacy account',
+          institution: payment.institution || '',
+          accountName: payment.accountName || '',
+          accountNumber: payment.accountNumber || ''
+        };
+        const key = JSON.stringify([details.methodId, details.methodName, details.institution, details.accountName, details.accountNumber]);
+        if (!accounts.has(key)) accounts.set(key, { key, ...details, amount: 0 });
+        accounts.get(key).amount += amount;
+      });
+    });
+    return { total, legacyPaid, currentDue, accounts: [...accounts.values()].sort((a, b) => a.methodName.localeCompare(b.methodName)) };
+  }, [accountingFiles, paymentMethods, collectionDate, collectionPeriod, collectionStartDate, collectionEndDate]);
+
+  const recordInvoicePayment = async (markPaid = false) => {
+    if (!selectedInvoice) return;
+    const method = paymentMethods.find(item => item.id === paymentMethodId);
+    if (!method) {
+      alert('Select a payment method / account before recording a payment.');
+      return;
+    }
+    const enteredAmount = Number(paymentAmount);
+    if (!markPaid && (!Number.isFinite(enteredAmount) || enteredAmount <= 0)) {
+      alert('Enter a valid payment amount.');
+      return;
+    }
+    setPaymentProcessing(true);
+    const fileDoc = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedInvoice.id);
+    const paymentId = `payment-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const shouldNotifyCash = isCashPaymentMethod(method);
+    const recipients = Array.isArray(cashPaymentNotificationEmails) ? cashPaymentNotificationEmails : [];
+    const mailRef = shouldNotifyCash && recipients.length > 0 ? doc(collection(db, 'mail')) : null;
+    try {
+      const result = await runTransaction(db, async transaction => {
+        const snapshot = await transaction.get(fileDoc);
+        if (!snapshot.exists()) throw new Error('Invoice no longer exists.');
+        const current = { id: snapshot.id, ...snapshot.data() };
+        const summary = getInvoiceSummary(current);
+        if (!markPaid && enteredAmount > summary.dueAmount) {
+          throw new Error(`Payment exceeds the outstanding due of ${formatCurrency(summary.dueAmount)}.`);
+        }
+        const existingPaid = summary.paidAmount;
+        const newAmount = Math.round(Math.min(markPaid ? summary.dueAmount : enteredAmount, summary.dueAmount) * 100) / 100;
+        if (newAmount <= 0) throw new Error('No outstanding amount remains on this invoice.');
+        const newPaid = Math.round((existingPaid + newAmount) * 100) / 100;
+        const status = newPaid >= summary.amount ? 'Paid' : 'Partially Paid';
+        const payment = {
+          id: paymentId,
+          amount: newAmount,
+          receivedAt: Timestamp.now(),
+          receivedBy: currentUser.name,
+          methodId: method.id,
+          methodName: method.name || '',
+          institution: method.institution || '',
+          accountName: method.accountName || '',
+          accountNumber: method.accountNumber || '',
+          note: paymentNote.trim()
+        };
+        const invoicePayments = [...(Array.isArray(current.invoicePayments) ? current.invoicePayments : Array.isArray(current.invoice?.payments) ? current.invoice.payments : []), payment];
+        transaction.update(fileDoc, {
+          invoicePaidAmount: newPaid,
+          invoicePaymentStatus: status,
+          invoicePayments,
+          'invoice.paidAmount': newPaid,
+          'invoice.paymentStatus': status,
+          updatedAt: serverTimestamp()
+        });
+        if (mailRef) {
+          transaction.set(mailRef, { ...buildCashPaymentMail(current, payment, recipients), createdAt: serverTimestamp() });
+        }
+        return {
+          updated: { ...current, invoicePaidAmount: newPaid, invoicePaymentStatus: status, invoicePayments, invoice: { ...(current.invoice || {}), paidAmount: newPaid, paymentStatus: status, payments: invoicePayments } },
+          cashNotificationMissingRecipients: shouldNotifyCash && recipients.length === 0
+        };
+      });
+      const updated = result.updated;
+      setSelectedInvoice(updated);
+      if (invoiceSearchResult) setInvoiceSearchResult({ hits: invoiceSearchResult.hits.map(hit => hit.id === updated.id ? updated : hit) });
+      setPaymentAmount('');
+      setPaymentNote('');
+      if (result.cashNotificationMissingRecipients) {
+        alert('Payment was recorded, but no cash payment notification email recipients are configured.');
+      }
+    } catch (error) {
+      console.error('Failed to record payment:', error);
+      alert(`Failed to record payment: ${error.message || 'See console for details.'}`);
+    } finally {
+      setPaymentProcessing(false);
+    }
+  };
+
+  // Helper function to get month/year from Firestore timestamp
+  const getFileMonthYear = (file) => {
+    if (!file.createdAt) return null;
+    const date = file.createdAt.toDate ? file.createdAt.toDate() : new Date(file.createdAt);
+    return {
+      month: date.getMonth() + 1,
+      year: date.getFullYear()
+    };
+  };
+
+  // Helper function to get month/year from date string (YYYY-MM-DD format)
+  const getDateMonthYear = (dateString) => {
+    if (!dateString) return null;
+    const parts = dateString.split('-');
+    if (parts.length !== 3) return null;
+    return {
+      month: parseInt(parts[1]),
+      year: parseInt(parts[0])
+    };
+  };
+
+  // Calculate report data based on selected period
+  const calculateReport = () => {
+    let filteredFiles = [];
+    let filteredMiscCosts = [];
+
+    const eligibleFiles = accountingFiles;
+    const eligibleMiscCosts = accountingMiscCosts;
+
+    if (reportType === 'monthly') {
+      filteredFiles = eligibleFiles.filter(f => {
+        const dateInfo = getFileMonthYear(f);
+        return dateInfo && dateInfo.month === reportMonth && dateInfo.year === reportYear;
+      });
+
+      filteredMiscCosts = eligibleMiscCosts.filter(c => {
+        const dateInfo = getDateMonthYear(c.date);
+        return dateInfo && dateInfo.month === reportMonth && dateInfo.year === reportYear;
+      });
+    } else {
+      filteredFiles = eligibleFiles.filter(f => {
+        const dateInfo = getFileMonthYear(f);
+        return dateInfo && dateInfo.year === reportYear;
+      });
+
+      filteredMiscCosts = eligibleMiscCosts.filter(c => {
+        const dateInfo = getDateMonthYear(c.date);
+        return dateInfo && dateInfo.year === reportYear;
+      });
+    }
+
+    // Calculate revenue by file type
+    const revenueByType = {};
+    const costByType = {};
+    const countByType = {};
+
+    filteredFiles.forEach(f => {
+      const type = f.fileType || FILE_TYPES.VISA;
+      if (!revenueByType[type]) {
+        revenueByType[type] = 0;
+        costByType[type] = 0;
+        countByType[type] = 0;
+      }
+      countByType[type]++;
+
+      if (type === FILE_TYPES.VISA) {
+        revenueByType[type] += Number(f.serviceCharge) || 0;
+        costByType[type] += Number(f.cost) || 0;
+      } else if (type === FILE_TYPES.AIR_TICKET) {
+        revenueByType[type] += Number(f.airlineSalePrice) || 0;
+        costByType[type] += Number(f.airlineCostPrice) || 0;
+      } else if (type === FILE_TYPES.PACKAGE) {
+        revenueByType[type] += Number(f.packageSalePrice) || 0;
+        costByType[type] += Number(f.packageCostPrice) || 0;
+      } else if (type === FILE_TYPES.PICK_DROP) {
+        revenueByType[type] += Number(f.salePrice) || 0;
+        costByType[type] += Number(f.costPrice) || 0;
+      }
+    });
+
+    const totalRevenue = Object.values(revenueByType).reduce((a, b) => a + b, 0);
+    const totalCost = Object.values(costByType).reduce((a, b) => a + b, 0);
+    const totalMiscCosts = filteredMiscCosts.reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
+    const totalExpenditure = totalCost + totalMiscCosts;
+    const netProfit = totalRevenue - totalExpenditure;
+    const profitMargin = totalRevenue > 0 ? ((netProfit / totalRevenue) * 100).toFixed(2) : 0;
+
+    return {
+      totalRevenue,
+      totalCost,
+      totalMiscCosts,
+      totalExpenditure,
+      netProfit,
+      profitMargin,
+      revenueByType,
+      costByType,
+      countByType,
+      fileCount: filteredFiles.length,
+      miscCostCount: filteredMiscCosts.length
+    };
+  };
+
+  // Calculate financial totals including all file types (overall)
+  const totalRevenue = accountingFiles.reduce((sum, f) => {
     if (f.fileType === FILE_TYPES.VISA) return sum + (Number(f.serviceCharge) || 0);
     if (f.fileType === FILE_TYPES.AIR_TICKET) return sum + (Number(f.airlineSalePrice) || 0);
     if (f.fileType === FILE_TYPES.PACKAGE) return sum + (Number(f.packageSalePrice) || 0);
+    if (f.fileType === FILE_TYPES.PICK_DROP) return sum + (Number(f.salePrice) || 0);
     return sum + (Number(f.serviceCharge) || 0); // Default to visa for backward compatibility
   }, 0);
   
-  const totalCost = files.reduce((sum, f) => {
+  const totalCost = accountingFiles.reduce((sum, f) => {
     if (f.fileType === FILE_TYPES.VISA) return sum + (Number(f.cost) || 0);
     if (f.fileType === FILE_TYPES.AIR_TICKET) return sum + (Number(f.airlineCostPrice) || 0);
     if (f.fileType === FILE_TYPES.PACKAGE) return sum + (Number(f.packageCostPrice) || 0);
+    if (f.fileType === FILE_TYPES.PICK_DROP) return sum + (Number(f.costPrice) || 0);
     return sum + (Number(f.cost) || 0); // Default to visa for backward compatibility
   }, 0);
   
-  const totalMiscCosts = miscCosts.reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
+  const totalMiscCosts = accountingMiscCosts.reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
   const totalExpenditure = totalCost + totalMiscCosts;
   const netProfit = totalRevenue - totalExpenditure;
   const profitMargin = totalRevenue > 0 ? ((netProfit / totalRevenue) * 100).toFixed(2) : 0;
+
+  const report = calculateReport();
 
   const handleAddMiscCost = (e) => {
     e.preventDefault();
@@ -6597,7 +8079,368 @@ function AccountingPanel({ currentUser, files, miscCosts, onAddMiscCost, onDelet
         </div>
       </div>
 
-      {/* Financial Overview Cards */}
+      {/* Cash Collections */}
+      <section className={`rounded-xl border p-5 ${cardClass}`}>
+        <div className="flex flex-wrap items-end justify-between gap-3 mb-4">
+          <div>
+            <h3 className={`text-lg font-bold ${textMain}`}>Cash Collections</h3>
+            <p className={`text-sm ${textSub}`}>Based on recorded payment dates and saved account details.</p>
+          </div>
+          <div className="flex flex-wrap items-end gap-2">
+            <label className={`text-xs ${textSub}`}>Period
+              <select value={collectionPeriod} onChange={e => setCollectionPeriod(e.target.value)} className={`block mt-1 px-3 py-2 border rounded-lg text-sm ${inputClass}`}>
+                <option value="daily">Daily</option>
+                <option value="monthly">Monthly</option>
+                <option value="yearly">Yearly</option>
+                <option value="custom">Custom range</option>
+              </select>
+            </label>
+            {collectionPeriod === 'daily' && <label className={`text-xs ${textSub}`}>Date<input type="date" value={collectionDate} onChange={e => setCollectionDate(e.target.value)} className={`block mt-1 px-3 py-2 border rounded-lg text-sm ${inputClass}`} /></label>}
+            {collectionPeriod === 'monthly' && <label className={`text-xs ${textSub}`}>Month<input type="month" value={collectionDate.slice(0, 7)} onChange={e => e.target.value && setCollectionDate(`${e.target.value}-01`)} className={`block mt-1 px-3 py-2 border rounded-lg text-sm ${inputClass}`} /></label>}
+            {collectionPeriod === 'yearly' && <label className={`text-xs ${textSub}`}>Year<input type="number" min="2000" max="2100" value={collectionDate.slice(0, 4)} onChange={e => /^\d{4}$/.test(e.target.value) && setCollectionDate(`${e.target.value}-01-01`)} className={`block mt-1 w-28 px-3 py-2 border rounded-lg text-sm ${inputClass}`} /></label>}
+            {collectionPeriod === 'custom' && <>
+              <label className={`text-xs ${textSub}`}>From<input type="date" value={collectionStartDate} onChange={e => setCollectionStartDate(e.target.value)} className={`block mt-1 px-3 py-2 border rounded-lg text-sm ${inputClass}`} /></label>
+              <label className={`text-xs ${textSub}`}>To<input type="date" value={collectionEndDate} onChange={e => setCollectionEndDate(e.target.value)} className={`block mt-1 px-3 py-2 border rounded-lg text-sm ${inputClass}`} /></label>
+            </>}
+          </div>
+        </div>
+        {collectionPeriod === 'custom' && collectionStartDate > collectionEndDate && <p className="text-sm text-red-500 mb-3">Start date must be on or before end date.</p>}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+          <div className={`rounded-lg p-4 ${darkMode ? 'bg-slate-800' : 'bg-green-50'}`}><div className={`text-xs uppercase ${textSub}`}>Collected in period</div><div className={`text-xl font-bold ${textMain}`}>{formatCurrency(collectionReport.total)}</div></div>
+          <div className={`rounded-lg p-4 ${darkMode ? 'bg-slate-800' : 'bg-amber-50'}`}><div className={`text-xs uppercase ${textSub}`}>Current outstanding due</div><div className={`text-xl font-bold ${textMain}`}>{formatCurrency(collectionReport.currentDue)}</div></div>
+          <div className={`rounded-lg p-4 ${darkMode ? 'bg-slate-800' : 'bg-slate-100'}`}><div className={`text-xs uppercase ${textSub}`}>Unattributed legacy payments (all time)</div><div className={`text-xl font-bold ${textMain}`}>{formatCurrency(collectionReport.legacyPaid)}</div><div className={`text-xs ${textSub}`}>No historical date or account is available for these amounts.</div></div>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+          {collectionReport.accounts.map(account => (
+            <div key={account.key} className={`rounded-lg border p-4 ${darkMode ? 'border-slate-700 bg-slate-800/50' : 'border-slate-200 bg-white'}`}>
+              <div className={`font-semibold ${textMain}`}>{account.methodName}</div>
+              <div className={`text-xs ${textSub}`}>{[account.institution, account.accountName, account.accountNumber].filter(Boolean).join(' · ') || 'No account details'}</div>
+              <div className={`mt-2 text-lg font-bold ${textMain}`}>{formatCurrency(account.amount)}</div>
+            </div>
+          ))}
+          {collectionReport.accounts.length === 0 && <p className={`text-sm ${textSub}`}>No payment accounts configured or recorded.</p>}
+        </div>
+      </section>
+
+      {/* Report Generation Section */}
+      <div className={`rounded-xl border p-6 ${cardClass}`}>
+        <h3 className={`text-lg font-bold mb-4 flex items-center gap-2 ${textMain}`}>
+          <BarChart3 className="h-5 w-5 text-purple-500"/> Generate Period Report
+        </h3>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div>
+            <label className={`block text-sm font-medium mb-2 ${textMain}`}>Report Type</label>
+            <select
+              className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-purple-500 outline-none ${inputClass}`}
+              value={reportType}
+              onChange={e => setReportType(e.target.value)}
+            >
+              <option value="monthly">Monthly Report</option>
+              <option value="yearly">Yearly Report</option>
+            </select>
+          </div>
+
+          {reportType === 'monthly' && (
+            <div>
+              <label className={`block text-sm font-medium mb-2 ${textMain}`}>Month</label>
+              <select
+                className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-purple-500 outline-none ${inputClass}`}
+                value={reportMonth}
+                onChange={e => setReportMonth(parseInt(e.target.value))}
+              >
+                {[
+                  'January', 'February', 'March', 'April', 'May', 'June',
+                  'July', 'August', 'September', 'October', 'November', 'December'
+                ].map((month, idx) => (
+                  <option key={idx} value={idx + 1}>{month}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          <div>
+            <label className={`block text-sm font-medium mb-2 ${textMain}`}>Year</label>
+            <input
+              type="number"
+              min="2020"
+              max={today.getFullYear()}
+              className={`w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-purple-500 outline-none ${inputClass}`}
+              value={reportYear}
+              onChange={e => setReportYear(parseInt(e.target.value))}
+            />
+          </div>
+
+          <div className="flex items-end">
+            <button
+              onClick={() => {}} // Report updates automatically
+              className="w-full px-4 py-2 bg-purple-600 text-white font-medium rounded-lg hover:bg-purple-700 transition-colors"
+              title="Report is auto-generated based on selected period"
+            >
+              <span className="text-sm">Report Ready</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Report Summary */}
+        <div className="mt-6 grid grid-cols-1 md:grid-cols-5 gap-4">
+          <div className={`p-4 rounded-lg border ${darkMode ? 'bg-emerald-900/20 border-emerald-800' : 'bg-emerald-50 border-emerald-100'}`}>
+            <p className={`text-xs font-semibold uppercase ${darkMode ? 'text-emerald-400' : 'text-emerald-700'}`}>Period Income</p>
+            <p className={`text-xl font-bold mt-1 ${darkMode ? 'text-emerald-300' : 'text-emerald-900'}`}>৳{report.totalRevenue.toFixed(2)}</p>
+            <p className={`text-xs mt-1 ${textSub}`}>{report.fileCount} files</p>
+          </div>
+
+          <div className={`p-4 rounded-lg border ${darkMode ? 'bg-orange-900/20 border-orange-800' : 'bg-orange-50 border-orange-100'}`}>
+            <p className={`text-xs font-semibold uppercase ${darkMode ? 'text-orange-400' : 'text-orange-700'}`}>Period Costs</p>
+            <p className={`text-xl font-bold mt-1 ${darkMode ? 'text-orange-300' : 'text-orange-900'}`}>৳{report.totalCost.toFixed(2)}</p>
+            <p className={`text-xs mt-1 ${textSub}`}>Direct costs</p>
+          </div>
+
+          <div className={`p-4 rounded-lg border ${darkMode ? 'bg-red-900/20 border-red-800' : 'bg-red-50 border-red-100'}`}>
+            <p className={`text-xs font-semibold uppercase ${darkMode ? 'text-red-400' : 'text-red-700'}`}>Period Misc</p>
+            <p className={`text-xl font-bold mt-1 ${darkMode ? 'text-red-300' : 'text-red-900'}`}>৳{report.totalMiscCosts.toFixed(2)}</p>
+            <p className={`text-xs mt-1 ${textSub}`}>{report.miscCostCount} entries</p>
+          </div>
+
+          <div className={`p-4 rounded-lg border ${darkMode ? 'bg-yellow-900/20 border-yellow-800' : 'bg-yellow-50 border-yellow-100'}`}>
+            <p className={`text-xs font-semibold uppercase ${darkMode ? 'text-yellow-400' : 'text-yellow-700'}`}>Total Expense</p>
+            <p className={`text-xl font-bold mt-1 ${darkMode ? 'text-yellow-300' : 'text-yellow-900'}`}>৳{report.totalExpenditure.toFixed(2)}</p>
+            <p className={`text-xs mt-1 ${textSub}`}>All costs</p>
+          </div>
+
+          <div className={`p-4 rounded-lg border ${report.netProfit >= 0 ? (darkMode ? 'bg-blue-900/20 border-blue-800' : 'bg-blue-50 border-blue-100') : (darkMode ? 'bg-red-900/20 border-red-800' : 'bg-red-50 border-red-100')}`}>
+            <p className={`text-xs font-semibold uppercase ${report.netProfit >= 0 ? (darkMode ? 'text-blue-400' : 'text-blue-700') : (darkMode ? 'text-red-400' : 'text-red-700')}`}>Net Profit</p>
+            <p className={`text-xl font-bold mt-1 ${report.netProfit >= 0 ? (darkMode ? 'text-blue-300' : 'text-blue-900') : (darkMode ? 'text-red-300' : 'text-red-900')}`}>৳{report.netProfit.toFixed(2)}</p>
+            <p className={`text-xs mt-1 ${textSub}`}>Margin: {report.profitMargin}%</p>
+          </div>
+        </div>
+
+        {/* Invoice Search (Accounting) */}
+        <div className="mt-4 mb-6">
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={invoiceSearchTerm}
+              onChange={(e) => setInvoiceSearchTerm(e.target.value)}
+              placeholder="Search Invoice # or File ID"
+              className={`px-3 py-2 border rounded-lg text-sm outline-none w-64 ${inputClass}`}
+            />
+            <button
+              onClick={async () => {
+                const term = (invoiceSearchTerm || '').trim();
+                if (!term) return;
+                setInvoiceSearchLoading(true);
+                setInvoiceSearchError('');
+                setInvoiceSearchResult(null);
+                try {
+                  const filesRef = collection(db, 'artifacts', appId, 'public', 'data', 'visa_files');
+                  let q1 = query(filesRef, where('invoiceNo', '==', term));
+                  const r1 = await getDocs(q1);
+                  if (!r1.empty) {
+                    setInvoiceSearchResult({ hits: r1.docs.map(d => ({ id: d.id, ...d.data() })) });
+                    setInvoiceSearchLoading(false);
+                    return;
+                  }
+                  let q2 = query(filesRef, where('invoice.invoiceNo', '==', term));
+                  const r2 = await getDocs(q2);
+                  if (!r2.empty) {
+                    setInvoiceSearchResult({ hits: r2.docs.map(d => ({ id: d.id, ...d.data() })) });
+                    setInvoiceSearchLoading(false);
+                    return;
+                  }
+                  let q3 = query(filesRef, where('fileId', '==', term));
+                  const r3 = await getDocs(q3);
+                  if (!r3.empty) {
+                    setInvoiceSearchResult({ hits: r3.docs.map(d => ({ id: d.id, ...d.data() })) });
+                    setInvoiceSearchLoading(false);
+                    return;
+                  }
+
+                  setInvoiceSearchError('No invoice found for that identifier');
+                } catch (e) {
+                  console.error('Invoice search error', e);
+                  setInvoiceSearchError('Search failed, check console for details');
+                } finally {
+                  setInvoiceSearchLoading(false);
+                }
+              }}
+              className="px-3 py-2 rounded-lg bg-blue-600 text-white text-sm"
+            >
+              <Search className="inline-block mr-1"/> Search
+            </button>
+
+            <div className="ml-6 grid grid-cols-4 gap-4">
+              <div className={`p-4 rounded-xl border ${darkMode ? 'bg-yellow-900/20 border-yellow-800' : 'bg-yellow-50 border-yellow-100'}`}>
+                <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-yellow-400' : 'text-yellow-800'}`}>Total Due</p>
+                <p className={`text-2xl font-bold ${darkMode ? 'text-yellow-200' : 'text-yellow-900'}`}>{formatCurrency(invoiceStats.totalDue)}</p>
+              </div>
+              <div className={`p-4 rounded-xl border ${darkMode ? 'bg-emerald-900/20 border-emerald-800' : 'bg-emerald-50 border-emerald-100'}`}>
+                <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-emerald-400' : 'text-emerald-800'}`}>Paid</p>
+                <p className={`text-2xl font-bold ${darkMode ? 'text-emerald-200' : 'text-emerald-900'}`}>{invoiceStats.paid}</p>
+              </div>
+              <div className={`p-4 rounded-xl border ${darkMode ? 'bg-yellow-900/20 border-yellow-800' : 'bg-yellow-50 border-yellow-100'}`}>
+                <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-yellow-400' : 'text-yellow-800'}`}>Partial</p>
+                <p className={`text-2xl font-bold ${darkMode ? 'text-yellow-200' : 'text-yellow-900'}`}>{invoiceStats.partial}</p>
+              </div>
+              <div className={`p-4 rounded-xl border ${darkMode ? 'bg-red-900/20 border-red-800' : 'bg-red-50 border-red-100'}`}>
+                <p className={`text-sm font-medium mb-1 ${darkMode ? 'text-red-400' : 'text-red-800'}`}>Unpaid</p>
+                <p className={`text-2xl font-bold ${darkMode ? 'text-red-200' : 'text-red-900'}`}>{invoiceStats.unpaid}</p>
+              </div>
+            </div>
+          </div>
+          
+          {/* Invoice Search Result */}
+          {invoiceSearchLoading && (
+            <div className={`mb-4 p-4 rounded-xl border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+              <div className={textSub}>Searching invoices...</div>
+            </div>
+          )}
+
+          {invoiceSearchError && (
+            <div className={`mb-4 p-4 rounded-xl border ${darkMode ? 'bg-red-900/10 border-red-800' : 'bg-red-50 border-red-100'}`}>
+              <div className={`text-sm ${darkMode ? 'text-red-300' : 'text-red-700'}`}>{invoiceSearchError}</div>
+            </div>
+          )}
+
+          {invoiceSearchResult && invoiceSearchResult.hits && (
+            <div className={`mb-6 p-4 rounded-xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+              <h4 className={`text-sm font-semibold mb-2 ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>Invoice Search Results ({invoiceSearchResult.hits.length})</h4>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm text-left">
+                  <thead className={`text-xs uppercase ${darkMode ? 'text-slate-400 bg-slate-800' : 'text-slate-500 bg-slate-100'}`}>
+                    <tr>
+                      <th className="px-3 py-2">Invoice #</th>
+                      <th className="px-3 py-2">File ID</th>
+                      <th className="px-3 py-2">Customer</th>
+                      <th className="px-3 py-2">Created By</th>
+                      <th className="px-3 py-2 text-right">Amount</th>
+                      <th className="px-3 py-2 text-right">Paid</th>
+                      <th className="px-3 py-2 text-right">Due</th>
+                      <th className="px-3 py-2">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className={textMain}>
+                    {invoiceSearchResult.hits.map(f => {
+                      const inv = getInvoiceSummary(f);
+                      return (
+                        <tr key={f.id} className={`border-b ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+                          <td className="px-3 py-2 font-medium">{f.invoiceNo || f.invoice?.invoiceNo || '-'}</td>
+                          <td className="px-3 py-2">{f.fileId || f.id}</td>
+                          <td className="px-3 py-2">{f.applicantName || f.mainPersonName || '-'}</td>
+                          <td className="px-3 py-2">{f.invoiceCreatedBy || f.invoice?.invoiceCreatedBy || '-'}</td>
+                          <td className="px-3 py-2 text-right font-mono">{formatCurrency(inv.amount)}</td>
+                          <td className="px-3 py-2 text-right font-mono">{formatCurrency(inv.paidAmount)}</td>
+                          <td className="px-3 py-2 text-right font-mono">{formatCurrency(inv.dueAmount)}</td>
+                          <td className="px-3 py-2"><span className={`px-2 py-1 rounded text-xs ${inv.paymentStatus === 'Paid' ? 'bg-green-100 text-green-800' : inv.paymentStatus === 'Partially Paid' ? 'bg-yellow-100 text-yellow-800' : 'bg-orange-100 text-orange-800'}`}>{inv.paymentStatus}</span></td>
+                          <td className="px-3 py-2">
+                            <button onClick={() => { setSelectedInvoice(f); setInvoiceModalOpen(true); setPaymentAmount(''); setPaymentNote(''); setPaymentMethodId(''); }} className="px-2 py-1 rounded bg-blue-600 text-white text-xs">View</button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Invoice Detail Modal */}
+          {invoiceModalOpen && selectedInvoice && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+              <div className={`rounded-2xl shadow-xl w-full max-w-lg p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
+                <div className="flex justify-between items-center mb-4">
+                  <h3 className={`text-lg font-bold ${textMain}`}>Invoice: {selectedInvoice.invoiceNo || selectedInvoice.invoice?.invoiceNo || selectedInvoice.fileId}</h3>
+                  <button onClick={() => setInvoiceModalOpen(false)} className="text-slate-400 hover:text-slate-600">Close</button>
+                </div>
+                <div className="space-y-3 mb-4">
+                  <div className={`p-4 rounded border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+                    <div className="flex justify-between">
+                      <div>
+                        <div className={`text-sm ${textSub}`}>Customer</div>
+                        <div className={`font-medium ${textMain}`}>{selectedInvoice.applicantName || selectedInvoice.mainPersonName || '-'}</div>
+                      </div>
+                      <div className="text-right">
+                        <div className={`text-sm ${textSub}`}>Amount</div>
+                        <div className={`font-medium ${textMain}`}>{formatCurrency(getInvoiceSummary(selectedInvoice).amount)}</div>
+                      </div>
+                    </div>
+                    <div className="mt-2 flex justify-between">
+                      <div>
+                        <div className={`text-sm ${textSub}`}>Paid</div>
+                        <div className={`font-medium ${textMain}`}>{formatCurrency(getInvoiceSummary(selectedInvoice).paidAmount)}</div>
+                      </div>
+                      <div>
+                        <div className={`text-sm ${textSub}`}>Due</div>
+                        <div className={`font-medium ${textMain}`}>{formatCurrency(getInvoiceSummary(selectedInvoice).dueAmount)}</div>
+                      </div>
+                    </div>
+                    <div className="mt-2">
+                      <div className={`text-sm ${textSub}`}>Created By</div>
+                      <div className={`font-medium ${textMain}`}>{selectedInvoice.invoiceCreatedBy || selectedInvoice.invoice?.invoiceCreatedBy || '-'}</div>
+                    </div>
+                  </div>
+
+                  <div className={`p-4 rounded border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+                    <div className={`text-sm font-medium mb-2 ${textMain}`}>Payment History</div>
+                    {(selectedInvoice.invoicePayments || selectedInvoice.invoice?.payments || []).length > 0 ? (
+                      <div className="space-y-2 max-h-36 overflow-y-auto">
+                        {(selectedInvoice.invoicePayments || selectedInvoice.invoice?.payments || []).map((payment, index) => {
+                          const rawDate = payment.receivedAt?.toDate ? payment.receivedAt.toDate() : payment.receivedAt?.seconds ? new Date(payment.receivedAt.seconds * 1000) : new Date(payment.receivedAt);
+                          const when = Number.isNaN(rawDate.getTime()) ? 'Date unavailable' : rawDate.toLocaleString();
+                          return <div key={payment.id || index} className={`text-xs flex justify-between gap-2 ${textSub}`}>
+                            <span>{when} · {[payment.methodName, payment.institution, payment.accountNumber].filter(Boolean).join(' / ') || 'Unattributed legacy payment'}</span>
+                            <span className={`font-semibold ${textMain}`}>{formatCurrency(Number(payment.amount) || 0)}</span>
+                          </div>;
+                        })}
+                      </div>
+                    ) : <p className={`text-xs ${textSub}`}>No dated payment records. Existing paid amounts are treated as unattributed legacy payments.</p>}
+                  </div>
+
+                  <div className={`p-4 rounded border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+                    <div className="text-sm mb-2">Record Payment</div>
+                    <div className="flex gap-2">
+                      <input type="number" step="0.01" min="0" value={paymentAmount} onChange={(e) => setPaymentAmount(e.target.value)} placeholder="Amount" className={`px-3 py-2 border rounded-lg text-sm outline-none ${inputClass} flex-1`} />
+                      <input type="text" value={paymentNote} onChange={(e) => setPaymentNote(e.target.value)} placeholder="Note (optional)" className={`px-3 py-2 border rounded-lg text-sm outline-none ${inputClass} flex-1`} />
+                    </div>
+                    <select value={paymentMethodId} onChange={e => setPaymentMethodId(e.target.value)} className={`w-full mt-2 px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}>
+                      <option value="">Select payment method / account</option>
+                      {paymentMethods.map(method => <option key={method.id} value={method.id}>{[method.name, method.institution, method.accountNumber].filter(Boolean).join(' — ')}</option>)}
+                    </select>
+                    {paymentMethods.length === 0 && <p className="text-xs text-red-500 mt-1">Configure a payment method in Admin before recording payments.</p>}
+                    <div className="flex gap-2 mt-3">
+                      <button disabled={paymentProcessing} onClick={() => recordInvoicePayment(false)} className="px-4 py-2 rounded bg-green-600 text-white">Record</button>
+                      <button disabled={paymentProcessing} onClick={() => recordInvoicePayment(true)} className="px-4 py-2 rounded bg-blue-600 text-white">Mark Paid</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* File Type Breakdown for Report */}
+        {report.fileCount > 0 && (
+          <div className="mt-6">
+            <p className={`text-sm font-semibold mb-3 ${textMain}`}>Breakdown by File Type:</p>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              {Object.entries(report.revenueByType).map(([type, revenue]) => (
+                <div key={type} className={`p-3 rounded-lg border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-100 border-slate-200'}`}>
+                  <p className={`text-xs font-semibold uppercase ${textSub}`}>{type}</p>
+                  <p className={`text-sm font-bold mt-1 ${textMain}`}>{report.countByType[type]} files</p>
+                  <div className={`text-xs mt-2 space-y-1 ${textSub}`}>
+                    <div>Income: ৳{revenue.toFixed(2)}</div>
+                    <div>Cost: ৳{report.costByType[type].toFixed(2)}</div>
+                    <div className={`font-semibold ${(revenue - report.costByType[type]) >= 0 ? (darkMode ? 'text-emerald-400' : 'text-emerald-700') : (darkMode ? 'text-red-400' : 'text-red-700')}`}>
+                      Profit: ৳{(revenue - report.costByType[type]).toFixed(2)}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Overall Financial Overview Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
         <div className={`p-5 rounded-xl border ${darkMode ? 'bg-emerald-900/20 border-emerald-800' : 'bg-emerald-50 border-emerald-100'}`}>
           <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-emerald-400' : 'text-emerald-700'}`}>Total Income</p>
@@ -6614,7 +8457,7 @@ function AccountingPanel({ currentUser, files, miscCosts, onAddMiscCost, onDelet
         <div className={`p-5 rounded-xl border ${darkMode ? 'bg-red-900/20 border-red-800' : 'bg-red-50 border-red-100'}`}>
           <p className={`text-xs font-semibold uppercase mb-1 ${darkMode ? 'text-red-400' : 'text-red-700'}`}>Misc Expenses</p>
           <p className={`text-2xl font-bold ${darkMode ? 'text-red-300' : 'text-red-900'}`}>৳{totalMiscCosts.toFixed(2)}</p>
-          <p className={`text-xs mt-2 ${textSub}`}>{miscCosts.length} entries</p>
+          <p className={`text-xs mt-2 ${textSub}`}>{accountingMiscCosts.length} entries</p>
         </div>
 
         <div className={`p-5 rounded-xl border ${darkMode ? 'bg-yellow-900/20 border-yellow-800' : 'bg-yellow-50 border-yellow-100'}`}>
@@ -6710,13 +8553,13 @@ function AccountingPanel({ currentUser, files, miscCosts, onAddMiscCost, onDelet
 
         {/* Misc Costs List */}
         <div className={`lg:col-span-2 rounded-xl border p-6 ${cardClass}`}>
-          <h3 className={`text-lg font-bold mb-4 ${textMain}`}>Expense Entries ({miscCosts.length})</h3>
+          <h3 className={`text-lg font-bold mb-4 ${textMain}`}>Expense Entries ({accountingMiscCosts.length})</h3>
           
-          {miscCosts.length === 0 ? (
+          {accountingMiscCosts.length === 0 ? (
             <p className={`text-center py-8 ${textSub}`}>No expense entries yet. Add one to get started.</p>
           ) : (
             <div className="space-y-3 max-h-96 overflow-y-auto">
-              {miscCosts.map(cost => (
+              {accountingMiscCosts.map(cost => (
                 <div key={cost.id} className={`p-4 rounded-lg border flex items-center justify-between ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1">

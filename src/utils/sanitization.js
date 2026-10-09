@@ -1,278 +1,240 @@
-/**
- * Input Sanitization & Validation
- * Prevents XSS and injection attacks
- */
+import { validateDateFormat } from './dateValidation';
 
-/**
- * Escapes HTML special characters to prevent XSS
- * @param {string} text - Text to escape
- * @returns {string} - Escaped text safe to display
- */
-export const escapeHTML = (text) => {
-  if (!text || typeof text !== 'string') return '';
-  
-  const escapeMap = {
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#x27;',
-    '/': '&#x2F;'
-  };
-  
-  return text.replace(/[&<>"'\/]/g, (char) => escapeMap[char]);
+const DEFAULT_MAX_LENGTH = 255;
+
+const trimAndNormalize = (value) => {
+  if (value === null || value === undefined) return '';
+  const str = String(value).trim();
+  return str.replace(/\s+/g, ' ');
 };
 
-/**
- * Sanitizes user input by trimming and escaping
- * @param {string} input - Raw user input
- * @param {object} options - Sanitization options
- * @returns {string} - Sanitized input
- */
-export const sanitizeInput = (input, options = {}) => {
-  const {
-    maxLength = 500,
-    allowHTML = false,
-    toLowerCase = false,
-    trim = true
-  } = options;
-
-  if (!input || typeof input !== 'string') return '';
-
-  let sanitized = input;
-
-  // Trim whitespace if requested
-  if (trim) {
-    sanitized = sanitized.trim();
-  }
-
-  // Limit length to prevent storage attacks
-  if (maxLength && sanitized.length > maxLength) {
-    sanitized = sanitized.substring(0, maxLength);
-  }
-
-  // Escape HTML unless explicitly allowed
-  if (!allowHTML) {
-    sanitized = escapeHTML(sanitized);
-  }
-
-  // Convert to lowercase if requested
-  if (toLowerCase) {
-    sanitized = sanitized.toLowerCase();
-  }
-
-  return sanitized;
+export const sanitizeInput = (value, options = {}) => {
+  const maxLength = typeof options.maxLength === 'number' ? options.maxLength : DEFAULT_MAX_LENGTH;
+  const sanitized = trimAndNormalize(value);
+  return sanitized.length <= maxLength ? sanitized : sanitized.slice(0, maxLength);
 };
 
-/**
- * Validates and sanitizes applicant name
- * @param {string} name - Applicant name
- * @returns {object} { isValid: boolean, value: string, error?: string }
- */
-export const validateApplicantName = (name) => {
-  const sanitized = sanitizeInput(name, { maxLength: 100 });
-
-  if (!sanitized || sanitized.length < 2) {
-    return { isValid: false, value: '', error: 'Name must be at least 2 characters' };
-  }
-
-  // Allow letters, spaces, hyphens, and apostrophes only
-  if (!/^[a-zA-Z\s'-]+$/.test(sanitized)) {
-    return { isValid: false, value: sanitized, error: 'Name contains invalid characters' };
-  }
-
-  return { isValid: true, value: sanitized };
-};
-
-/**
- * Validates and sanitizes contact number
- * @param {string} phone - Phone number
- * @returns {object} { isValid: boolean, value: string, error?: string }
- */
-export const validateContactNumber = (phone) => {
-  const sanitized = sanitizeInput(phone, { maxLength: 20 }).replace(/\s+/g, '');
-
-  if (!sanitized || sanitized.length < 7) {
-    return { isValid: false, value: '', error: 'Phone must be at least 7 digits' };
-  }
-
-  // Allow only digits, +, -, and parentheses
-  if (!/^[\d+\-()]+$/.test(sanitized)) {
-    return { isValid: false, value: sanitized, error: 'Phone contains invalid characters' };
-  }
-
-  return { isValid: true, value: sanitized };
-};
-
-/**
- * Validates and sanitizes note/comment
- * @param {string} note - Note text
- * @returns {object} { isValid: boolean, value: string, error?: string }
- */
-export const validateNote = (note) => {
-  const sanitized = sanitizeInput(note, { maxLength: 1000 });
-
-  if (!sanitized || sanitized.length < 1) {
-    return { isValid: false, value: '', error: 'Note cannot be empty' };
-  }
-
-  return { isValid: true, value: sanitized };
-};
-
-/**
- * Validates and sanitizes passport number
- * @param {string} passport - Passport number
- * @returns {object} { isValid: boolean, value: string, error?: string }
- */
-export const validatePassportNumber = (passport) => {
-  const sanitized = sanitizeInput(passport, { maxLength: 30 }).toUpperCase();
-
-  if (!sanitized || sanitized.length < 5) {
-    return { isValid: false, value: '', error: 'Passport must be at least 5 characters' };
-  }
-
-  // Allow alphanumeric characters only
-  if (!/^[A-Z0-9]+$/.test(sanitized)) {
-    return { isValid: false, value: sanitized, error: 'Passport contains invalid characters' };
-  }
-
-  return { isValid: true, value: sanitized };
-};
-
-/**
- * Validates and sanitizes numeric input
- * @param {string|number} value - Numeric value
- * @returns {object} { isValid: boolean, value: number, error?: string }
- */
-export const validateNumericInput = (value, options = {}) => {
-  const { min = 0, max = Infinity, allowDecimal = true } = options;
-
-  const num = parseFloat(value);
-
-  if (isNaN(num)) {
-    return { isValid: false, value: 0, error: 'Invalid number' };
-  }
-
-  if (num < min) {
-    return { isValid: false, value: min, error: `Value must be at least ${min}` };
-  }
-
-  if (num > max) {
-    return { isValid: false, value: max, error: `Value must not exceed ${max}` };
-  }
-
-  if (!allowDecimal && num % 1 !== 0) {
-    return { isValid: false, value: Math.round(num), error: 'Decimal values not allowed' };
-  }
-
-  return { isValid: true, value: num };
-};
-
-/**
- * Creates a safe display version of text (escaped for HTML rendering)
- * @param {string} text - Text to display
- * @returns {string} - Safe text for display
- */
-export const sanitizeForDisplay = (text) => {
-  return sanitizeInput(text, { allowHTML: false, trim: true });
-};
-
-/**
- * Validates all file creation data
- * @param {object} fileData - Raw file data from form
- * @returns {object} - { isValid: boolean, errors: object, data: object }
- */
-export const validateFileData = (fileData) => {
+export const validateFileData = (data) => {
   const errors = {};
-  const data = {};
 
-  // Validate applicant name
-  const nameVal = validateApplicantName(fileData.applicantName);
-  if (!nameVal.isValid) errors.applicantName = nameVal.error;
-  else data.applicantName = nameVal.value;
-
-  // Validate contact
-  const contactVal = validateContactNumber(fileData.contactNo);
-  if (!contactVal.isValid) errors.contactNo = contactVal.error;
-  else data.contactNo = contactVal.value;
-
-  // Validate passport if visa
-  if (fileData.fileType === 'Visa') {
-    const passportVal = validatePassportNumber(fileData.passportNo);
-    if (!passportVal.isValid) errors.passportNo = passportVal.error;
-    else data.passportNo = passportVal.value;
+  const applicantName = sanitizeInput(data.applicantName, { maxLength: 100 });
+  if (!applicantName) {
+    errors.applicantName = 'Applicant name is required';
   }
 
-  // Validate numeric fields for Visa and Air Ticket
-  if (fileData.serviceCharge !== undefined && fileData.serviceCharge !== '') {
-    const chargeVal = validateNumericInput(fileData.serviceCharge, { min: 0 });
-    if (!chargeVal.isValid) errors.serviceCharge = chargeVal.error;
-    else data.serviceCharge = chargeVal.value;
+  const contactNo = sanitizeInput(data.contactNo, { maxLength: 20 });
+  if (!contactNo) {
+    errors.contactNo = 'Contact number is required';
   }
 
-  if (fileData.cost !== undefined && fileData.cost !== '') {
-    const costVal = validateNumericInput(fileData.cost, { min: 0 });
-    if (!costVal.isValid) errors.cost = costVal.error;
-    else data.cost = costVal.value;
+  const fileType = sanitizeInput(data.fileType);
+  if (!fileType) {
+    errors.fileType = 'File type is required';
   }
 
-  // Validate package-specific numeric fields
-  if (fileData.packageSalePrice !== undefined && fileData.packageSalePrice !== '') {
-    const salePriceVal = validateNumericInput(fileData.packageSalePrice, { min: 0 });
-    if (!salePriceVal.isValid) errors.packageSalePrice = salePriceVal.error;
-    else data.packageSalePrice = salePriceVal.value;
-  }
+  if (fileType === 'Visa') {
+    const passportNo = sanitizeInput(data.passportNo, { maxLength: 30 });
+    if (!passportNo) {
+      errors.passportNo = 'Passport number is required';
+    }
 
-  if (fileData.packageCostPrice !== undefined && fileData.packageCostPrice !== '') {
-    const costPriceVal = validateNumericInput(fileData.packageCostPrice, { min: 0 });
-    if (!costPriceVal.isValid) errors.packageCostPrice = costPriceVal.error;
-    else data.packageCostPrice = costPriceVal.value;
-  }
+    const destination = sanitizeInput(data.destination, { maxLength: 50 });
+    if (!destination) {
+      errors.destination = 'Destination is required';
+    }
 
-  if (fileData.numberOfPersons !== undefined && fileData.numberOfPersons !== '') {
-    const personsVal = validateNumericInput(fileData.numberOfPersons, { min: 1, allowDecimal: false });
-    if (!personsVal.isValid) errors.numberOfPersons = personsVal.error;
-    else data.numberOfPersons = personsVal.value;
-  }
-
-  // Validate Pick & Drop-specific fields
-  if (fileData.fileType === 'Pick & Drop') {
-    if (fileData.pickupLocation !== undefined && fileData.pickupLocation !== '') {
-      if (fileData.pickupLocation.length < 3) {
-        errors.pickupLocation = 'Pickup location must be at least 3 characters';
-      } else if (fileData.pickupLocation.length > 100) {
-        errors.pickupLocation = 'Pickup location must not exceed 100 characters';
-      } else {
-        data.pickupLocation = fileData.pickupLocation;
+    if (data.serviceCharge !== undefined && data.serviceCharge !== null && data.serviceCharge !== '') {
+      const serviceCharge = Number(data.serviceCharge);
+      if (Number.isNaN(serviceCharge) || serviceCharge < 0) {
+        errors.serviceCharge = 'Service charge must be a non-negative number';
       }
     }
 
-    if (fileData.dropoffLocation !== undefined && fileData.dropoffLocation !== '') {
-      if (fileData.dropoffLocation.length < 3) {
-        errors.dropoffLocation = 'Dropoff location must be at least 3 characters';
-      } else if (fileData.dropoffLocation.length > 100) {
-        errors.dropoffLocation = 'Dropoff location must not exceed 100 characters';
-      } else {
-        data.dropoffLocation = fileData.dropoffLocation;
+    if (data.cost !== undefined && data.cost !== null && data.cost !== '') {
+      const cost = Number(data.cost);
+      if (Number.isNaN(cost) || cost < 0) {
+        errors.cost = 'Cost must be a non-negative number';
       }
     }
 
-    if (fileData.salePrice !== undefined && fileData.salePrice !== '') {
-      const salePriceVal = validateNumericInput(fileData.salePrice, { min: 0 });
-      if (!salePriceVal.isValid) errors.salePrice = salePriceVal.error;
-      else data.salePrice = salePriceVal.value;
+    if (data.reminderDate) {
+      const dateValidation = validateDateFormat(data.reminderDate);
+      if (!dateValidation.isValid) {
+        errors.reminderDate = dateValidation.error;
+      }
+    }
+  }
+
+  if (fileType === 'Air Ticket') {
+    const airlineRoute = sanitizeInput(data.airlineRoute);
+    if (!airlineRoute) {
+      errors.airlineRoute = 'Route is required';
     }
 
-    if (fileData.costPrice !== undefined && fileData.costPrice !== '') {
-      const costPriceVal = validateNumericInput(fileData.costPrice, { min: 0 });
-      if (!costPriceVal.isValid) errors.costPrice = costPriceVal.error;
-      else data.costPrice = costPriceVal.value;
+    const airlineSalePriceValue =
+      data.airlineSalePrice !== undefined &&
+      data.airlineSalePrice !== null &&
+      String(data.airlineSalePrice).trim() !== ''
+        ? data.airlineSalePrice
+        : data.serviceCharge;
+
+    if (airlineSalePriceValue === undefined || airlineSalePriceValue === null || String(airlineSalePriceValue).trim() === '') {
+      errors.airlineSalePrice = 'Sale price is required';
+    } else {
+      const airlineSalePrice = Number(airlineSalePriceValue);
+      if (!Number.isFinite(airlineSalePrice) || airlineSalePrice < 0) {
+        errors.airlineSalePrice = 'Sale price must be a non-negative number';
+      }
+    }
+
+    const airlineCostPriceValue =
+      data.airlineCostPrice !== undefined &&
+      data.airlineCostPrice !== null &&
+      String(data.airlineCostPrice).trim() !== ''
+        ? data.airlineCostPrice
+        : data.cost;
+
+    if (airlineCostPriceValue === undefined || airlineCostPriceValue === null || String(airlineCostPriceValue).trim() === '') {
+      errors.airlineCostPrice = 'Cost price is required';
+    } else {
+      const airlineCostPrice = Number(airlineCostPriceValue);
+      if (!Number.isFinite(airlineCostPrice) || airlineCostPrice < 0) {
+        errors.airlineCostPrice = 'Cost price must be a non-negative number';
+      }
+    }
+
+    const contactNo = sanitizeInput(data.contactNo, { maxLength: 20 });
+    if (!contactNo) {
+      errors.contactNo = 'Contact number is required';
+    }
+  }
+
+  if (fileType === 'Pick & Drop') {
+    const pickupLocation = sanitizeInput(data.pickupLocation, { maxLength: 100 });
+    if (!pickupLocation) {
+      errors.pickupLocation = 'Pickup location is required';
+    }
+
+    const dropoffLocation = sanitizeInput(data.dropoffLocation, { maxLength: 100 });
+    if (!dropoffLocation) {
+      errors.dropoffLocation = 'Dropoff location is required';
+    }
+
+    if (data.numberOfPersons === undefined || data.numberOfPersons === null || data.numberOfPersons === '') {
+      errors.numberOfPersons = 'Number of persons is required';
+    } else {
+      const numberOfPersons = Number(data.numberOfPersons);
+      if (!Number.isInteger(numberOfPersons) || numberOfPersons < 1) {
+        errors.numberOfPersons = 'Number of persons must be a whole number greater than zero';
+      }
+    }
+
+    if (data.salePrice === undefined || data.salePrice === null || data.salePrice === '') {
+      errors.salePrice = 'Sale price is required';
+    } else {
+      const salePrice = Number(data.salePrice);
+      if (!Number.isFinite(salePrice) || salePrice < 0) {
+        errors.salePrice = 'Sale price must be a non-negative number';
+      }
+    }
+
+    if (data.costPrice === undefined || data.costPrice === null || data.costPrice === '') {
+      errors.costPrice = 'Cost price is required';
+    } else {
+      const costPrice = Number(data.costPrice);
+      if (!Number.isFinite(costPrice) || costPrice < 0) {
+        errors.costPrice = 'Cost price must be a non-negative number';
+      }
+    }
+
+    const contactNo = sanitizeInput(data.contactNo, { maxLength: 20 });
+    if (!contactNo) {
+      errors.contactNo = 'Contact number is required';
+    }
+  }
+
+  if (fileType === 'Package') {
+    if (!Array.isArray(data.packageCountries) || data.packageCountries.length === 0) {
+      errors.packageCountries = 'At least one package country is required';
+    }
+
+    const packageNights = data.packageNights;
+    if (packageNights === undefined || packageNights === null) {
+      errors.packageNights = 'Please enter nights for selected countries';
+    } else if (typeof packageNights === 'object' && !Array.isArray(packageNights)) {
+      const missingCountry = Array.isArray(data.packageCountries)
+        ? data.packageCountries.find(country => packageNights[country] === undefined || packageNights[country] === '')
+        : null;
+      const invalidCountry = Object.entries(packageNights).find(([country, nights]) => {
+        const value = Number(nights);
+        return !Number.isInteger(value) || value < 1;
+      });
+
+      if (missingCountry) {
+        errors.packageNights = `Please enter nights for ${missingCountry}`;
+      } else if (invalidCountry) {
+        errors.packageNights = 'Package nights must be whole numbers greater than zero for selected countries';
+      }
+    } else {
+      const nights = Number(packageNights);
+      if (!Number.isInteger(nights) || nights < 1) {
+        errors.packageNights = 'Package nights must be a whole number greater than zero';
+      }
+    }
+
+    if (data.packageSalePrice === undefined || data.packageSalePrice === null || data.packageSalePrice === '') {
+      errors.packageSalePrice = 'Package sale price is required';
+    } else {
+      const packageSalePrice = Number(data.packageSalePrice);
+      if (!Number.isFinite(packageSalePrice) || packageSalePrice < 0) {
+        errors.packageSalePrice = 'Package sale price must be a non-negative number';
+      }
+    }
+
+    if (data.packageCostPrice === undefined || data.packageCostPrice === null || data.packageCostPrice === '') {
+      errors.packageCostPrice = 'Package cost price is required';
+    } else {
+      const packageCostPrice = Number(data.packageCostPrice);
+      if (!Number.isFinite(packageCostPrice) || packageCostPrice < 0) {
+        errors.packageCostPrice = 'Package cost price must be a non-negative number';
+      }
+    }
+
+    if (data.numberOfPersons === undefined || data.numberOfPersons === null || data.numberOfPersons === '') {
+      errors.numberOfPersons = 'Number of persons is required';
+    } else {
+      const numberOfPersons = Number(data.numberOfPersons);
+      if (!Number.isInteger(numberOfPersons) || numberOfPersons < 1) {
+        errors.numberOfPersons = 'Number of persons must be a whole number greater than zero';
+      }
+    }
+
+    const mainPersonPassport = sanitizeInput(data.mainPersonPassport, { maxLength: 30 });
+    if (!mainPersonPassport) {
+      errors.mainPersonPassport = 'Main person passport number is required';
+    }
+
+    const contactNo = sanitizeInput(data.contactNo, { maxLength: 20 });
+    if (!contactNo) {
+      errors.contactNo = 'Contact number is required';
     }
   }
 
   return {
     isValid: Object.keys(errors).length === 0,
-    errors,
-    data
+    errors
+  };
+};
+
+export const validateNote = (note) => {
+  const sanitizedNote = sanitizeInput(note, { maxLength: 500 });
+
+  if (!sanitizedNote) {
+    return { isValid: false, error: 'Note cannot be empty' };
+  }
+
+  return {
+    isValid: true,
+    value: sanitizedNote
   };
 };

@@ -1,5 +1,11 @@
 # React + Vite
 
+## Cash payment email notifications
+
+The app queues an email in the top-level Firestore `mail` collection when a new payment is recorded using a payment method whose name is `Cash` (case-insensitive). Configure the Firebase **Trigger Email from Firestore** extension to watch the `mail` collection and use your Hostinger mailbox's SMTP settings. Keep the SMTP password in the extension's server-side configuration; do not add it to the Vite environment or client code.
+
+Admins configure notification recipients in **Admin → Cash Payment Email Alerts**. Each queued message includes the payment amount, file ID, applicant name, country, file type, employee who recorded it, and receipt time. Email delivery will not begin until the Firebase extension is installed and configured.
+
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
 Currently, two official plugins are available:

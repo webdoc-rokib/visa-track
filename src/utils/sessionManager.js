@@ -17,10 +17,12 @@ export const storeSecureUserSession = (user) => {
   // Only store non-sensitive user data
   const safeUserData = {
     id: user.id,
+    uid: user.uid,
     name: user.name,
     username: user.username,
+    email: user.email,
     role: user.role,
-    // DO NOT STORE: password, email, phone, address, etc.
+    // DO NOT STORE: password, phone, address, etc.
   };
 
   localStorage.setItem('visaTrackUser', JSON.stringify(safeUserData));
