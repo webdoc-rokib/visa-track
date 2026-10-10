@@ -152,21 +152,18 @@ const RESULTS = {
   REJECTED: { label: 'Visa Rejected', color: 'text-red-600', icon: ThumbsDown },
 };
 
-const isFileCompleted = (file) => {
-  if (!file) return false;
+const isFileCompletedAtStatus = (file, status = file?.status) => {
+  if (!file || !status) return false;
+  const fileType = file.fileType || FILE_TYPES.VISA;
 
-  if (file.fileType === FILE_TYPES.VISA) {
-    return ['DONE', 'FOLLOW_UP'].includes(file.status);
-  } else if (file.fileType === FILE_TYPES.AIR_TICKET) {
-    return file.status === 'ISSUED';
-  } else if (file.fileType === FILE_TYPES.PACKAGE) {
-    return file.status === 'PACKAGE_READY';
-  } else if (file.fileType === FILE_TYPES.PICK_DROP) {
-    return ['PICKUP_DROP_BOOKED', 'PICKUP_DROP_CONFIRMED', 'PICKUP_DROP_COMPLETED'].includes(file.status);
-  }
-
+  if (fileType === FILE_TYPES.VISA) return status === 'DONE';
+  if (fileType === FILE_TYPES.PACKAGE) return status === 'PACKAGE_READY';
+  if (fileType === FILE_TYPES.AIR_TICKET) return status === 'ISSUED';
+  if (fileType === FILE_TYPES.PICK_DROP) return status === 'PICKUP_DROP_COMPLETED';
   return false;
 };
+
+const isFileCompleted = (file) => isFileCompletedAtStatus(file);
 
 // --- Helper Functions ---
 const formatDate = (timestamp) => {
@@ -439,6 +436,25 @@ const createInvoiceNumber = (fileId) => {
 
 const isCashPaymentMethod = (method) => String(method?.name || '').trim().toLowerCase() === 'cash';
 
+const normalizePaymentReference = (reference) => String(reference || '').trim().replace(/\s+/g, ' ').toLowerCase();
+
+const getPaymentReferenceDocumentId = (reference) => {
+  const normalized = normalizePaymentReference(reference);
+  const encoded = Array.from(new TextEncoder().encode(normalized), byte => byte.toString(16).padStart(2, '0')).join('');
+  return `ref_${encoded}`;
+};
+
+const findDuplicatePaymentReference = (files, reference) => {
+  const normalized = normalizePaymentReference(reference);
+  if (!normalized) return null;
+  for (const file of files) {
+    const payments = Array.isArray(file.invoicePayments) ? file.invoicePayments : Array.isArray(file.invoice?.payments) ? file.invoice.payments : [];
+    const payment = payments.find(item => normalizePaymentReference(item.transactionRef) === normalized);
+    if (payment) return { file, payment };
+  }
+  return null;
+};
+
 const buildCashPaymentMail = (file, payment, recipients) => {
   const fileId = file.fileId || file.id || 'N/A';
   const applicantName = file.applicantName || file.mainPersonName || 'N/A';
@@ -453,6 +469,7 @@ const buildCashPaymentMail = (file, payment, recipients) => {
     `Name: ${applicantName}`,
     `Country: ${country}`,
     `File type: ${fileType}`,
+    `Payment/Transaction reference: ${payment.transactionRef || 'N/A'}`,
     `Received by: ${payment.receivedBy || 'N/A'}`,
     `Received at: ${receivedAt.toLocaleString()}`
   ];
@@ -755,7 +772,6 @@ export default function VisaTrackApp() {
   const [packageHotelsBookedModalOpen, setPackageHotelsBookedModalOpen] = useState(false);
   const [packagePickupDropoffModalOpen, setPackagePickupDropoffModalOpen] = useState(false);
   const [pickDropBookedModalOpen, setPickDropBookedModalOpen] = useState(false);
-  const [pickDropConfirmedModalOpen, setPickDropConfirmedModalOpen] = useState(false);
   
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedAction, setSelectedAction] = useState(null);
@@ -1206,9 +1222,21 @@ export default function VisaTrackApp() {
     }, 1500);
   };
 
-  const generateInvoice = async (file, paymentStatus, paidAmount = null, paymentMethodId = '') => {
+  const generateInvoice = async (file, paymentStatus, paidAmount = null, paymentMethodId = '', transactionRef = '') => {
     if (!file || !file.id) return;
     const selectedMethod = paymentMethods.find(method => method.id === paymentMethodId);
+    const requestedPaidAmount = paymentStatus === 'Paid'
+      ? getInvoiceAmount(file) || 0
+      : paymentStatus === 'Partially Paid'
+        ? Math.min(Math.max(Number(paidAmount) || 0, 0), getInvoiceAmount(file) || 0)
+        : 0;
+    if (requestedPaidAmount > getInvoiceSummary(file).paidAmount) {
+      const duplicate = findDuplicatePaymentReference(files, transactionRef);
+      if (duplicate) {
+        alert(`This transaction reference was already used on file ${duplicate.file.fileId || duplicate.file.id}. Enter a unique reference.`);
+        return false;
+      }
+    }
 
     try {
       const fileDoc = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', file.id);
@@ -1226,9 +1254,18 @@ export default function VisaTrackApp() {
         const resolvedPaid = Math.max(previousPaid, requestedPaid);
         const newlyCollected = Math.round(Math.max(0, resolvedPaid - previousPaid) * 100) / 100;
         if (newlyCollected > 0 && !selectedMethod) throw new Error('Select a payment method for the new payment.');
+        if (newlyCollected > 0 && !transactionRef.trim()) throw new Error('Enter the payment / transaction reference for the new payment.');
         const status = resolvedPaid >= amount ? 'Paid' : resolvedPaid > 0 ? 'Partially Paid' : 'Unpaid';
         const invoiceNo = current.invoiceNo || createInvoiceNumber(current.fileId || `VT-${Date.now()}`);
         const invoicePayments = Array.isArray(current.invoicePayments) ? current.invoicePayments : Array.isArray(current.invoice?.payments) ? current.invoice.payments : [];
+        const referenceRef = newlyCollected > 0
+          ? doc(db, 'artifacts', appId, 'public', 'data', 'invoice_payment_refs', getPaymentReferenceDocumentId(transactionRef))
+          : null;
+        const referenceSnapshot = referenceRef ? await transaction.get(referenceRef) : null;
+        if (referenceSnapshot?.exists()) {
+          const referenceFileId = referenceSnapshot.data().fileId || referenceSnapshot.data().fileDocId || 'another file';
+          throw new Error(`This transaction reference was already used on file ${referenceFileId}. Enter a unique reference.`);
+        }
         const shouldNotifyCash = newlyCollected > 0 && isCashPaymentMethod(selectedMethod);
         const recipients = Array.isArray(cashPaymentNotificationEmails) ? cashPaymentNotificationEmails : [];
         const mailRef = shouldNotifyCash && recipients.length > 0 ? doc(collection(db, 'mail')) : null;
@@ -1241,7 +1278,8 @@ export default function VisaTrackApp() {
           methodName: selectedMethod.name || '',
           institution: selectedMethod.institution || '',
           accountName: selectedMethod.accountName || '',
-          accountNumber: selectedMethod.accountNumber || ''
+          accountNumber: selectedMethod.accountNumber || '',
+          transactionRef: transactionRef.trim()
         } : null;
         const invoiceData = {
           invoiceNo,
@@ -1253,6 +1291,17 @@ export default function VisaTrackApp() {
           ...(payment ? { invoicePayments: [...invoicePayments, payment] } : {})
         };
         transaction.update(fileDoc, invoiceData);
+        if (referenceRef && payment) {
+          transaction.set(referenceRef, {
+            transactionRef: payment.transactionRef,
+            normalizedReference: normalizePaymentReference(payment.transactionRef),
+            paymentId: payment.id,
+            fileDocId: current.id,
+            fileId: current.fileId || current.id,
+            amount: payment.amount,
+            createdAt: serverTimestamp()
+          });
+        }
         if (mailRef && payment) {
           transaction.set(mailRef, { ...buildCashPaymentMail(current, payment, recipients), createdAt: serverTimestamp() });
         }
@@ -1313,8 +1362,6 @@ export default function VisaTrackApp() {
     } else if (fileType === FILE_TYPES.PICK_DROP) {
       if (action === 'PICKUP_DROP_BOOKED') {
         setPickDropBookedModalOpen(true);
-      } else if (action === 'PICKUP_DROP_CONFIRMED') {
-        setPickDropConfirmedModalOpen(true);
       } else {
         setModalOpen(true);
       }
@@ -1527,7 +1574,6 @@ export default function VisaTrackApp() {
     setPackageHotelsBookedModalOpen(false);
     setPackagePickupDropoffModalOpen(false);
     setPickDropBookedModalOpen(false);
-    setPickDropConfirmedModalOpen(false);
   };
 
   const handleAddNote = async (note) => {
@@ -1553,7 +1599,7 @@ export default function VisaTrackApp() {
   };
 
   const handleEditFile = async (data) => {
-    if (!appUser || !selectedFile) return;
+    if (!appUser || appUser.role !== ROLES.ADMIN || !selectedFile) return;
     
     try {
       const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id);
@@ -1563,24 +1609,31 @@ export default function VisaTrackApp() {
       
       const oldCreatedBy = selectedFile.createdBy || '';
       const newCreatedBy = data.createdBy || '';
-      
-      console.log('Old createdBy:', oldCreatedBy, 'New createdBy:', newCreatedBy);
-      
-      // When createdBy (sales rep) is changed, update assignedTo and add history entry
+      const oldAssignee = selectedFile.assignedTo || '';
+      const newAssignee = data.assignedTo || '';
+      const historyEntries = [];
+
       if (newCreatedBy && oldCreatedBy !== newCreatedBy) {
-        console.log('Sales rep changed! Updating assignedTo and history');
-        updateData.assignedTo = newCreatedBy;
-        
-        // Add to history to track sales rep change
-        const historyEntry = {
+        historyEntries.push({
           status: selectedFile.status,
           timestamp: Date.now(),
           performedBy: appUser.name,
           action: `Sales Rep changed from ${oldCreatedBy} to ${newCreatedBy}`,
           note: `Sales Rep changed from ${oldCreatedBy} to ${newCreatedBy}`
-        };
-        
-        updateData.history = [...(selectedFile.history || []), historyEntry];
+        });
+      }
+
+      if (oldAssignee !== newAssignee) {
+        historyEntries.push({
+          status: selectedFile.status,
+          timestamp: Date.now(),
+          performedBy: appUser.name,
+          action: `File reassigned from ${oldAssignee || 'Unassigned'} to ${newAssignee || 'Unassigned'}`
+        });
+      }
+
+      if (historyEntries.length > 0) {
+        updateData.history = [...historyEntries, ...(selectedFile.history || [])];
       }
       
       if (selectedFile.fileType === FILE_TYPES.VISA) {
@@ -1601,9 +1654,7 @@ export default function VisaTrackApp() {
       
       updateData.updatedAt = serverTimestamp();
       
-      console.log('Final update data:', updateData);
       await updateDoc(fileRef, updateData);
-      console.log('File updated successfully');
       setEditModalOpen(false);
       alert('File updated successfully!');
     } catch (err) {
@@ -2075,6 +2126,10 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
   const [currentTime, setCurrentTime] = useState(getDhakaDate());
   const itemsPerPage = 20;
   const isAdmin = user?.role === ROLES.ADMIN;
+  const activeTasks = useMemo(
+    () => myTasks.filter(task => task?.status && !isFileCompleted(task)),
+    [myTasks]
+  );
 
   useEffect(() => {
     setCurrentPage(1);
@@ -2111,7 +2166,8 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
     // Build user roles map
     const userRoles = {};
     allUsers.forEach(u => {
-      userRoles[u.fullName] = u.role;
+      const userName = u.name || u.fullName;
+      if (userName) userRoles[userName] = u.role;
     });
     
     // ===== CATEGORY 3: BEST SALES =====
@@ -2120,12 +2176,13 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
     
     files.forEach(file => {
       const createdDate = toDhakaTime(file.createdAt);
-      if (!createdDate || createdDate < HONORS_START_DATE || !file.isNewSale) return;
+      if (!createdDate || createdDate < HONORS_START_DATE || file.isNewSale === false) return;
       
       const fileMonthString = getMonthString(createdDate);
       if (fileMonthString !== monthString) return;
       
-      const user = file.assignedTo || 'System';
+      const user = file.createdBy;
+      if (!user) return;
       if (userRoles[user] !== ROLES.SALES) return;
       
       salesCounts[user] = (salesCounts[user] || 0) + 1;
@@ -2142,13 +2199,18 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
     const processingCounts = {};
     
     files.forEach(file => {
-      const updatedDate = toDhakaTime(file.updatedAt);
-      if (!updatedDate || updatedDate < HONORS_START_DATE || file.status !== 'SUBMITTED') return;
-      
-      const fileMonthString = getMonthString(updatedDate);
-      if (fileMonthString !== monthString) return;
-      
-      const user = file.assignedTo || 'System';
+      const completionEvent = (file.history || []).find(entry => {
+        if (!isFileCompletedAtStatus(file, entry.status)) return false;
+        const completedAt = getTimestampDate(entry.timestamp);
+        if (!completedAt) return false;
+        const completedDate = new Date(completedAt.getTime() + 6 * 60 * 60 * 1000);
+        return completedDate >= HONORS_START_DATE &&
+          getMonthString(completedDate) === monthString &&
+          userRoles[entry.performedBy] === ROLES.PROCESSING;
+      });
+      if (!completionEvent) return;
+
+      const user = completionEvent.performedBy;
       processingCounts[user] = (processingCounts[user] || 0) + 1;
     });
     
@@ -2178,7 +2240,7 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
       if (f.createdAt?.seconds * 1000 >= today.getTime() && isSale) {
         salesToday++;
       }
-      if (!['DONE', 'RECEIVED_SALES', 'FOLLOW_UP'].includes(f.status)) {
+      if (f.status !== 'RECEIVED_SALES' && !isFileCompleted(f)) {
         inProcess++;
       }
       const submittedAction = f.history.find(h => h.status === 'SUBMITTED' && h.timestamp >= today.getTime());
@@ -2596,10 +2658,10 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
                  <h3 className={`font-semibold flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}><CheckSquare className="h-4 w-4"/> My Active Tasks</h3>
               </div>
               <div className={`divide-y max-h-64 overflow-y-auto ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                 {myTasks.length === 0 ? (
+                 {activeTasks.length === 0 ? (
                     <p className="p-4 text-sm text-slate-400 text-center">No active files assigned to you.</p>
                  ) : (
-                    myTasks.map(t => (
+                    activeTasks.map(t => (
                        <div key={t.id} className={`p-4 transition-colors cursor-pointer ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`} onClick={() => onOpenUpdateModal(t, t.status)}>
                           <div className="flex justify-between items-start">
                              <span className={`font-medium text-sm ${textMain}`}>{t.applicantName}</span>
@@ -3102,7 +3164,7 @@ function PipelineView({ files, darkMode, onOpenFile }) {
   const groupedFiles = useMemo(() => {
     const groups = {};
     files.forEach(f => {
-      if (f.status === 'DONE') return;
+      if (isFileCompleted(f)) return;
       
       // Apply filters
       if (filterCreatedBy !== 'ALL' && f.createdBy !== filterCreatedBy) return;
@@ -3122,7 +3184,7 @@ function PipelineView({ files, darkMode, onOpenFile }) {
   }, [files]);
 
   const statuses = useMemo(() => {
-    const unique = new Set(files.filter(f => f.status !== 'DONE').map(f => f.status));
+    const unique = new Set(files.filter(f => !isFileCompleted(f)).map(f => f.status));
     return Array.from(unique).sort();
   }, [files]);
 
@@ -3195,7 +3257,9 @@ function PipelineView({ files, darkMode, onOpenFile }) {
                     </div>
                     <h4 className={`font-medium line-clamp-1 ${textMain}`}>{file.applicantName}</h4>
                     <div className="flex items-center gap-2 mt-2 text-xs text-slate-500">
-                       <MapPin className="h-3 w-3"/> {file.destination || 'N/A'}
+                       <MapPin className="h-3 w-3"/> {file.fileType === FILE_TYPES.PICK_DROP
+                         ? `${file.pickupLocation || 'N/A'} → ${file.dropoffLocation || 'N/A'}`
+                         : file.destination || 'N/A'}
                     </div>
                  </div>
                ))}
@@ -3229,10 +3293,7 @@ function ProcessingTracker({ files, darkMode, onOpenFile }) {
   const trackedFiles = useMemo(() => files
     .filter(file => {
       if (!file.status) return false;
-      if (file.fileType === FILE_TYPES.VISA) {
-        return !['RECEIVED_SALES', 'DONE'].includes(file.status);
-      }
-      return !isFileCompleted(file);
+      return file.status !== 'RECEIVED_SALES' && !isFileCompleted(file);
     })
     .map(file => {
       let statusDate = getTimestampDate(file.statusChangedAt);
@@ -4300,10 +4361,14 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
       return actions_pkg;
     }
     
-    // Pick & Drop workflow - user can mark service as booked, completing that processing flow
+    // Pick & Drop workflow progresses through booking, confirmation, and service completion.
     if (file.fileType === FILE_TYPES.PICK_DROP) {
       if (file.status === 'PICKUP_DROP_INITIATED') {
         actions.push({ key: 'PICKUP_DROP_BOOKED', label: STATUS['PICKUP_DROP_BOOKED'].label, isSpecial: true });
+      } else if (file.status === 'PICKUP_DROP_BOOKED') {
+        actions.push({ key: 'PICKUP_DROP_CONFIRMED', label: STATUS['PICKUP_DROP_CONFIRMED'].label });
+      } else if (file.status === 'PICKUP_DROP_CONFIRMED') {
+        actions.push({ key: 'PICKUP_DROP_COMPLETED', label: STATUS['PICKUP_DROP_COMPLETED'].label });
       }
       return actions;
     }
@@ -4348,6 +4413,11 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
   const textSub = darkMode ? 'text-slate-400' : 'text-slate-500';
   const statusColor = (darkMode && STATUS[file.status].darkColor) ? STATUS[file.status].darkColor : STATUS[file.status].color;
   const invoiceSummary = getInvoiceSummary(file);
+  const invoicePayments = Array.isArray(file.invoicePayments)
+    ? file.invoicePayments
+    : Array.isArray(file.invoice?.payments)
+      ? file.invoice.payments
+      : [];
   const invoiceBadgeClass = invoiceSummary.paymentStatus === 'Paid'
     ? (darkMode ? 'bg-green-900/30 text-green-400 border-green-800' : 'bg-green-100 text-green-700 border-green-200')
     : invoiceSummary.paymentStatus === 'Partially Paid'
@@ -4396,6 +4466,13 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
                     {file.airlineSalePrice && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold">৳</span> {file.airlineSalePrice}</span>}
                     {canViewCosts && file.airlineCostPrice && <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400"><span className="text-sm font-bold">Cost</span> ৳{file.airlineCostPrice}</span>}
                   </>
+                ) : file.fileType === FILE_TYPES.PICK_DROP ? (
+                  <>
+                    <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {file.pickupLocation || 'N/A'} → {file.dropoffLocation || 'N/A'}</span>
+                    {file.numberOfPersons !== undefined && file.numberOfPersons !== null && <span className="flex items-center gap-1"><User className="h-3 w-3" /> {file.numberOfPersons} person{Number(file.numberOfPersons) === 1 ? '' : 's'}</span>}
+                    {file.salePrice !== undefined && file.salePrice !== null && <span className="flex items-center gap-1 text-slate-600 dark:text-slate-400"><span className="text-sm font-bold">৳</span> {file.salePrice}</span>}
+                    {canViewCosts && file.costPrice !== undefined && file.costPrice !== null && <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400"><span className="text-sm font-bold">Cost</span> ৳{file.costPrice}</span>}
+                  </>
                 ) : (
                   <>
                     <span className="flex items-center gap-1"><User className="h-3 w-3" /> {file.passportNo}</span>
@@ -4420,7 +4497,7 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
             <span className={`px-3 py-1 rounded-full text-sm font-medium ${statusColor}`}>
               {STATUS[file.status].label}
             </span>
-            <span className="text-xs text-slate-400">Assigned: {file.assignedTo}</span>
+            <span className="text-xs text-slate-400">Assigned: {file.assignedTo || 'Unassigned'}</span>
           </div>
         </div>
 
@@ -4481,7 +4558,7 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
             )}
           </div>
 
-          {(isOwner || ((file.fileType === FILE_TYPES.PACKAGE || file.fileType === FILE_TYPES.AIR_TICKET) && user.role === ROLES.ADMIN)) && file.status !== 'DONE' && file.status !== 'ISSUED' && file.status !== 'PACKAGE_READY' && (
+          {(isOwner || ((file.fileType === FILE_TYPES.PACKAGE || file.fileType === FILE_TYPES.AIR_TICKET) && user.role === ROLES.ADMIN)) && !isFileCompleted(file) && (
             <div className="flex flex-wrap gap-1.5 sm:gap-2 w-full sm:w-auto">
               {getAvailableActions().map(action => (
                 <button
@@ -4511,6 +4588,48 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
 
       {expanded && (
         <div className={`p-5 border-t ${darkMode ? 'bg-slate-950/50 border-slate-800' : 'bg-slate-50 border-slate-100'}`}>
+          {invoiceSummary.amount > 0 && (
+              <section className={`mb-6 p-4 rounded-lg border ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
+                <h4 className={`text-sm font-semibold mb-3 ${textMain}`}>Invoice Payment Transactions</h4>
+                {invoicePayments.length > 0 ? (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead className={`${darkMode ? 'text-slate-400' : 'text-slate-500'} border-b ${darkMode ? 'border-slate-700' : 'border-slate-200'}`}>
+                        <tr>
+                          <th className="py-2 pr-3">Date</th>
+                          <th className="py-2 pr-3">Amount</th>
+                          <th className="py-2 pr-3">Method / Account</th>
+                          <th className="py-2 pr-3">Transaction Ref</th>
+                          <th className="py-2">Received By</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {invoicePayments.map((payment, index) => {
+                          const timestamp = payment.receivedAt?.toDate
+                            ? payment.receivedAt.toDate()
+                            : payment.receivedAt?.seconds
+                              ? new Date(payment.receivedAt.seconds * 1000)
+                              : new Date(payment.receivedAt);
+                          const dateLabel = Number.isNaN(timestamp.getTime()) ? 'Date unavailable' : timestamp.toLocaleString();
+                          return (
+                            <tr key={payment.id || index} className={`border-b last:border-0 ${darkMode ? 'border-slate-800 text-slate-300' : 'border-slate-100 text-slate-700'}`}>
+                              <td className="py-2 pr-3 whitespace-nowrap">{dateLabel}</td>
+                              <td className="py-2 pr-3 whitespace-nowrap font-semibold">{formatCurrency(Number(payment.amount) || 0)}</td>
+                              <td className="py-2 pr-3">{[payment.methodName, payment.institution, payment.accountName, payment.accountNumber].filter(Boolean).join(' · ') || 'Unattributed legacy payment'}</td>
+                              <td className="py-2 pr-3">{payment.transactionRef || '—'}</td>
+                              <td className="py-2">{payment.receivedBy || '—'}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className={`text-xs ${textSub}`}>No transaction entries are saved on this file yet. Historical paid amounts may not have transaction details.</p>
+                )}
+              </section>
+          )}
+
           {/* Display Air Ticket & Package Details */}
           {file.fileType === FILE_TYPES.AIR_TICKET && (file.pnr || file.portal || file.bookingValidity) && (
             <div className="mb-6 p-4 rounded-lg border border-purple-200 dark:border-purple-800 bg-purple-50 dark:bg-purple-900/20">
@@ -4582,6 +4701,40 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
                     </div>
                   </div>
                 )}
+              </div>
+            </div>
+          )}
+
+          {file.fileType === FILE_TYPES.PICK_DROP && (
+            <div className="mb-6 p-4 rounded-lg border border-orange-200 dark:border-orange-800 bg-orange-50 dark:bg-orange-900/20">
+              <h4 className="text-sm font-semibold text-orange-700 dark:text-orange-300 mb-3">🚗 Pick &amp; Drop Booking Details</h4>
+              <div className="space-y-3 text-sm">
+                <div className="pb-3 border-b border-orange-200 dark:border-orange-800">
+                  <p className="font-medium">Route</p>
+                  <p className="text-xs text-slate-600 dark:text-slate-400 mt-1">
+                    <span className="font-medium">Pickup:</span> {file.pickupLocation || 'N/A'}
+                  </p>
+                  <p className="text-xs text-slate-600 dark:text-slate-400">
+                    <span className="font-medium">Dropoff:</span> {file.dropoffLocation || 'N/A'}
+                  </p>
+                </div>
+                <div className="pb-3 border-b border-orange-200 dark:border-orange-800">
+                  <p className="font-medium">Passengers &amp; Price</p>
+                  <p className="text-xs text-slate-600 dark:text-slate-400 mt-1">
+                    <span className="font-medium">Number of Persons:</span> {file.numberOfPersons ?? 'N/A'}
+                  </p>
+                  <p className="text-xs text-slate-600 dark:text-slate-400">
+                    <span className="font-medium">Sale Price:</span> {formatCurrency(Number(file.salePrice) || 0)}
+                  </p>
+                  {canViewCosts && (
+                    <p className="text-xs text-slate-600 dark:text-slate-400">
+                      <span className="font-medium">Cost Price:</span> {formatCurrency(Number(file.costPrice) || 0)}
+                    </p>
+                  )}
+                </div>
+                <p className="text-xs text-slate-600 dark:text-slate-400">
+                  <span className="font-medium">Booking Status:</span> {STATUS[file.status]?.label || file.status || 'N/A'}
+                </p>
               </div>
             </div>
           )}
@@ -4847,7 +5000,18 @@ function PickDropBookedModal({ isOpen, onClose, onConfirm, file, darkMode }) {
     : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
 
   const handleSubmit = () => {
-    if (!pickupLocation || !dropoffLocation || !salePrice || !costPrice) {
+    const numericSalePrice = Number(salePrice);
+    const numericCostPrice = Number(costPrice);
+    if (
+      !pickupLocation.trim() ||
+      !dropoffLocation.trim() ||
+      salePrice === '' ||
+      costPrice === '' ||
+      !Number.isFinite(numericSalePrice) ||
+      !Number.isFinite(numericCostPrice) ||
+      numericSalePrice < 0 ||
+      numericCostPrice < 0
+    ) {
       alert('Please fill in all Pick & Drop booking details');
       return;
     }
@@ -5623,7 +5787,8 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                     serviceCharge: file.serviceCharge || '',
                     cost: file.cost || '',
                     reminderDate: file.reminderDate || '',
-                    createdBy: file.createdBy || ''
+                    createdBy: file.createdBy || '',
+                    assignedTo: file.assignedTo || ''
                 });
             } else if (fileType === FILE_TYPES.AIR_TICKET) {
                 setEditData({
@@ -5634,7 +5799,8 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                     airlineCostPrice: file.airlineCostPrice || '',
                     pnr: file.pnr || '',
                     portal: file.portal || '',
-                    createdBy: file.createdBy || ''
+                    createdBy: file.createdBy || '',
+                    assignedTo: file.assignedTo || ''
                 });
             } else if (fileType === FILE_TYPES.PACKAGE) {
                 setEditData({
@@ -5648,7 +5814,8 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                     includesPickDrop: file.includesPickDrop || false,
                     packageSalePrice: file.packageSalePrice || '',
                     packageCostPrice: file.packageCostPrice || '',
-                    createdBy: file.createdBy || ''
+                    createdBy: file.createdBy || '',
+                    assignedTo: file.assignedTo || ''
                 });
             } else if (fileType === FILE_TYPES.PICK_DROP) {
                 setEditData({
@@ -5659,7 +5826,8 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                     numberOfPersons: file.numberOfPersons || '',
                     salePrice: file.salePrice || '',
                     costPrice: file.costPrice || '',
-                    createdBy: file.createdBy || ''
+                    createdBy: file.createdBy || '',
+                    assignedTo: file.assignedTo || ''
                 });
             }
             setInitialized(true);
@@ -5692,6 +5860,10 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
     const inputClass = darkMode 
       ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
       : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+    const assignees = (allUsers || [])
+      .map(user => ({ name: user.fullName || user.name || user.username, role: user.role, id: user.id }))
+      .filter(user => user.name && user.name !== 'Processing Team');
+    const currentAssigneeIsListed = assignees.some(user => user.name === editData.assignedTo);
 
     const renderVISAFields = () => (
         <>
@@ -5957,19 +6129,38 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                 <div className="space-y-4">
                     {/* Sales Rep - Admin Only */}
                     {currentUser?.role === ROLES.ADMIN && (
-                        <div>
-                            <label className="block text-sm font-medium mb-1 opacity-80">Sales Rep</label>
-                            <select 
-                                className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`} 
-                                value={editData.createdBy} 
-                                onChange={e => setEditData({...editData, createdBy: e.target.value})}
-                            >
-                                <option value="">Select Sales Rep</option>
-                                {allUsers && allUsers.map(u => (
-                                    <option key={u.id} value={u.fullName}>{u.fullName} ({u.role})</option>
-                                ))}
-                            </select>
-                        </div>
+                        <>
+                            <div>
+                                <label className="block text-sm font-medium mb-1 opacity-80">Sales Rep</label>
+                                <select
+                                    className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}
+                                    value={editData.createdBy}
+                                    onChange={e => setEditData({...editData, createdBy: e.target.value})}
+                                >
+                                    <option value="">Select Sales Rep</option>
+                                    {allUsers && allUsers.map(u => (
+                                        <option key={u.id} value={u.fullName || u.name || u.username}>{u.fullName || u.name || u.username} ({u.role})</option>
+                                    ))}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1 opacity-80">Assigned To</label>
+                                <select
+                                    className={`w-full px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}
+                                    value={editData.assignedTo}
+                                    onChange={e => setEditData({...editData, assignedTo: e.target.value})}
+                                >
+                                    <option value="">Unassigned</option>
+                                    <option value="Processing Team">Processing Team</option>
+                                    {!currentAssigneeIsListed && editData.assignedTo && (
+                                        <option value={editData.assignedTo}>{editData.assignedTo} (current assignment)</option>
+                                    )}
+                                    {assignees.map(user => (
+                                        <option key={user.id} value={user.name}>{user.name} ({user.role})</option>
+                                    ))}
+                                </select>
+                            </div>
+                        </>
                     )}
                     
                     {(file?.fileType === FILE_TYPES.VISA || !file?.fileType) && renderVISAFields()}
@@ -6030,6 +6221,7 @@ function ResultModal({ isOpen, onClose, message, darkMode }) {
 function NotificationModal({ isOpen, onClose, tasks, onOpenTask, darkMode }) {
   if (!isOpen) return null;
 
+  const activeTasks = tasks.filter(task => task?.status && !isFileCompleted(task));
   const cardClass = darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900';
   const headerClass = darkMode ? 'bg-slate-950/50 border-slate-800' : 'bg-slate-50 border-slate-100';
   const footerClass = darkMode ? 'bg-slate-950/50 border-slate-800' : 'bg-slate-50 border-slate-100';
@@ -6050,14 +6242,14 @@ function NotificationModal({ isOpen, onClose, tasks, onOpenTask, darkMode }) {
         </div>
         
         <div className="max-h-[60vh] overflow-y-auto p-2">
-          {tasks.length === 0 ? (
+          {activeTasks.length === 0 ? (
             <div className="py-12 text-center text-slate-400 flex flex-col items-center gap-3">
                <CheckCircle className="h-10 w-10 text-slate-200"/>
                <p>You're all caught up! No pending tasks.</p>
             </div>
           ) : (
             <div className="space-y-2">
-              {tasks.map(task => (
+              {activeTasks.map(task => (
                 <div key={task.id} className={`p-3 rounded-xl border border-transparent transition-all group cursor-pointer ${itemHover}`} onClick={() => onOpenTask(task)}>
                    <div className="flex justify-between items-start mb-1">
                       <span className="font-semibold">{task.applicantName}</span>
@@ -6189,7 +6381,7 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
 
     files.forEach(file => {
       if (userFilter === 'ALL' || file.assignedTo === userFilter) {
-        if (!['DONE', 'RECEIVED_SALES'].includes(file.status)) {
+        if (file.status !== 'RECEIVED_SALES' && !isFileCompleted(file)) {
           reportData.processing.inProcess++;
         }
       }
@@ -6265,10 +6457,10 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
 
             if (entry.status === 'SUBMITTED') reportData.processing.submittedToday++;
             if (entry.status === 'DOCS_PENDING') reportData.processing.docsPendingToday++;
-            if (entry.status === 'DONE') {
+            if (isFileCompletedAtStatus(file, entry.status)) {
               reportData.processing.completedToday++;
-              if (entry.result === 'APPROVED') reportData.processing.approvals++;
-              if (entry.result === 'REJECTED') reportData.processing.rejections++;
+              if ((file.fileType || FILE_TYPES.VISA) === FILE_TYPES.VISA && entry.result === 'APPROVED') reportData.processing.approvals++;
+              if ((file.fileType || FILE_TYPES.VISA) === FILE_TYPES.VISA && entry.result === 'REJECTED') reportData.processing.rejections++;
             }
 
             // Only count actual customer communications (FOLLOW_UP, DOCS_PENDING)
@@ -6425,6 +6617,9 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
         } else if (file.fileType === FILE_TYPES.PACKAGE) {
           repData[repName].revenue += Number(file.packageSalePrice || 0);
           repData[repName].cost += Number(file.packageCostPrice || 0);
+        } else if (file.fileType === FILE_TYPES.PICK_DROP) {
+          repData[repName].revenue += Number(file.salePrice || 0);
+          repData[repName].cost += Number(file.costPrice || 0);
         } else {
           repData[repName].revenue += Number(file.serviceCharge || 0);
           repData[repName].cost += Number(file.cost || 0);
@@ -6513,9 +6708,7 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
 
       const assignee = metrics.get(file.assignedTo);
       if (assignee?.role === ROLES.PROCESSING && file.status &&
-          (file.fileType === FILE_TYPES.VISA
-            ? file.status !== 'DONE'
-            : !isFileCompleted(file))) {
+          file.status !== 'RECEIVED_SALES' && !isFileCompleted(file)) {
         assignee.activeAssigned++;
         let statusDate = getTimestampDate(file.statusChangedAt);
         if (!statusDate) {
@@ -6551,12 +6744,7 @@ function StatisticalReports({ files, currentUser, darkMode, onOpenInvoiceModal }
 
         performer.statusActions++;
         if (entry.status === 'SUBMITTED') performer.submitted++;
-        if (
-          (file.fileType === FILE_TYPES.VISA && entry.status === 'DONE') ||
-          (file.fileType === FILE_TYPES.AIR_TICKET && entry.status === 'ISSUED') ||
-          (file.fileType === FILE_TYPES.PACKAGE && entry.status === 'PACKAGE_READY') ||
-          (file.fileType === FILE_TYPES.PICK_DROP && entry.status === 'PICKUP_DROP_COMPLETED')
-        ) performer.completed++;
+        if (isFileCompletedAtStatus(file, entry.status)) performer.completed++;
         if (entry.status === 'DONE' && entry.result === 'APPROVED') performer.approved++;
         if (entry.status === 'DONE' && entry.result === 'REJECTED') performer.rejected++;
       });
@@ -7590,6 +7778,7 @@ function InvoiceModal({ isOpen, onClose, file, paymentMethods = [], cashPaymentN
   const [paymentStatus, setPaymentStatus] = useState('Unpaid');
   const [paidAmount, setPaidAmount] = useState('');
   const [paymentMethodId, setPaymentMethodId] = useState('');
+  const [transactionRef, setTransactionRef] = useState('');
   const [showPaidAmountInput, setShowPaidAmountInput] = useState(false);
 
   if (!isOpen || !file) return null;
@@ -7609,15 +7798,19 @@ function InvoiceModal({ isOpen, onClose, file, paymentMethods = [], cashPaymentN
       alert('Select a payment method for the payment.');
       return;
     }
+    if (requestedAmount > getInvoiceSummary(file).paidAmount && !transactionRef.trim()) {
+      alert('Enter the payment / transaction reference.');
+      return;
+    }
     let saved;
     if (paymentStatus === 'Partially Paid') {
       if (!paidAmount || !Number.isFinite(Number(paidAmount)) || Number(paidAmount) < 0) {
         alert('Please enter a valid paid amount');
         return;
       }
-      saved = await onGenerateInvoice(file, paymentStatus, paidAmount, paymentMethodId);
+      saved = await onGenerateInvoice(file, paymentStatus, paidAmount, paymentMethodId, transactionRef);
     } else {
-      saved = await onGenerateInvoice(file, paymentStatus, null, paymentMethodId);
+      saved = await onGenerateInvoice(file, paymentStatus, null, paymentMethodId, transactionRef);
     }
     if (saved) onClose();
   };
@@ -7629,6 +7822,7 @@ function InvoiceModal({ isOpen, onClose, file, paymentMethods = [], cashPaymentN
   const invoiceAmount = getInvoiceAmount(file) || 0;
   const requestedPaidAmount = paymentStatus === 'Paid' ? invoiceAmount : paymentStatus === 'Partially Paid' ? Number(paidAmount) || 0 : 0;
   const recordsNewPayment = requestedPaidAmount > getInvoiceSummary(file).paidAmount;
+  const showPaymentDetails = paymentStatus === 'Partially Paid' || recordsNewPayment;
   const selectedMethod = paymentMethods.find(method => method.id === paymentMethodId);
 
   return (
@@ -7696,15 +7890,26 @@ function InvoiceModal({ isOpen, onClose, file, paymentMethods = [], cashPaymentN
               />
             </div>
           )}
-          {recordsNewPayment && (
+          {showPaymentDetails && (
             <div>
+              {paymentStatus === 'Partially Paid' && <p className={`text-xs ${textSub} mb-2`}>Enter the total paid so far. Payment details are saved only for any new amount collected.</p>}
               <label className={`block text-sm font-semibold ${textSub} uppercase tracking-wider mb-2`}>Payment Method / Account</label>
-              <select value={paymentMethodId} onChange={e => setPaymentMethodId(e.target.value)} className={`w-full px-3 py-2 rounded-lg border ${inputClass}`} required>
+              <select value={paymentMethodId} onChange={e => setPaymentMethodId(e.target.value)} className={`w-full px-3 py-2 rounded-lg border ${inputClass}`} required={recordsNewPayment}>
                 <option value="">Select payment method</option>
                 {paymentMethods.map(method => <option key={method.id} value={method.id}>{[method.name, method.institution, method.accountNumber].filter(Boolean).join(' — ')}</option>)}
               </select>
               {paymentMethods.length === 0 && <p className="text-xs text-red-500 mt-1">An admin must configure a payment method before recording a payment.</p>}
               {isCashPaymentMethod(selectedMethod) && cashPaymentNotificationEmails.length === 0 && <p className="text-xs text-amber-600 mt-1">No cash payment notification email recipients are configured.</p>}
+              <label className={`block text-sm font-semibold ${textSub} uppercase tracking-wider mt-3 mb-2`}>Payment / Transaction Reference</label>
+              <input
+                type="text"
+                value={transactionRef}
+                onChange={e => setTransactionRef(e.target.value)}
+                placeholder="Receipt number, bank reference, or cash voucher"
+                maxLength={120}
+                required={recordsNewPayment}
+                className={`w-full px-3 py-2 rounded-lg border ${inputClass}`}
+              />
             </div>
           )}
         </div>
@@ -7757,6 +7962,7 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [paymentAmount, setPaymentAmount] = useState('');
   const [paymentNote, setPaymentNote] = useState('');
+  const [paymentTransactionRef, setPaymentTransactionRef] = useState('');
   const [paymentMethodId, setPaymentMethodId] = useState('');
   const [paymentProcessing, setPaymentProcessing] = useState(false);
   const [collectionPeriod, setCollectionPeriod] = useState('daily');
@@ -7858,6 +8064,15 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
       alert('Select a payment method / account before recording a payment.');
       return;
     }
+    if (!paymentTransactionRef.trim()) {
+      alert('Enter the payment / transaction reference.');
+      return;
+    }
+    const duplicate = findDuplicatePaymentReference(files, paymentTransactionRef);
+    if (duplicate) {
+      alert(`This transaction reference was already used on file ${duplicate.file.fileId || duplicate.file.id}. Enter a unique reference.`);
+      return;
+    }
     const enteredAmount = Number(paymentAmount);
     if (!markPaid && (!Number.isFinite(enteredAmount) || enteredAmount <= 0)) {
       alert('Enter a valid payment amount.');
@@ -7866,6 +8081,7 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
     setPaymentProcessing(true);
     const fileDoc = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedInvoice.id);
     const paymentId = `payment-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const referenceDoc = doc(db, 'artifacts', appId, 'public', 'data', 'invoice_payment_refs', getPaymentReferenceDocumentId(paymentTransactionRef));
     const shouldNotifyCash = isCashPaymentMethod(method);
     const recipients = Array.isArray(cashPaymentNotificationEmails) ? cashPaymentNotificationEmails : [];
     const mailRef = shouldNotifyCash && recipients.length > 0 ? doc(collection(db, 'mail')) : null;
@@ -7874,6 +8090,11 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
         const snapshot = await transaction.get(fileDoc);
         if (!snapshot.exists()) throw new Error('Invoice no longer exists.');
         const current = { id: snapshot.id, ...snapshot.data() };
+        const referenceSnapshot = await transaction.get(referenceDoc);
+        if (referenceSnapshot.exists()) {
+          const referenceFileId = referenceSnapshot.data().fileId || referenceSnapshot.data().fileDocId || 'another file';
+          throw new Error(`This transaction reference was already used on file ${referenceFileId}. Enter a unique reference.`);
+        }
         const summary = getInvoiceSummary(current);
         if (!markPaid && enteredAmount > summary.dueAmount) {
           throw new Error(`Payment exceeds the outstanding due of ${formatCurrency(summary.dueAmount)}.`);
@@ -7893,6 +8114,7 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
           institution: method.institution || '',
           accountName: method.accountName || '',
           accountNumber: method.accountNumber || '',
+          transactionRef: paymentTransactionRef.trim(),
           note: paymentNote.trim()
         };
         const invoicePayments = [...(Array.isArray(current.invoicePayments) ? current.invoicePayments : Array.isArray(current.invoice?.payments) ? current.invoice.payments : []), payment];
@@ -7903,6 +8125,15 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
           'invoice.paidAmount': newPaid,
           'invoice.paymentStatus': status,
           updatedAt: serverTimestamp()
+        });
+        transaction.set(referenceDoc, {
+          transactionRef: payment.transactionRef,
+          normalizedReference: normalizePaymentReference(payment.transactionRef),
+          paymentId: payment.id,
+          fileDocId: current.id,
+          fileId: current.fileId || current.id,
+          amount: payment.amount,
+          createdAt: serverTimestamp()
         });
         if (mailRef) {
           transaction.set(mailRef, { ...buildCashPaymentMail(current, payment, recipients), createdAt: serverTimestamp() });
@@ -7917,6 +8148,7 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
       if (invoiceSearchResult) setInvoiceSearchResult({ hits: invoiceSearchResult.hits.map(hit => hit.id === updated.id ? updated : hit) });
       setPaymentAmount('');
       setPaymentNote('');
+      setPaymentTransactionRef('');
       if (result.cashNotificationMissingRecipients) {
         alert('Payment was recorded, but no cash payment notification email recipients are configured.');
       }
@@ -8332,7 +8564,7 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
                           <td className="px-3 py-2 text-right font-mono">{formatCurrency(inv.dueAmount)}</td>
                           <td className="px-3 py-2"><span className={`px-2 py-1 rounded text-xs ${inv.paymentStatus === 'Paid' ? 'bg-green-100 text-green-800' : inv.paymentStatus === 'Partially Paid' ? 'bg-yellow-100 text-yellow-800' : 'bg-orange-100 text-orange-800'}`}>{inv.paymentStatus}</span></td>
                           <td className="px-3 py-2">
-                            <button onClick={() => { setSelectedInvoice(f); setInvoiceModalOpen(true); setPaymentAmount(''); setPaymentNote(''); setPaymentMethodId(''); }} className="px-2 py-1 rounded bg-blue-600 text-white text-xs">View</button>
+                            <button onClick={() => { setSelectedInvoice(f); setInvoiceModalOpen(true); setPaymentAmount(''); setPaymentNote(''); setPaymentTransactionRef(''); setPaymentMethodId(''); }} className="px-2 py-1 rounded bg-blue-600 text-white text-xs">View</button>
                           </td>
                         </tr>
                       );
@@ -8387,7 +8619,7 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
                           const rawDate = payment.receivedAt?.toDate ? payment.receivedAt.toDate() : payment.receivedAt?.seconds ? new Date(payment.receivedAt.seconds * 1000) : new Date(payment.receivedAt);
                           const when = Number.isNaN(rawDate.getTime()) ? 'Date unavailable' : rawDate.toLocaleString();
                           return <div key={payment.id || index} className={`text-xs flex justify-between gap-2 ${textSub}`}>
-                            <span>{when} · {[payment.methodName, payment.institution, payment.accountNumber].filter(Boolean).join(' / ') || 'Unattributed legacy payment'}</span>
+                            <span>{when} · {[payment.methodName, payment.institution, payment.accountNumber].filter(Boolean).join(' / ') || 'Unattributed legacy payment'}{payment.transactionRef ? ` · Ref: ${payment.transactionRef}` : ''}</span>
                             <span className={`font-semibold ${textMain}`}>{formatCurrency(Number(payment.amount) || 0)}</span>
                           </div>;
                         })}
@@ -8405,6 +8637,14 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
                       <option value="">Select payment method / account</option>
                       {paymentMethods.map(method => <option key={method.id} value={method.id}>{[method.name, method.institution, method.accountNumber].filter(Boolean).join(' — ')}</option>)}
                     </select>
+                    <input
+                      type="text"
+                      value={paymentTransactionRef}
+                      onChange={e => setPaymentTransactionRef(e.target.value)}
+                      placeholder="Payment / Transaction Ref (required)"
+                      maxLength={120}
+                      className={`w-full mt-2 px-3 py-2 border rounded-lg text-sm outline-none ${inputClass}`}
+                    />
                     {paymentMethods.length === 0 && <p className="text-xs text-red-500 mt-1">Configure a payment method in Admin before recording payments.</p>}
                     <div className="flex gap-2 mt-3">
                       <button disabled={paymentProcessing} onClick={() => recordInvoicePayment(false)} className="px-4 py-2 rounded bg-green-600 text-white">Record</button>
