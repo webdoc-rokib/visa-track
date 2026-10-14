@@ -28,6 +28,10 @@ Create and manage four file types:
 
 Files include a human-readable file ID, creator, current assignee, current status, and activity history. Staff can add notes and follow status changes. Administrators can edit file details and reassign a file to a staff member, Processing Team, or Unassigned; reassignment is recorded in the file history.
 
+When registering a file, VisaTrack warns about likely existing matches: Visa files by passport and destination; Package files by main passenger passport and the same set of countries; Air Ticket and Pick & Drop files by applicant, normalized phone, and matching route/locations. Staff can review the existing records and either cancel or proceed if this is a legitimate new service. Proceeding is recorded in the new file's history. These are review warnings, not a guarantee that every duplicate will be detected.
+
+Administrators can open **Duplicates** to filter candidate pairs by file type, review state, file ID, applicant, or passport. A pair can be marked **Confirmed duplicate** or **Not a duplicate**, and decisions can be reopened. The review screen does not merge or delete files: admins can open each record and use the existing file-management actions after checking its history, invoice, and payments.
+
 ### Workflow tracking
 
 The dashboard provides search, filters, reminders, active tasks, and file summaries. The pipeline and processing tracker help teams review in-process workloads, assignees, current statuses, and time in status. Dashboard workload notifications highlight active tasks assigned to the signed-in user.

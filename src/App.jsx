@@ -6,6 +6,7 @@ import { validateDateFormat, parseDateSafe } from './utils/dateValidation';
 import { storeSecureUserSession, getSecureUserSession, clearUserSession, logoutUser } from './utils/sessionManager';
 import { sanitizeInput, validateFileData, validateNote } from './utils/sanitization';
 import { getDhakaDate, getStartOf, getEndOf, getDhakaTodayString, toDhakaTime, getDateKey } from './utils/timezoneUtils';
+import { findPossibleFileDuplicates, findPossibleFileDuplicatePairs } from './utils/duplicateDetection';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
@@ -737,6 +738,7 @@ export default function VisaTrackApp() {
   const [cashPaymentNotificationEmails, setCashPaymentNotificationEmails] = useState([]);
   const [allPortals, setAllPortals] = useState(AIR_TICKET_PORTALS);
   const [allUsers, setAllUsers] = useState([]); 
+  const [duplicateReviews, setDuplicateReviews] = useState([]);
   const [leaveRequests, setLeaveRequests] = useState([]);
   const [approvedLeaves, setApprovedLeaves] = useState([]);
   const [cleanupComplete, setCleanupComplete] = useState(false);
@@ -882,6 +884,21 @@ export default function VisaTrackApp() {
     return () => { unsubFiles(); unsubDest(); unsubPaymentMethods(); unsubCashPaymentNotifications(); unsubPortals(); unsubUsers(); unsubLeaveRequests(); unsubApprovedLeaves(); };
   }, [user, cleanupComplete]);
 
+  useEffect(() => {
+    if (!user || appUser?.role !== ROLES.ADMIN) {
+      setDuplicateReviews([]);
+      return;
+    }
+    const reviewsRef = collection(db, 'artifacts', appId, 'public', 'data', 'file_duplicate_reviews');
+    const unsubscribe = onSnapshot(reviewsRef, snapshot => {
+      setDuplicateReviews(snapshot.docs.map(review => ({ id: review.id, ...review.data() })));
+    }, error => {
+      console.error('Error loading duplicate review decisions:', error);
+      alert('Unable to load duplicate review decisions. Check Firestore access and try again.');
+    });
+    return () => unsubscribe();
+  }, [user, appUser?.role]);
+
   const myTasks = useMemo(() => {
     if (!appUser || files.length === 0) return [];
 
@@ -899,6 +916,7 @@ export default function VisaTrackApp() {
 
     return files.filter(isVisibleTask);
   }, [files, appUser]);
+  const possibleDuplicatePairs = useMemo(() => findPossibleFileDuplicatePairs(files), [files]);
 
   useEffect(() => {
     if (appUser && !loading && !hasCheckedIn) {
@@ -1105,7 +1123,7 @@ export default function VisaTrackApp() {
       return;
     }
 
-    const fileId = `VT-${Math.floor(10000 + Math.random() * 90000)}`;
+    const fileId = data.fileId || `VT-${Math.floor(10000 + Math.random() * 90000)}`;
     const isNewSale = appUser.role !== ROLES.PROCESSING;
     
     let newFile = {
@@ -1197,6 +1215,26 @@ export default function VisaTrackApp() {
       };
     }
 
+    const reviewedDuplicateFileIds = Array.isArray(data.reviewedDuplicateFileIds)
+      ? [...new Set(data.reviewedDuplicateFileIds.filter(id => typeof id === 'string' && id))]
+      : [];
+    if (reviewedDuplicateFileIds.length > 0) {
+      newFile = {
+        ...newFile,
+        duplicateReview: {
+          matchedFileIds: reviewedDuplicateFileIds,
+          reviewedBy: appUser.name,
+          reviewedAt: Date.now()
+        },
+        history: [{
+          action: `Possible duplicate reviewed; new file created after checking ${reviewedDuplicateFileIds.join(', ')}`,
+          status: newFile.status,
+          performedBy: appUser.name,
+          timestamp: Date.now()
+        }, ...newFile.history]
+      };
+    }
+
     const invoiceNumber = createInvoiceNumber(fileId);
     newFile = {
       ...newFile,
@@ -1207,10 +1245,25 @@ export default function VisaTrackApp() {
       invoiceCreatedAt: serverTimestamp(),
       invoiceCreatedBy: appUser.name,
       statusChangedAt: serverTimestamp(),
-      invoiceUpdatedAt: serverTimestamp()
+      invoiceUpdatedAt: serverTimestamp(),
+      creationRequestId: data.creationRequestId
     };
 
-    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'visa_files'), newFile);
+    const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', data.documentId);
+    try {
+      await runTransaction(db, async transaction => {
+        const existingFile = await transaction.get(fileRef);
+        if (existingFile.exists()) {
+          if (existingFile.data().creationRequestId === data.creationRequestId) return;
+          throw new Error('The file could not be safely created. Please try registering it again.');
+        }
+        transaction.set(fileRef, newFile);
+      });
+    } catch (error) {
+      console.error('Error creating file:', error);
+      alert(`Failed to create file: ${error.message || 'Please try again.'}`);
+      return false;
+    }
     
     // Trigger new file creation animation
     triggerConfetti();
@@ -1220,6 +1273,7 @@ export default function VisaTrackApp() {
     setTimeout(() => {
       setActiveTab('dashboard');
     }, 1500);
+    return true;
   };
 
   const generateInvoice = async (file, paymentStatus, paidAmount = null, paymentMethodId = '', transactionRef = '') => {
@@ -1692,6 +1746,29 @@ export default function VisaTrackApp() {
     }
   };
 
+  const saveDuplicateReview = async (pair, decision) => {
+    if (appUser?.role !== ROLES.ADMIN) return false;
+    const reviewRef = doc(db, 'artifacts', appId, 'public', 'data', 'file_duplicate_reviews', pair.reviewId);
+    try {
+      if (decision) {
+        await setDoc(reviewRef, {
+          fileIds: pair.fileIds,
+          decision,
+          reviewedBy: appUser.name,
+          reviewedAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        });
+      } else {
+        await deleteDoc(reviewRef);
+      }
+      return true;
+    } catch (error) {
+      console.error('Error saving duplicate review decision:', error);
+      alert(`Could not save duplicate review: ${error.message || 'Check Firestore access and try again.'}`);
+      return false;
+    }
+  };
+
   const containerClass = darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-800';
   const borderClass = darkMode ? 'border-slate-800' : 'border-slate-200';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
@@ -1771,7 +1848,10 @@ export default function VisaTrackApp() {
                  {(appUser.role === ROLES.ADMIN || appUser.role === ROLES.ACCOUNTS) && <NavButton active={activeTab === 'accounting'} onClick={() => setActiveTab('accounting')} icon={DollarSign} darkMode={darkMode}>Accounting</NavButton>}
                  <NavButton active={activeTab === 'leaves'} onClick={() => setActiveTab('leaves')} icon={Calendar} darkMode={darkMode} badge={appUser.role === ROLES.ADMIN ? leaveRequests.filter(r => r.status === 'PENDING').length : 0}>Leaves</NavButton>
                  {appUser.role === ROLES.ADMIN && (
-                   <NavButton active={activeTab === 'admin'} onClick={() => setActiveTab('admin')} icon={Shield} darkMode={darkMode}>Admin</NavButton>
+                   <>
+                     <NavButton active={activeTab === 'duplicates'} onClick={() => setActiveTab('duplicates')} icon={Copy} darkMode={darkMode} badge={possibleDuplicatePairs.filter(pair => !duplicateReviews.some(review => review.id === pair.reviewId)).length}>Duplicates</NavButton>
+                     <NavButton active={activeTab === 'admin'} onClick={() => setActiveTab('admin')} icon={Shield} darkMode={darkMode}>Admin</NavButton>
+                   </>
                  )}
                </div>
 
@@ -1825,7 +1905,10 @@ export default function VisaTrackApp() {
                   <NavItem id="accounting" onClick={() => setActiveTab('accounting')} icon={DollarSign} label="Accounting" />
                 )}
                 {appUser.role === ROLES.ADMIN && (
-                  <NavItem id="admin" onClick={() => setActiveTab('admin')} icon={Shield} label="Admin Panel" />
+                  <>
+                    <NavItem id="duplicates" onClick={() => setActiveTab('duplicates')} icon={Copy} label="Duplicate Review" />
+                    <NavItem id="admin" onClick={() => setActiveTab('admin')} icon={Shield} label="Admin Panel" />
+                  </>
                 )}
              </div>
              <div className={`mt-6 pt-6 border-t ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
@@ -1889,6 +1972,7 @@ export default function VisaTrackApp() {
         {activeTab === 'add' && (
           <AddFileForm 
             destinations={destinations} 
+            files={files}
             onSubmit={addNewFile} 
             onCancel={() => setActiveTab('dashboard')} 
             darkMode={darkMode}
@@ -1903,6 +1987,20 @@ export default function VisaTrackApp() {
         )}
         {activeTab === 'admin' && appUser.role === ROLES.ADMIN && (
           <AdminPanel currentUser={appUser} destinations={destinations} paymentMethods={paymentMethods} darkMode={darkMode} />
+        )}
+        {activeTab === 'duplicates' && appUser.role === ROLES.ADMIN && (
+          <DuplicateReviewPanel
+            files={files}
+            pairs={possibleDuplicatePairs}
+            reviews={duplicateReviews}
+            currentUser={appUser}
+            darkMode={darkMode}
+            onSaveReview={saveDuplicateReview}
+            onOpenFile={file => {
+              setSearchTerm(file.fileId || '');
+              setActiveTab('dashboard');
+            }}
+          />
         )}
       </main>
 
@@ -2110,6 +2208,242 @@ function NavButton({ active, onClick, icon: Icon, children, darkMode, badge }) {
         </span>
       )}
     </button>
+  );
+}
+
+function DuplicateReviewPanel({ pairs, reviews, currentUser, darkMode, onSaveReview, onOpenFile }) {
+  const [reviewFilter, setReviewFilter] = useState('needs_review');
+  const [fileTypeFilter, setFileTypeFilter] = useState('');
+  const [searchText, setSearchText] = useState('');
+  const [savingReviewId, setSavingReviewId] = useState('');
+  const reviewById = useMemo(() => new Map(reviews.map(review => [review.id, review])), [reviews]);
+  const textClass = darkMode ? 'text-slate-100' : 'text-slate-900';
+  const subTextClass = darkMode ? 'text-slate-400' : 'text-slate-500';
+  const inputClass = darkMode
+    ? 'bg-slate-950 border-slate-700 text-slate-100'
+    : 'bg-white border-slate-300 text-slate-900';
+
+  const counts = useMemo(() => {
+    const summary = { needs_review: 0, duplicate: 0, not_duplicate: 0 };
+    pairs.forEach(pair => {
+      const decision = reviewById.get(pair.reviewId)?.decision;
+      if (decision === 'duplicate' || decision === 'not_duplicate') summary[decision]++;
+      else summary.needs_review++;
+    });
+    return summary;
+  }, [pairs, reviewById]);
+
+  const filteredPairs = useMemo(() => {
+    const normalizedSearch = searchText.trim().toLowerCase();
+    return pairs.filter(pair => {
+      const review = reviewById.get(pair.reviewId);
+      const decision = review?.decision === 'duplicate' || review?.decision === 'not_duplicate'
+        ? review.decision
+        : 'needs_review';
+      const fileType = pair.fileA.fileType || FILE_TYPES.VISA;
+      if (reviewFilter !== 'all' && decision !== reviewFilter) return false;
+      if (fileTypeFilter && fileType !== fileTypeFilter) return false;
+      if (normalizedSearch) {
+        const searchableText = [
+          pair.fileA.fileId, pair.fileA.applicantName, pair.fileA.passportNo, pair.fileA.mainPersonPassport,
+          pair.fileB.fileId, pair.fileB.applicantName, pair.fileB.passportNo, pair.fileB.mainPersonPassport
+        ].filter(Boolean).join(' ').toLowerCase();
+        if (!searchableText.includes(normalizedSearch)) return false;
+      }
+      return true;
+    });
+  }, [pairs, reviewById, reviewFilter, fileTypeFilter, searchText]);
+
+  const handleReview = async (pair, decision) => {
+    setSavingReviewId(pair.reviewId);
+    try {
+      await onSaveReview(pair, decision);
+    } finally {
+      setSavingReviewId('');
+    }
+  };
+
+  const getCreatedDate = file => {
+    const date = file.createdAt?.toDate ? file.createdAt.toDate() : file.createdAt ? new Date(file.createdAt) : null;
+    return date && !Number.isNaN(date.getTime()) ? date.toLocaleDateString() : 'Date unavailable';
+  };
+
+  return (
+    <section className="space-y-6">
+      <header>
+        <h2 className={`text-2xl font-bold ${textClass}`}>Duplicate Review</h2>
+        <p className={`mt-1 text-sm ${subTextClass}`}>
+          Review possible matching files. Decisions are saved for this pair only; files are never merged or deleted automatically.
+        </p>
+      </header>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {[
+          ['Needs review', counts.needs_review, 'needs_review'],
+          ['Confirmed duplicates', counts.duplicate, 'duplicate'],
+          ['Marked as distinct', counts.not_duplicate, 'not_duplicate']
+        ].map(([label, count, filter]) => (
+          <button
+            key={filter}
+            type="button"
+            onClick={() => setReviewFilter(filter)}
+            className={`rounded-xl border p-4 text-left transition-colors ${
+              reviewFilter === filter
+                ? 'border-blue-500 ring-2 ring-blue-500/20'
+                : darkMode ? 'border-slate-800 hover:border-slate-700' : 'border-slate-200 hover:border-slate-300'
+            } ${darkMode ? 'bg-slate-900' : 'bg-white'}`}
+          >
+            <span className={`block text-sm ${subTextClass}`}>{label}</span>
+            <span className={`mt-1 block text-2xl font-bold ${textClass}`}>{count}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="flex flex-col sm:flex-row gap-3">
+        <label className="flex-1">
+          <span className="sr-only">Search duplicate candidates</span>
+          <input
+            type="search"
+            value={searchText}
+            onChange={event => setSearchText(event.target.value)}
+            placeholder="Search file ID, name, or passport"
+            className={`w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+          />
+        </label>
+        <label>
+          <span className="sr-only">Filter by file type</span>
+          <select
+            value={fileTypeFilter}
+            onChange={event => setFileTypeFilter(event.target.value)}
+            className={`w-full sm:w-48 rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+          >
+            <option value="">All file types</option>
+            {Object.values(FILE_TYPES).map(type => <option key={type} value={type}>{type}</option>)}
+          </select>
+        </label>
+        <label>
+          <span className="sr-only">Filter by review status</span>
+          <select
+            value={reviewFilter}
+            onChange={event => setReviewFilter(event.target.value)}
+            className={`w-full sm:w-48 rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+          >
+            <option value="needs_review">Needs review</option>
+            <option value="duplicate">Confirmed duplicate</option>
+            <option value="not_duplicate">Marked as distinct</option>
+            <option value="all">All candidates</option>
+          </select>
+        </label>
+      </div>
+
+      <p className={`text-sm ${subTextClass}`}>Showing {filteredPairs.length} of {pairs.length} possible matching pairs.</p>
+
+      {filteredPairs.length === 0 ? (
+        <div className={`rounded-xl border p-8 text-center ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+          <p className={`font-medium ${textClass}`}>
+            {pairs.length === 0 ? 'No possible duplicate pairs found.' : 'No pairs match these filters.'}
+          </p>
+          <p className={`mt-1 text-sm ${subTextClass}`}>Possible matches are based on the identifiers and service details available on each file.</p>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {filteredPairs.map(pair => {
+            const review = reviewById.get(pair.reviewId);
+            const isSaving = savingReviewId === pair.reviewId;
+            const decision = review?.decision;
+            const statusLabel = decision === 'duplicate'
+              ? 'Confirmed duplicate'
+              : decision === 'not_duplicate'
+                ? 'Marked as distinct'
+                : 'Needs review';
+            const statusStyle = decision === 'duplicate'
+              ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-200'
+              : decision === 'not_duplicate'
+                ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200'
+                : 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200';
+
+            return (
+              <article key={pair.reviewId} className={`rounded-xl border p-4 sm:p-5 ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+                  <span className={`rounded-full px-3 py-1 text-xs font-semibold ${statusStyle}`}>{statusLabel}</span>
+                  {review?.reviewedBy && (
+                    <span className={`text-xs ${subTextClass}`}>
+                      Reviewed by {review.reviewedBy}
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {[pair.fileA, pair.fileB].map(file => (
+                    <div key={file.id} className={`rounded-lg border p-4 ${darkMode ? 'border-slate-700 bg-slate-950/50' : 'border-slate-200 bg-slate-50'}`}>
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <p className={`font-semibold ${textClass}`}>{file.fileId || 'No file ID'} · {file.applicantName || 'Unknown applicant'}</p>
+                          <p className={`mt-1 text-xs ${subTextClass}`}>
+                            {file.fileType || FILE_TYPES.VISA} · {STATUS[file.status]?.label || file.status || 'Unknown status'}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => onOpenFile(file)}
+                          className="shrink-0 rounded-lg border border-blue-500 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-950/40"
+                        >
+                          Open file
+                        </button>
+                      </div>
+                      <dl className={`mt-3 space-y-1 text-xs ${subTextClass}`}>
+                        <div>Created: {getCreatedDate(file)}</div>
+                        <div>Created by: {file.createdBy || 'Unknown'} · Assigned to: {file.assignedTo || 'Unassigned'}</div>
+                        {(file.passportNo || file.mainPersonPassport) && <div>Passport: {file.passportNo || file.mainPersonPassport}</div>}
+                        {file.destination && <div>Destination: {file.destination}</div>}
+                        {file.packageCountries?.length > 0 && <div>Countries: {file.packageCountries.join(', ')}</div>}
+                        {file.airlineRoute && <div>Route: {file.airlineRoute}</div>}
+                        {(file.pickupLocation || file.dropoffLocation) && <div>Journey: {file.pickupLocation || '—'} → {file.dropoffLocation || '—'}</div>}
+                        <div>Contact: {file.contactNo || 'Unknown'}</div>
+                      </dl>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+                  <p className={`text-xs ${subTextClass}`}>
+                    Matching criteria: {pair.fileA.fileType || FILE_TYPES.VISA}. {review ? `Last reviewed by ${review.reviewedBy || currentUser.name}.` : 'Confirm whether these are the same service.'}
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {review && (
+                      <button
+                        type="button"
+                        disabled={isSaving}
+                        onClick={() => handleReview(pair, null)}
+                        className={`rounded-lg border px-3 py-2 text-sm disabled:opacity-50 ${darkMode ? 'border-slate-700 hover:bg-slate-800' : 'border-slate-300 hover:bg-slate-50'}`}
+                      >
+                        Reopen review
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      disabled={isSaving}
+                      onClick={() => handleReview(pair, 'not_duplicate')}
+                      className={`rounded-lg border px-3 py-2 text-sm disabled:opacity-50 ${darkMode ? 'border-green-800 text-green-300 hover:bg-green-950/30' : 'border-green-300 text-green-700 hover:bg-green-50'}`}
+                    >
+                      Not a duplicate
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isSaving}
+                      onClick={() => handleReview(pair, 'duplicate')}
+                      className="rounded-lg bg-red-600 px-3 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                    >
+                      Confirm duplicate
+                    </button>
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -2698,7 +3032,7 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
   );
 }
 
-function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
+function AddFileForm({ onSubmit, onCancel, destinations, files, darkMode }) {
   const [fileType, setFileType] = useState(FILE_TYPES.VISA);
   const [formData, setFormData] = useState({ 
     applicantName: '', 
@@ -2730,6 +3064,10 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
     costPrice: ''
   });
   const [countries, setCountries] = useState([]);
+  const [possibleDuplicates, setPossibleDuplicates] = useState(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const pendingCreationRef = useRef(null);
+  const submittingRef = useRef(false);
 
   useEffect(() => {
     // First try to fetch countries from admin settings
@@ -2782,9 +3120,46 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
     });
   };
 
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    onSubmit({...formData, fileType});
+  const handleSubmit = async (e, reviewedFileIds = null) => {
+    e?.preventDefault();
+    if (submittingRef.current) return;
+
+    const currentFormData = { ...formData, fileType };
+    const matches = findPossibleFileDuplicates(currentFormData, files);
+    const matchingIds = matches.map(file => file.id).filter(Boolean).sort();
+    const approvedIds = reviewedFileIds ? [...reviewedFileIds].sort() : null;
+    const confirmationMatchesCurrent = approvedIds &&
+      approvedIds.length === matchingIds.length &&
+      approvedIds.every((id, index) => id === matchingIds[index]);
+
+    if (matchingIds.length > 0 && !confirmationMatchesCurrent) {
+      setPossibleDuplicates(matches);
+      return;
+    }
+
+    setPossibleDuplicates(null);
+    if (!pendingCreationRef.current) {
+      const documentId = doc(collection(db, 'artifacts', appId, 'public', 'data', 'visa_files')).id;
+      pendingCreationRef.current = {
+        documentId,
+        creationRequestId: documentId,
+        fileId: `VT-${Math.floor(10000 + Math.random() * 90000)}`
+      };
+    }
+
+    submittingRef.current = true;
+    setIsSubmitting(true);
+    try {
+      const created = await onSubmit({
+        ...currentFormData,
+        ...pendingCreationRef.current,
+        reviewedDuplicateFileIds: matchingIds
+      });
+      if (created) pendingCreationRef.current = null;
+    } finally {
+      submittingRef.current = false;
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -3148,9 +3523,57 @@ function AddFileForm({ onSubmit, onCancel, destinations, darkMode }) {
           )}
         </div>
         
+        {possibleDuplicates && (
+          <div className={`rounded-lg border p-4 space-y-3 ${darkMode ? 'border-amber-700 bg-amber-950/30' : 'border-amber-300 bg-amber-50'}`} role="alert">
+            <div>
+              <h3 className={`font-semibold ${darkMode ? 'text-amber-200' : 'text-amber-900'}`}>Possible matching files found</h3>
+              <p className={`text-sm mt-1 ${darkMode ? 'text-amber-100' : 'text-amber-800'}`}>
+                Review these records before creating another file. A matching record may be a legitimate repeat service, so this warning does not block creation.
+              </p>
+            </div>
+            <ul className="space-y-2">
+              {possibleDuplicates.slice(0, 5).map(file => {
+                const createdAt = file.createdAt?.toDate ? file.createdAt.toDate() : file.createdAt ? new Date(file.createdAt) : null;
+                const createdDate = createdAt && !Number.isNaN(createdAt.getTime())
+                  ? createdAt.toLocaleDateString()
+                  : 'Date unavailable';
+                return (
+                  <li key={file.id} className={`text-sm ${darkMode ? 'text-slate-200' : 'text-slate-800'}`}>
+                    <strong>{file.fileId || 'No file ID'}</strong> · {file.applicantName || 'Unknown applicant'} · {file.fileType || 'Visa'} · {STATUS[file.status]?.label || file.status || 'Unknown status'} · {createdDate}
+                  </li>
+                );
+              })}
+              {possibleDuplicates.length > 5 && (
+                <li className={`text-xs ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>
+                  Showing 5 of {possibleDuplicates.length} possible matches.
+                </li>
+              )}
+            </ul>
+            <div className="flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPossibleDuplicates(null)}
+                className={`px-4 py-2 rounded-lg text-sm ${darkMode ? 'bg-slate-800 text-slate-200 hover:bg-slate-700' : 'bg-white text-slate-700 hover:bg-slate-100'}`}
+              >
+                Review details
+              </button>
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={() => handleSubmit(null, possibleDuplicates.map(file => file.id).filter(Boolean))}
+                className="px-4 py-2 rounded-lg bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:opacity-50"
+              >
+                Create Anyway
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="flex justify-end gap-3 pt-4">
           <button type="button" onClick={onCancel} className={`px-6 py-2 rounded-lg ${darkMode ? 'text-slate-300 hover:bg-slate-800' : 'text-slate-600 hover:bg-slate-100'}`}>Cancel</button>
-          <button type="submit" className="px-6 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700">Register File</button>
+          <button type="submit" disabled={isSubmitting} className="px-6 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50">
+            {isSubmitting ? 'Registering…' : 'Register File'}
+          </button>
         </div>
       </form>
     </div>
