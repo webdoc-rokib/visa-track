@@ -1,13 +1,18 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import logoImage from './assets/logo.jpg';
 import ErrorBoundary from './ErrorBoundary';
-import DhakaClock from './DhakaClock';
 import { validateDateFormat, parseDateSafe } from './utils/dateValidation';
-import { storeSecureUserSession, getSecureUserSession, clearUserSession, logoutUser } from './utils/sessionManager';
+import { storeSecureUserSession, getSecureUserSession, logoutUser } from './utils/sessionManager';
 import { sanitizeInput, validateFileData, validateNote } from './utils/sanitization';
-import { getDhakaDate, getStartOf, getEndOf, getDhakaTodayString, toDhakaTime, getDateKey } from './utils/timezoneUtils';
+import { getDhakaDate, getStartOf, getEndOf, getDhakaTodayString, toDhakaTime } from './utils/timezoneUtils';
 import { findPossibleFileDuplicates, findPossibleFileDuplicatePairs } from './utils/duplicateDetection';
-import { calculateProcessingAgentWorkloads, chooseProcessingAgent, WORK_RANK_WEIGHTS } from './utils/assignmentRouting';
+import {
+  calculateProcessingAgentWorkloads,
+  chooseProcessingAgent,
+  isProcessingAgentEligibleForDestinations,
+  MAX_VISA_FAMILY_SIZE,
+  WORK_RANK_WEIGHTS
+} from './utils/assignmentRouting';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
@@ -83,6 +88,7 @@ import {
   CalendarDays,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   Timer,
   Plane
 } from 'lucide-react';
@@ -169,23 +175,11 @@ const isFileCompleted = (file) => isFileCompletedAtStatus(file);
 
 // --- Helper Functions ---
 const formatDate = (timestamp) => {
-  if (!timestamp) return '-';
   try {
-    const date = timestamp.seconds ? new Date(timestamp.seconds * 1000) : new Date(timestamp);
-    if (isNaN(date.getTime())) return '-';
+    const date = getTimestampDate(timestamp);
+    if (!date) return '-';
     return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  } catch (e) {
-    return '-';
-  }
-};
-
-const formatTimeOnly = (timestamp) => {
-  if (!timestamp) return '-';
-  try {
-    const date = timestamp.seconds ? new Date(timestamp.seconds * 1000) : new Date(timestamp);
-    if (isNaN(date.getTime())) return '-';
-    return date.toLocaleString('en-US', { hour: '2-digit', minute: '2-digit' });
-  } catch (e) {
+  } catch {
     return '-';
   }
 };
@@ -457,6 +451,9 @@ const findDuplicatePaymentReference = (files, reference) => {
   return null;
 };
 
+const getDuplicatePaymentReferenceMessage = (duplicate) =>
+  `This transaction reference was already used on file ${duplicate.file.fileId || duplicate.file.id}. Enter a unique reference.`;
+
 const buildCashPaymentMail = (file, payment, recipients) => {
   const fileId = file.fileId || file.id || 'N/A';
   const applicantName = file.applicantName || file.mainPersonName || 'N/A';
@@ -485,6 +482,8 @@ const buildCashPaymentMail = (file, payment, recipients) => {
 };
 
 const buildInvoicePrintHtml = (file, invoice) => {
+  const trackingId = file?.fileId || '';
+  const trackingUrl = `${window.location.origin}/?track=${encodeURIComponent(trackingId)}`;
   const amount = Number(invoice?.amount || getInvoiceAmount(file) || 0);
   const paidAmount = Number(invoice?.paidAmount || 0);
   const dueAmount = Math.max(amount - paidAmount, 0);
@@ -493,7 +492,7 @@ const buildInvoicePrintHtml = (file, invoice) => {
   const latestPayment = paymentRecords[paymentRecords.length - 1];
   const paymentMethodText = latestPayment
     ? [latestPayment.methodName, latestPayment.institution, latestPayment.accountName, latestPayment.accountNumber].filter(Boolean).join(' · ')
-    : 'Not recorded for historical payments';
+    : paidAmount > 0 ? 'Not recorded for historical payments' : 'No payment received yet';
   const invoiceNo = invoice?.invoiceNo || file?.invoiceNo || `INV-${file?.fileId || 'NEW'}`;
   const issuedDate = getDhakaDate().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
   const customerName = file?.applicantName || 'Customer';
@@ -560,6 +559,8 @@ const buildInvoicePrintHtml = (file, invoice) => {
         .status-unpaid { background: #f9fafb; color: #111111; }
         .note-box { min-height: 52px; border: 1px solid #d1d5db; border-radius: 12px; padding: 12px 14px; background: #ffffff; color: #111111; white-space: pre-wrap; }
         .terms { margin-top: 8px; font-size: 10px; color: #4b5563; line-height: 1.45; }
+        .track-box { border: 1px dashed #94a3b8; border-radius: 12px; padding: 10px 14px; background: #f8fafc; font-size: 12px; color: #111111; }
+        .track-box a { color: #0f4c81; word-break: break-all; }
         .footer { border-top: 1px solid #d1d5db; padding: 14px 20px 18px; display: flex; justify-content: space-between; gap: 14px; flex-wrap: wrap; font-size: 10px; color: #6b7280; }
         .footer a { color: #111111; text-decoration: none; }
         .copy-stamp { font-size: 9px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 0.12em; }
@@ -670,6 +671,13 @@ const buildInvoicePrintHtml = (file, invoice) => {
             </div>
           </div>
 
+          ${trackingId ? `<div class="section">
+            <div class="section-block">
+              <h2>Track Your Progress</h2>
+              <div class="track-box">Follow your file status online anytime. Open <a href="${trackingUrl}">${trackingUrl}</a></div>
+            </div>
+          </div>` : ''}
+
           <div class="section">
             <div class="section-block">
               <h2>Terms & Conditions</h2>
@@ -737,6 +745,7 @@ export default function VisaTrackApp() {
   const [destinations, setDestinations] = useState([]); 
   const [visaWorkRanks, setVisaWorkRanks] = useState({});
   const [visaDestinationAgents, setVisaDestinationAgents] = useState({});
+  const [visaFamilyGroups, setVisaFamilyGroups] = useState([]);
   const [paymentMethods, setPaymentMethods] = useState([]);
   const [cashPaymentNotificationEmails, setCashPaymentNotificationEmails] = useState([]);
   const [allPortals, setAllPortals] = useState(AIR_TICKET_PORTALS);
@@ -748,6 +757,7 @@ export default function VisaTrackApp() {
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [trackingMode, setTrackingMode] = useState(false);
   const [trackingFileId, setTrackingFileId] = useState('');
   
@@ -848,6 +858,13 @@ export default function VisaTrackApp() {
       console.error('Error loading Visa destination agent assignments:', error);
       alert('Unable to load Visa destination routing rules. Please refresh before handing off a Visa file.');
     });
+    const visaFamilyGroupsRef = collection(db, 'artifacts', appId, 'public', 'data', 'visa_family_groups');
+    const unsubVisaFamilyGroups = onSnapshot(visaFamilyGroupsRef, snapshot => {
+      setVisaFamilyGroups(snapshot.docs.map(groupDoc => ({ id: groupDoc.id, ...groupDoc.data() })));
+    }, error => {
+      console.error('Error loading Visa family groups:', error);
+      alert('Unable to load family groups. Family linking may be unavailable until you refresh.');
+    });
     const paymentMethodsRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'payment_methods');
     const unsubPaymentMethods = onSnapshot(paymentMethodsRef, (docSnap) => {
       setPaymentMethods(docSnap.exists() ? docSnap.data().items || [] : []);
@@ -898,7 +915,7 @@ export default function VisaTrackApp() {
       setApprovedLeaves(leaves);
     });
 
-    return () => { unsubFiles(); unsubDest(); unsubVisaWorkRanks(); unsubVisaDestinationAgents(); unsubPaymentMethods(); unsubCashPaymentNotifications(); unsubPortals(); unsubUsers(); unsubLeaveRequests(); unsubApprovedLeaves(); };
+    return () => { unsubFiles(); unsubDest(); unsubVisaWorkRanks(); unsubVisaDestinationAgents(); unsubVisaFamilyGroups(); unsubPaymentMethods(); unsubCashPaymentNotifications(); unsubPortals(); unsubUsers(); unsubLeaveRequests(); unsubApprovedLeaves(); };
   }, [user, cleanupComplete]);
 
   useEffect(() => {
@@ -1129,6 +1146,18 @@ export default function VisaTrackApp() {
 
   const addNewFile = async (data) => {
     if (!appUser) return;
+    if (data.familyGroupId && ![ROLES.SALES, ROLES.ADMIN].includes(appUser.role)) {
+      alert('Only Sales Representatives can add files to a family group.');
+      return false;
+    }
+    if (data.familyGroupId && (data.fileType || FILE_TYPES.VISA) !== FILE_TYPES.VISA) {
+      alert('Family groups can only contain Visa files.');
+      return false;
+    }
+    if (data.createFamilyGroup && !data.familyGroupId) {
+      alert('Could not create the family group ID. Please try again.');
+      return false;
+    }
     
     // Validate and sanitize input data
     const validation = validateFileData(data);
@@ -1168,6 +1197,10 @@ export default function VisaTrackApp() {
         status: 'RECEIVED_SALES',
         visaResult: null,
         acknowledgedByProcessingAgent: false,
+        ...(data.familyGroupId ? {
+          familyGroupId: data.familyGroupId,
+          familyGroupLabel: sanitizeInput(data.familyGroupLabel || `${data.applicantName} family`, { maxLength: 80 })
+        } : {}),
         history: [{
           action: 'File Received & Registered',
           status: 'RECEIVED_SALES',
@@ -1269,10 +1302,47 @@ export default function VisaTrackApp() {
     const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', data.documentId);
     try {
       await runTransaction(db, async transaction => {
-        const existingFile = await transaction.get(fileRef);
+        const familyGroupRef = data.familyGroupId
+          ? doc(db, 'artifacts', appId, 'public', 'data', 'visa_family_groups', data.familyGroupId)
+          : null;
+        const [existingFile, familyGroupSnapshot] = await Promise.all([
+          transaction.get(fileRef),
+          familyGroupRef ? transaction.get(familyGroupRef) : Promise.resolve(null)
+        ]);
         if (existingFile.exists()) {
           if (existingFile.data().creationRequestId === data.creationRequestId) return;
           throw new Error('The file could not be safely created. Please try registering it again.');
+        }
+        if (familyGroupRef) {
+          const memberFileIds = familyGroupSnapshot?.exists()
+            ? familyGroupSnapshot.data().memberFileIds || []
+            : [];
+          if (data.createFamilyGroup) {
+            if (familyGroupSnapshot?.exists()) throw new Error('This family group ID is already in use. Please try again.');
+            transaction.set(familyGroupRef, {
+              label: newFile.familyGroupLabel,
+              createdBy: appUser.name,
+              createdByUserId: appUser.id || '',
+              status: 'OPEN',
+              assignedAgent: '',
+              memberFileIds: [fileRef.id],
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp()
+            });
+          } else {
+            if (!familyGroupSnapshot?.exists()) throw new Error('This family group no longer exists. Refresh and select an available group.');
+            const familyGroup = familyGroupSnapshot.data();
+            if (familyGroup.status !== 'OPEN' || familyGroup.assignedAgent) {
+              throw new Error('This family group is already assigned and locked. Ask an admin to review it.');
+            }
+            if (memberFileIds.length >= MAX_VISA_FAMILY_SIZE) {
+              throw new Error(`A family group can contain up to ${MAX_VISA_FAMILY_SIZE} files.`);
+            }
+            transaction.update(familyGroupRef, {
+              memberFileIds: arrayUnion(fileRef.id),
+              updatedAt: serverTimestamp()
+            });
+          }
         }
         transaction.set(fileRef, newFile);
       });
@@ -1284,7 +1354,9 @@ export default function VisaTrackApp() {
     
     // Trigger new file creation animation
     triggerConfetti();
-    setResultMessage('🎊 New File Created Successfully! 🎊');
+    setResultMessage(data.familyGroupId
+      ? `New file created. Family Group ID: ${data.familyGroupId}`
+      : '🎊 New File Created Successfully! 🎊');
     setResultModalOpen(true);
     
     setTimeout(() => {
@@ -1304,7 +1376,7 @@ export default function VisaTrackApp() {
     if (requestedPaidAmount > getInvoiceSummary(file).paidAmount) {
       const duplicate = findDuplicatePaymentReference(files, transactionRef);
       if (duplicate) {
-        alert(`This transaction reference was already used on file ${duplicate.file.fileId || duplicate.file.id}. Enter a unique reference.`);
+        alert(getDuplicatePaymentReferenceMessage(duplicate));
         return false;
       }
     }
@@ -1399,10 +1471,31 @@ export default function VisaTrackApp() {
   const confirmDeleteFile = async () => {
     if (!fileToDelete) return;
     try {
-      await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', fileToDelete));
+      const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', fileToDelete);
+      await runTransaction(db, async transaction => {
+        const fileSnapshot = await transaction.get(fileRef);
+        if (!fileSnapshot.exists()) return;
+        const familyGroupId = fileSnapshot.data().familyGroupId;
+        const familyGroupRef = familyGroupId
+          ? doc(db, 'artifacts', appId, 'public', 'data', 'visa_family_groups', familyGroupId)
+          : null;
+        const familyGroupSnapshot = familyGroupRef ? await transaction.get(familyGroupRef) : null;
+        transaction.delete(fileRef);
+        if (familyGroupSnapshot?.exists()) {
+          const remainingMemberIds = (familyGroupSnapshot.data().memberFileIds || []).filter(id => id !== fileToDelete);
+          if (remainingMemberIds.length === 0) transaction.delete(familyGroupRef);
+          else transaction.update(familyGroupRef, {
+            memberFileIds: remainingMemberIds,
+            updatedAt: serverTimestamp()
+          });
+        }
+      });
       setDeleteConfirmOpen(false);
       setFileToDelete(null);
-    } catch (err) { console.error("Error deleting file:", err); }
+    } catch (err) {
+      console.error("Error deleting file:", err);
+      alert(`Failed to delete file: ${err.message || 'Please try again.'}`);
+    }
   };
 
   const openUpdateModal = (file, action) => { 
@@ -1459,12 +1552,19 @@ export default function VisaTrackApp() {
     if (selectedAction === 'SEND_TO_PROCESSING' && isVisaFile) {
       const assignmentStateRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'visa_assignment_dispatch');
       const destinationAgentsRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'visa_destination_agents');
+      const visaWorkRanksRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'visa_work_ranks');
       try {
         await runTransaction(db, async transaction => {
-          const [fileSnapshot, assignmentStateSnapshot, destinationAgentsSnapshot] = await Promise.all([
-            transaction.get(doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id)),
+          const fileRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id);
+          const familyGroupRef = selectedFile.familyGroupId
+            ? doc(db, 'artifacts', appId, 'public', 'data', 'visa_family_groups', selectedFile.familyGroupId)
+            : null;
+          const [fileSnapshot, assignmentStateSnapshot, destinationAgentsSnapshot, workRanksSnapshot, familyGroupSnapshot] = await Promise.all([
+            transaction.get(fileRef),
             transaction.get(assignmentStateRef),
-            transaction.get(destinationAgentsRef)
+            transaction.get(destinationAgentsRef),
+            transaction.get(visaWorkRanksRef),
+            familyGroupRef ? transaction.get(familyGroupRef) : Promise.resolve(null)
           ]);
           if (!fileSnapshot.exists()) throw new Error('This file no longer exists.');
           const currentFile = { id: fileSnapshot.id, ...fileSnapshot.data() };
@@ -1475,24 +1575,84 @@ export default function VisaTrackApp() {
           const agentsByDestination = destinationAgentsSnapshot.exists()
             ? destinationAgentsSnapshot.data().agentsByDestination || {}
             : {};
-          const processingAgent = chooseProcessingAgent(
-            files,
-            allUsers,
-            visaWorkRanks,
-            assignmentState.lastAssignedAgent || '',
-            currentFile.destination,
-            agentsByDestination
-          );
+          const currentWorkRanks = workRanksSnapshot.exists() ? workRanksSnapshot.data().ranks || {} : {};
+          let familyMemberSnapshots = [];
+          let familyDestinations = [currentFile.destination].filter(Boolean);
+          let processingAgent = '';
+          let familyGroupData = null;
+          if (familyGroupRef) {
+            if (!familyGroupSnapshot?.exists()) throw new Error('This family group no longer exists. Ask an admin to review this file.');
+            familyGroupData = familyGroupSnapshot.data();
+            if (familyGroupData.status === 'LOCKED' && familyGroupData.assignedAgent) {
+              const lockedAgent = allUsers.find(user =>
+                user.role === ROLES.PROCESSING &&
+                (user.fullName || user.name || user.username) === familyGroupData.assignedAgent
+              );
+              if (!lockedAgent) {
+                throw new Error(`This family is locked to ${familyGroupData.assignedAgent}, who is not currently an active Processing Agent. Ask an admin to review the group.`);
+              }
+              processingAgent = familyGroupData.assignedAgent;
+            } else {
+              if (familyGroupData.status !== 'OPEN' || familyGroupData.assignedAgent) {
+                throw new Error('This family group is not available for handoff. Ask an admin to review it.');
+              }
+              const memberFileIds = familyGroupData.memberFileIds || [];
+              if (!memberFileIds.includes(fileSnapshot.id)) {
+                throw new Error('This file is not registered as a member of its family group. Ask an admin to review it.');
+              }
+              const memberRefs = memberFileIds.map(id =>
+                doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', id)
+              );
+              familyMemberSnapshots = await Promise.all(memberRefs.map(ref => transaction.get(ref)));
+              const members = familyMemberSnapshots.map(snapshot => ({ id: snapshot.id, ...snapshot.data() }));
+              if (familyMemberSnapshots.some((snapshot, index) =>
+                !snapshot.exists() ||
+                members[index].familyGroupId !== familyGroupRef.id ||
+                (members[index].fileType || FILE_TYPES.VISA) !== FILE_TYPES.VISA ||
+                members[index].status !== 'RECEIVED_SALES'
+              )) {
+                throw new Error('Every file in a family group must still be at Sales handoff before the first member is sent to Processing.');
+              }
+              familyDestinations = [...new Set(members.map(member => member.destination).filter(Boolean))];
+              if (!familyDestinations.length) throw new Error('Family files need valid destinations before they can be handed off.');
+              processingAgent = chooseProcessingAgent(
+                files,
+                allUsers,
+                currentWorkRanks,
+                assignmentState.lastAssignedAgent || '',
+                currentFile.destination,
+                agentsByDestination
+              );
+            }
+          } else {
+            processingAgent = chooseProcessingAgent(
+              files,
+              allUsers,
+              currentWorkRanks,
+              assignmentState.lastAssignedAgent || '',
+              currentFile.destination,
+              agentsByDestination
+            );
+          }
           if (!processingAgent) {
-            const destinationRule = agentsByDestination[currentFile.destination];
-            if (Array.isArray(destinationRule) && destinationRule.length > 0) {
+            const currentDestinationRule = agentsByDestination[currentFile.destination];
+            if (Array.isArray(currentDestinationRule) && currentDestinationRule.length > 0) {
               throw new Error(`No active Processing Agent is configured for ${currentFile.destination}. Ask an admin to update destination routing.`);
             }
             throw new Error('No Processing Agents are available. Ask an admin to add or reactivate a Processing Agent.');
           }
+          if (familyGroupRef && familyGroupData.status === 'OPEN') {
+            if (!isProcessingAgentEligibleForDestinations(processingAgent, familyDestinations, agentsByDestination)) {
+              const ineligibleDestinations = familyDestinations.filter(destination => {
+                const eligibleAgents = agentsByDestination[destination];
+                return Array.isArray(eligibleAgents) && eligibleAgents.length > 0 && !eligibleAgents.includes(processingAgent);
+              });
+              throw new Error(`The system selected ${processingAgent} based on the first file, but they are not eligible for every family destination (${ineligibleDestinations.join(', ')}). No files were handed off. Ask an admin to review destination routing.`);
+            }
+          }
 
           routedProcessingAgent = processingAgent;
-          routedWorkRank = visaWorkRanks[currentFile.destination] || 'Moderate';
+          routedWorkRank = currentWorkRanks[currentFile.destination] || 'Moderate';
           const docsProvided = Boolean(trackingData?.documentsProvidedToProcessing);
           const nextStatus = docsProvided ? 'HANDOVER_PROCESSING' : 'DOCS_PENDING';
           const historyItem = {
@@ -1502,9 +1662,36 @@ export default function VisaTrackApp() {
             timestamp: Date.now()
           };
 
+          if (familyGroupRef && familyGroupData.status === 'OPEN') {
+            transaction.update(familyGroupRef, {
+              status: 'LOCKED',
+              assignedAgent: processingAgent,
+              destinations: familyDestinations,
+              lockedAt: serverTimestamp(),
+              updatedAt: serverTimestamp()
+            });
+            familyMemberSnapshots.forEach(memberSnapshot => {
+              if (memberSnapshot.id !== fileSnapshot.id) {
+                const member = memberSnapshot.data();
+                const familyAssignmentHistory = {
+                  action: `Family group locked to Processing Agent: ${processingAgent}`,
+                  status: member.status,
+                  performedBy: appUser.name,
+                  timestamp: Date.now()
+                };
+                transaction.update(memberSnapshot.ref, {
+                  familyGroupAssignedTo: processingAgent,
+                  updatedAt: serverTimestamp(),
+                  history: [familyAssignmentHistory, ...(member.history || [])]
+                });
+              }
+            });
+          }
+
           transaction.update(fileSnapshot.ref, {
             status: nextStatus,
             assignedTo: processingAgent,
+            ...(familyGroupRef ? { familyGroupAssignedTo: processingAgent } : {}),
             assignmentMode: 'automatic',
             assignmentWorkRank: routedWorkRank,
             acknowledgedByProcessingAgent: false,
@@ -1820,12 +2007,76 @@ export default function VisaTrackApp() {
       
       updateData.updatedAt = serverTimestamp();
       
-      await updateDoc(fileRef, updateData);
+      if (oldAssignee !== newAssignee && selectedFile.familyGroupId) {
+        const familyGroupRef = doc(db, 'artifacts', appId, 'public', 'data', 'visa_family_groups', selectedFile.familyGroupId);
+        await runTransaction(db, async transaction => {
+          const destinationAgentsRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'visa_destination_agents');
+          const [groupSnapshot, destinationAgentsSnapshot] = await Promise.all([
+            transaction.get(familyGroupRef),
+            transaction.get(destinationAgentsRef)
+          ]);
+          if (!groupSnapshot.exists()) throw new Error('The family group could not be found. No files were reassigned.');
+          const memberFileIds = groupSnapshot.data().memberFileIds || [];
+          if (!memberFileIds.includes(selectedFile.id)) {
+            throw new Error('This file is not registered as a member of its family group. No files were reassigned.');
+          }
+          const memberRefs = memberFileIds.map(id =>
+            doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', id)
+          );
+          const memberSnapshots = await Promise.all(memberRefs.map(ref => transaction.get(ref)));
+          if (memberSnapshots.some(snapshot => !snapshot.exists())) {
+            throw new Error('A family file could not be found. No files were reassigned.');
+          }
+          const agentsByDestination = destinationAgentsSnapshot.exists()
+            ? destinationAgentsSnapshot.data().agentsByDestination || {}
+            : {};
+          const groupDestinations = [...new Set(memberSnapshots.map(snapshot => snapshot.data().destination).filter(Boolean))];
+          if (!isProcessingAgentEligibleForDestinations(newAssignee, groupDestinations, agentsByDestination)) {
+            const ineligibleDestinations = groupDestinations.filter(destination => {
+              const eligibleAgents = agentsByDestination[destination];
+              return Array.isArray(eligibleAgents) && eligibleAgents.length > 0 && !eligibleAgents.includes(newAssignee);
+            });
+            throw new Error(`${newAssignee} is not eligible for every destination in this family (${ineligibleDestinations.join(', ')}). No files were reassigned.`);
+          }
+          memberSnapshots.forEach(snapshot => {
+            const member = snapshot.data();
+            if (snapshot.id === selectedFile.id) {
+              transaction.update(snapshot.ref, {
+                ...updateData,
+                familyGroupAssignedTo: newAssignee,
+                assignmentMode: 'admin'
+              });
+            } else {
+              const historyItem = {
+                status: member.status,
+                timestamp: Date.now(),
+                performedBy: appUser.name,
+                action: `Family file reassigned from ${member.assignedTo || member.familyGroupAssignedTo || 'Unassigned'} to ${newAssignee}`
+              };
+              transaction.update(snapshot.ref, {
+                assignedTo: newAssignee,
+                familyGroupAssignedTo: newAssignee,
+                assignmentMode: 'admin',
+                updatedAt: serverTimestamp(),
+                history: [historyItem, ...(member.history || [])]
+              });
+            }
+          });
+          transaction.update(familyGroupRef, {
+            status: 'LOCKED',
+            assignedAgent: newAssignee,
+            lockedAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          });
+        });
+      } else {
+        await updateDoc(fileRef, updateData);
+      }
       setEditModalOpen(false);
       alert('File updated successfully!');
     } catch (err) {
       console.error('Error updating file:', err);
-      alert('Failed to update file');
+      alert(`Failed to update file: ${err.message || 'Please try again.'}`);
     }
   };
 
@@ -1904,30 +2155,18 @@ export default function VisaTrackApp() {
     return <LoginScreen onLogin={handleLogin} darkMode={darkMode} toggleDarkMode={toggleDarkMode} />;
   }
 
-  const NavItem = ({ id, icon: Icon, label }) => (
-    <button 
-      onClick={() => { setActiveTab(id); setMobileMenuOpen(false); }}
-      className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-colors ${
-        activeTab === id 
-          ? (darkMode ? "bg-slate-800 text-blue-400" : "bg-slate-100 text-blue-600") 
-          : (darkMode ? "text-slate-400 hover:bg-slate-800" : "text-slate-600 hover:bg-slate-50")
-      }`}
-    >
-      <Icon className="h-5 w-5" />
-      {label}
-    </button>
-  );
-
   return (
     <ErrorBoundary>
       <div className={`min-h-screen font-sans transition-colors duration-200 flex flex-col ${containerClass}`}>
       <nav className={`${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} border-b sticky top-0 z-20 print:hidden`}>
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between h-16">
             <div className="flex items-center gap-2">
               <button 
                 onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-                className={`md:hidden p-2 rounded-lg ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-100'}`}
+                className={`xl:hidden p-2 rounded-lg ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-100'}`}
+                aria-label={mobileMenuOpen ? 'Close navigation menu' : 'Open navigation menu'}
+                aria-expanded={mobileMenuOpen}
               >
                 {mobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
               </button>
@@ -1947,24 +2186,64 @@ export default function VisaTrackApp() {
             </div>
             
             <div className="flex items-center gap-2 md:gap-4">
-               <div className="hidden md:flex gap-1">
+               <div className="hidden xl:flex items-center gap-1">
                  <NavButton active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} icon={Layout} darkMode={darkMode}>Dashboard</NavButton>
                  {appUser.role !== ROLES.ACCOUNTS && (
                    <>
                      <NavButton active={activeTab === 'pipeline'} onClick={() => setActiveTab('pipeline')} icon={List} darkMode={darkMode}>Pipeline</NavButton>
                      <NavButton active={activeTab === 'processing'} onClick={() => setActiveTab('processing')} icon={Activity} darkMode={darkMode}>Tracker</NavButton>
                      <NavButton active={activeTab === 'add'} onClick={() => setActiveTab('add')} icon={Plus} darkMode={darkMode}>New File</NavButton>
-                     <NavButton active={activeTab === 'reports'} onClick={() => setActiveTab('reports')} icon={Activity} darkMode={darkMode}>Stats</NavButton>
                    </>
                  )}
-                 {(appUser.role === ROLES.ADMIN || appUser.role === ROLES.ACCOUNTS) && <NavButton active={activeTab === 'accounting'} onClick={() => setActiveTab('accounting')} icon={DollarSign} darkMode={darkMode}>Accounting</NavButton>}
-                 <NavButton active={activeTab === 'leaves'} onClick={() => setActiveTab('leaves')} icon={Calendar} darkMode={darkMode} badge={appUser.role === ROLES.ADMIN ? leaveRequests.filter(r => r.status === 'PENDING').length : 0}>Leaves</NavButton>
-                 {appUser.role === ROLES.ADMIN && (
-                   <>
-                     <NavButton active={activeTab === 'duplicates'} onClick={() => setActiveTab('duplicates')} icon={Copy} darkMode={darkMode} badge={possibleDuplicatePairs.filter(pair => !duplicateReviews.some(review => review.id === pair.reviewId)).length}>Duplicates</NavButton>
-                     <NavButton active={activeTab === 'admin'} onClick={() => setActiveTab('admin')} icon={Shield} darkMode={darkMode}>Admin</NavButton>
-                   </>
-                 )}
+                 <div className="relative">
+                   <button
+                     type="button"
+                     onClick={() => setMoreMenuOpen(open => !open)}
+                     aria-expanded={moreMenuOpen}
+                     className={`relative flex items-center gap-1 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
+                       moreMenuOpen || ['reports', 'accounting', 'leaves', 'duplicates', 'admin'].includes(activeTab)
+                         ? (darkMode ? 'bg-slate-800 text-blue-400' : 'bg-slate-100 text-blue-600')
+                         : (darkMode ? 'text-slate-400 hover:bg-slate-800 hover:text-slate-200' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900')
+                     }`}
+                   >
+                     More <ChevronDown className={`h-4 w-4 transition-transform ${moreMenuOpen ? 'rotate-180' : ''}`} />
+                     {leaveRequests.filter(request => request.status === 'PENDING').length +
+                       possibleDuplicatePairs.filter(pair => !duplicateReviews.some(review => review.id === pair.reviewId)).length > 0 && (
+                       <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white">
+                         {leaveRequests.filter(request => request.status === 'PENDING').length +
+                           possibleDuplicatePairs.filter(pair => !duplicateReviews.some(review => review.id === pair.reviewId)).length > 99
+                           ? '99+'
+                           : leaveRequests.filter(request => request.status === 'PENDING').length +
+                             possibleDuplicatePairs.filter(pair => !duplicateReviews.some(review => review.id === pair.reviewId)).length}
+                       </span>
+                     )}
+                   </button>
+                   {moreMenuOpen && (
+                     <>
+                       <button
+                         type="button"
+                         aria-label="Close more navigation menu"
+                         className="fixed inset-0 z-30 cursor-default"
+                         onClick={() => setMoreMenuOpen(false)}
+                       />
+                       <div className={`absolute right-0 top-full z-40 mt-2 w-56 rounded-xl border p-2 shadow-xl ${
+                         darkMode ? 'border-slate-700 bg-slate-900' : 'border-slate-200 bg-white'
+                       }`}>
+                         <NavMenuItem id="reports" icon={Activity} label="Statistical Reports" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('reports'); setMoreMenuOpen(false); }} />
+                         {(appUser.role === ROLES.ADMIN || appUser.role === ROLES.ACCOUNTS) && (
+                           <NavMenuItem id="accounting" icon={DollarSign} label="Accounting" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('accounting'); setMoreMenuOpen(false); }} />
+                         )}
+                         <NavMenuItem id="leaves" icon={Calendar} label="Leaves" badge={appUser.role === ROLES.ADMIN ? leaveRequests.filter(request => request.status === 'PENDING').length : 0} activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('leaves'); setMoreMenuOpen(false); }} />
+                         {appUser.role === ROLES.ADMIN && (
+                           <>
+                             <NavMenuItem id="duplicates" icon={Copy} label="Duplicates" badge={possibleDuplicatePairs.filter(pair => !duplicateReviews.some(review => review.id === pair.reviewId)).length} activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('duplicates'); setMoreMenuOpen(false); }} />
+                             <NavMenuItem id="admin" icon={Shield} label="Admin Panel" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('admin'); setMoreMenuOpen(false); }} />
+                           </>
+                         )}
+                       </div>
+                     </>
+                   )}
+                 </div>
                </div>
 
                <button 
@@ -2002,24 +2281,25 @@ export default function VisaTrackApp() {
         
         {/* Mobile Navigation Sidebar */}
         {mobileMenuOpen && (
-          <div className={`md:hidden absolute top-16 left-0 w-full h-[calc(100vh-4rem)] z-50 p-4 border-t ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+          <div className={`xl:hidden absolute top-16 left-0 w-full h-[calc(100vh-4rem)] z-50 overflow-y-auto p-4 border-t ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
              <div className="space-y-1">
-                <NavItem id="dashboard" icon={Layout} label="Dashboard" />
+                <NavItem id="dashboard" icon={Layout} label="Dashboard" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('dashboard'); setMobileMenuOpen(false); }} />
                 {appUser.role !== ROLES.ACCOUNTS && (
                   <>
-                    <NavItem id="pipeline" icon={List} label="Work Pipeline" />
-                    <NavItem id="processing" icon={Activity} label="Processing Tracker" />
-                    <NavItem id="add" icon={Plus} label="Register New File" />
-                    <NavItem id="reports" icon={Activity} label="Statistical Reports" />
+                    <NavItem id="pipeline" icon={List} label="Work Pipeline" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('pipeline'); setMobileMenuOpen(false); }} />
+                    <NavItem id="processing" icon={Activity} label="Processing Tracker" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('processing'); setMobileMenuOpen(false); }} />
+                    <NavItem id="add" icon={Plus} label="Register New File" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('add'); setMobileMenuOpen(false); }} />
+                    <NavItem id="reports" icon={Activity} label="Statistical Reports" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('reports'); setMobileMenuOpen(false); }} />
                   </>
                 )}
+                <NavItem id="leaves" icon={Calendar} label="Leaves" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('leaves'); setMobileMenuOpen(false); }} />
                 {(appUser.role === ROLES.ADMIN || appUser.role === ROLES.ACCOUNTS) && (
-                  <NavItem id="accounting" onClick={() => setActiveTab('accounting')} icon={DollarSign} label="Accounting" />
+                  <NavItem id="accounting" icon={DollarSign} label="Accounting" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('accounting'); setMobileMenuOpen(false); }} />
                 )}
                 {appUser.role === ROLES.ADMIN && (
                   <>
-                    <NavItem id="duplicates" onClick={() => setActiveTab('duplicates')} icon={Copy} label="Duplicate Review" />
-                    <NavItem id="admin" onClick={() => setActiveTab('admin')} icon={Shield} label="Admin Panel" />
+                    <NavItem id="duplicates" icon={Copy} label="Duplicate Review" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('duplicates'); setMobileMenuOpen(false); }} />
+                    <NavItem id="admin" icon={Shield} label="Admin Panel" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('admin'); setMobileMenuOpen(false); }} />
                   </>
                 )}
              </div>
@@ -2038,7 +2318,7 @@ export default function VisaTrackApp() {
         )}
       </nav>
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-grow w-full">
+      <main className="max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-grow w-full">
         {activeTab === 'dashboard' && (
           <Dashboard 
             files={files} 
@@ -2088,6 +2368,8 @@ export default function VisaTrackApp() {
           <AddFileForm 
             destinations={destinations} 
             files={files}
+            familyGroups={visaFamilyGroups}
+            currentUser={appUser}
             onSubmit={addNewFile} 
             onCancel={() => setActiveTab('dashboard')} 
             darkMode={darkMode}
@@ -2222,7 +2504,8 @@ export default function VisaTrackApp() {
 
       {/* Specialized Status Update Modals */}
       {airTicketBookedModalOpen && (
-        <AirTicketBookedModal
+        <AirTicketDetailsModal
+          key="booked"
           isOpen={airTicketBookedModalOpen}
           onClose={() => setAirTicketBookedModalOpen(false)}
           onConfirm={(data) => {
@@ -2236,7 +2519,9 @@ export default function VisaTrackApp() {
       )}
 
       {airTicketIssuedModalOpen && (
-        <AirTicketIssuedModal
+        <AirTicketDetailsModal
+          key="issued"
+          issued={true}
           isOpen={airTicketIssuedModalOpen}
           onClose={() => setAirTicketIssuedModalOpen(false)}
           onConfirm={(data) => {
@@ -2307,6 +2592,40 @@ export default function VisaTrackApp() {
 }
 
 // --- Sub-Components ---
+
+function NavItem({ id, icon: Icon, label, activeTab, darkMode, onSelect }) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-colors ${
+        activeTab === id
+          ? (darkMode ? 'bg-slate-800 text-blue-400' : 'bg-slate-100 text-blue-600')
+          : (darkMode ? 'text-slate-400 hover:bg-slate-800' : 'text-slate-600 hover:bg-slate-50')
+      }`}
+    >
+      <Icon className="h-5 w-5" />
+      {label}
+    </button>
+  );
+}
+
+function NavMenuItem({ id, icon: Icon, label, badge = 0, activeTab, darkMode, onSelect }) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors ${
+        activeTab === id
+          ? (darkMode ? 'bg-slate-800 text-blue-400' : 'bg-slate-100 text-blue-600')
+          : (darkMode ? 'text-slate-300 hover:bg-slate-800' : 'text-slate-700 hover:bg-slate-50')
+      }`}
+    >
+      <span className="flex items-center gap-3"><Icon className="h-4 w-4" />{label}</span>
+      {badge > 0 && <span className="rounded-full bg-red-500 px-2 py-0.5 text-xs font-bold text-white">{badge > 99 ? '99+' : badge}</span>}
+    </button>
+  );
+}
 
 function NavButton({ active, onClick, icon: Icon, children, darkMode, badge }) {
   const baseClass = "flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors relative";
@@ -2572,9 +2891,15 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
   const [registeredByFilter, setRegisteredByFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
-  const [currentTime, setCurrentTime] = useState(getDhakaDate());
   const itemsPerPage = 20;
   const isAdmin = user?.role === ROLES.ADMIN;
+  const activeFilterCount = [
+    destFilter,
+    fileTypeFilter,
+    showIncompleteCosts,
+    showLowCostOnly,
+    ...(isAdmin ? [dateFromFilter, dateToFilter, registeredByFilter, statusFilter] : [])
+  ].filter(Boolean).length;
   const activeTasks = useMemo(
     () => myTasks.filter(task => task?.status && !isFileCompleted(task)),
     [myTasks]
@@ -2583,12 +2908,6 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
   useEffect(() => {
     setCurrentPage(1);
   }, [destFilter, fileTypeFilter, showIncompleteCosts, dateFromFilter, dateToFilter, showLowCostOnly, registeredByFilter, statusFilter, searchTerm]);
-
-  // Update clock every second
-  useEffect(() => {
-    const timer = setInterval(() => setCurrentTime(getDhakaDate()), 1000);
-    return () => clearInterval(timer);
-  }, []);
 
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
@@ -2770,6 +3089,8 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
         (f.passportNo && String(f.passportNo).trim().toLowerCase().includes(normalizedSearch)) ||
         (f.mainPersonPassport && String(f.mainPersonPassport).trim().toLowerCase().includes(normalizedSearch)) ||
         (f.destination && String(f.destination).toLowerCase().includes(normalizedSearch)) ||
+        (f.familyGroupLabel && String(f.familyGroupLabel).toLowerCase().includes(normalizedSearch)) ||
+        (f.familyGroupId && String(f.familyGroupId).toLowerCase().includes(normalizedSearch)) ||
         (f.fileId && String(f.fileId).toLowerCase().includes(normalizedSearch)) ||
         (f.invoiceNo && String(f.invoiceNo).toLowerCase().includes(normalizedSearch)) ||
         (f.invoice && f.invoice.invoiceNo && String(f.invoice.invoiceNo).toLowerCase().includes(normalizedSearch)) ||
@@ -2826,211 +3147,274 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
 
   return (
     <div className="space-y-6">
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-      {/* Left Sidebar: Company Branding & Honors Board */}
-      <div className="space-y-6">
-        {/* Company Branding Section - Vertical */}
-        <div className={`rounded-xl border p-4 ${cardClass}`}>
-          <div className="flex flex-col items-center text-center">
-            {/* Logo */}
-            <img 
-              src={logoImage} 
-              alt="Company Logo" 
-              className="h-16 w-16 rounded-lg object-cover shadow-lg mb-3"
-            />
-            
-            {/* Company Info */}
-            <h2 className={`text-lg font-bold ${textMain} mb-2`}>{COMPANY_INFO.name}</h2>
-            <div className={`${textSub} text-xs space-y-2`}>
-              <div>
-                <p className={`font-semibold ${textMain}`}>Trade License</p>
-                <p className="truncate text-[10px]">{COMPANY_INFO.tradeNum}</p>
-              </div>
-              <div>
-                <p className={`font-semibold ${textMain}`}>CAAB No</p>
-                <p className="truncate text-[10px]">{COMPANY_INFO.caabNum}</p>
-              </div>
-            </div>
+      <div className="flex flex-col gap-5">
+      <div className="order-1 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-3">
+          <img src={logoImage} alt="" className="h-10 w-10 shrink-0 rounded-lg object-cover" />
+          <div className="min-w-0">
+            <h2 className={`text-xl font-bold ${textMain}`}>Dashboard</h2>
+            <p className={`truncate text-xs ${textSub}`}>{COMPANY_INFO.name} · Trade License {COMPANY_INFO.tradeNum} · CAAB {COMPANY_INFO.caabNum}</p>
           </div>
         </div>
+        <span className={`rounded-full border px-3 py-1.5 text-xs font-medium ${darkMode ? 'border-slate-700 bg-slate-900 text-slate-300' : 'border-slate-200 bg-white text-slate-600'}`}>
+          Today · {new Intl.DateTimeFormat('en', { timeZone: 'Asia/Dhaka', weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' }).format(new Date())}
+        </span>
+      </div>
 
-        {/* Honors Board - Top Performers by Category */}
-        <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
-          <div className={`px-4 py-3 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
-            <h3 className={`font-bold flex items-center gap-2 text-sm ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
-              ⭐ Honors Board
-            </h3>
-          </div>
-          <div className="p-4 space-y-4">
+      {/* Honors Board and operational summaries */}
+      <div className="order-3 space-y-4">
+        <details className={`rounded-xl border overflow-hidden ${cardClass}`}>
+          <summary className={`cursor-pointer list-none px-4 py-3 text-sm font-bold ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
+            ⭐ Honors Board
+            <span className="mt-1 block text-[11px] font-normal text-slate-500">
+              Sales: {honorsMetrics.bestSales.user} · Processing: {honorsMetrics.bestProcessing.user}
+            </span>
+          </summary>
+          <div className="grid grid-cols-1 gap-3 p-4 sm:grid-cols-2">
             {/* Best Sales */}
-            <div className={`p-3 rounded-lg border ${darkMode ? 'border-purple-800/50 bg-purple-900/20' : 'border-purple-200 bg-purple-50'}`}>
+            <div className={`rounded-lg border p-3 ${darkMode ? 'border-purple-800/50 bg-purple-900/20' : 'border-purple-200 bg-purple-50'}`}>
               <p className={`text-[10px] font-semibold ${darkMode ? 'text-purple-400' : 'text-purple-600'} uppercase tracking-wide mb-2`}>💰 Best Sales</p>
               <p className={`text-sm font-semibold ${textMain}`}>{honorsMetrics.bestSales.user}</p>
               <p className={`text-xs ${textSub}`}>{honorsMetrics.bestSales.count} sales this month</p>
             </div>
 
             {/* Best Processing */}
-            <div className={`p-3 rounded-lg border ${darkMode ? 'border-amber-800/50 bg-amber-900/20' : 'border-amber-200 bg-amber-50'}`}>
+            <div className={`rounded-lg border p-3 ${darkMode ? 'border-amber-800/50 bg-amber-900/20' : 'border-amber-200 bg-amber-50'}`}>
               <p className={`text-[10px] font-semibold ${darkMode ? 'text-amber-400' : 'text-amber-600'} uppercase tracking-wide mb-2`}>⚡ Best Processing</p>
               <p className={`text-sm font-semibold ${textMain}`}>{honorsMetrics.bestProcessing.user}</p>
               <p className={`text-xs ${textSub}`}>{honorsMetrics.bestProcessing.count} files completed this month</p>
+            </div>
+          </div>
+        </details>
+
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
+            <div className={`px-4 py-3 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
+              <h3 className={`font-semibold flex items-center gap-2 text-sm ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}><CalendarDays className="h-4 w-4"/> Upcoming Reminders</h3>
+            </div>
+            <div className={`divide-y max-h-64 overflow-y-auto ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
+              {reminders.length === 0 ? (
+                <p className="p-4 text-sm text-slate-400 text-center">No upcoming reminders.</p>
+              ) : (
+                reminders.map(r => (
+                  <div key={r.id} className={`p-3 transition-colors cursor-pointer ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`} onClick={() => onOpenUpdateModal(r, r.status)}>
+                    <div className="flex justify-between items-start gap-2">
+                      <span className={`font-medium text-sm ${textMain}`}>{r.applicantName}</span>
+                      <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-orange-900/30 text-orange-400' : 'bg-orange-100 text-orange-600'}`}>{formatSimpleDate(r.reminderDate)}</span>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-1">{r.destination}</p>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
+            <div className={`px-4 py-3 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
+              <h3 className={`font-semibold flex items-center gap-2 text-sm ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}><CheckSquare className="h-4 w-4"/> My Active Tasks</h3>
+            </div>
+            <div className={`divide-y max-h-64 overflow-y-auto ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
+              {activeTasks.length === 0 ? (
+                <p className="p-4 text-sm text-slate-400 text-center">No active files assigned to you.</p>
+              ) : (
+                activeTasks.map(t => (
+                  <div key={t.id} className={`p-3 transition-colors cursor-pointer ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`} onClick={() => onOpenUpdateModal(t, t.status)}>
+                    <div className="flex justify-between items-start gap-2">
+                      <span className={`font-medium text-sm ${textMain}`}>{t.applicantName}</span>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded ${darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-500'}`}>{t.fileId}</span>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-1">{STATUS[t.status].label}</p>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+
+          <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
+            <div className={`px-4 py-3 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
+              <h3 className={`font-semibold flex items-center gap-2 text-sm ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}><Clock className="h-4 w-4"/> Recent Activity</h3>
+            </div>
+            <div className={`divide-y max-h-64 overflow-y-auto ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
+              {recentActivity.length === 0 ? (
+                <p className="p-4 text-sm text-slate-400 text-center">No recent activity.</p>
+              ) : (
+                recentActivity.map((act, idx) => (
+                  <div key={idx} className="p-3">
+                    <p className={`text-sm ${textMain}`}><span className="font-medium">{act.performedBy}</span> {(act.action || act.note || '').split(' - ')[0]}</p>
+                    <div className="flex justify-between items-center mt-1 gap-2">
+                      <span className="truncate text-xs text-blue-500 font-medium">{act.fileId || 'N/A'} - {act.applicant}</span>
+                      <span className="shrink-0 text-[10px] text-slate-400">{formatDate({seconds: act.timestamp/1000}).split(',')[1]}</span>
+                    </div>
+                  </div>
+                ))
+              )}
             </div>
           </div>
         </div>
       </div>
 
       {/* Main Content Area */}
-      <div className="lg:col-span-3 space-y-8">
-        {/* Clock and Date - Compact Top Card */}
-        <div className={`rounded-xl border ${darkMode ? 'bg-slate-900/50 border-slate-700' : 'bg-white border-slate-200'}`}>
-          <div className="flex items-center justify-center px-10 py-6 min-h-[200px]">
-            <DhakaClock />
-          </div>
-        </div>
-
+      <div className="order-2 space-y-5">
         {/* Stats Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
-        <div className={`p-4 md:p-6 rounded-xl border flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-0 ${cardClass}`}>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className={`p-4 rounded-xl border flex items-center justify-between gap-3 ${cardClass}`}>
           <div>
-            <p className={`text-xs md:text-sm font-medium ${textSub}`}>Sales Today</p>
-            <p className={`text-2xl md:text-3xl font-bold ${textMain}`}>{stats.salesToday}</p>
+            <p className={`text-xs font-medium ${textSub}`}>Sales Today</p>
+            <p className={`text-2xl font-bold ${textMain}`}>{stats.salesToday}</p>
           </div>
           <div className={`${darkMode ? 'bg-blue-900/30 text-blue-400' : 'bg-blue-100 text-blue-600'} p-2 md:p-3 rounded-full w-fit`}><TrendingUp className="h-5 md:h-6 w-5 md:w-6"/></div>
         </div>
-        <div className={`p-4 md:p-6 rounded-xl border flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-0 ${cardClass}`}>
+        <div className={`p-4 rounded-xl border flex items-center justify-between gap-3 ${cardClass}`}>
           <div>
-            <p className={`text-xs md:text-sm font-medium ${textSub}`}>In Processing</p>
-            <p className={`text-2xl md:text-3xl font-bold ${textMain}`}>{stats.inProcess}</p>
+            <p className={`text-xs font-medium ${textSub}`}>In Processing</p>
+            <p className={`text-2xl font-bold ${textMain}`}>{stats.inProcess}</p>
           </div>
           <div className={`${darkMode ? 'bg-purple-900/30 text-purple-400' : 'bg-purple-100 text-purple-600'} p-2 md:p-3 rounded-full w-fit`}><Activity className="h-5 md:h-6 w-5 md:w-6"/></div>
         </div>
-        <div className={`p-4 md:p-6 rounded-xl border flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-0 ${cardClass}`}>
+        <div className={`p-4 rounded-xl border flex items-center justify-between gap-3 ${cardClass}`}>
           <div>
-            <p className={`text-xs md:text-sm font-medium ${textSub}`}>Submitted Today</p>
-            <p className={`text-2xl md:text-3xl font-bold ${textMain}`}>{stats.submittedToday}</p>
+            <p className={`text-xs font-medium ${textSub}`}>Submitted Today</p>
+            <p className={`text-2xl font-bold ${textMain}`}>{stats.submittedToday}</p>
           </div>
           <div className={`${darkMode ? 'bg-indigo-900/30 text-indigo-400' : 'bg-indigo-100 text-indigo-600'} p-2 md:p-3 rounded-full w-fit`}><Send className="h-5 md:h-6 w-5 md:w-6"/></div>
         </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <div className="space-y-4">
         {/* Main Feed / Search */}
-        <div className="lg:col-span-2 space-y-6">
-          <div className="flex flex-col sm:flex-row justify-between gap-4">
-            <div>
-              <h2 className={`text-xl font-bold ${textMain}`}>All Files</h2>
-              <p className={`text-sm ${textSub}`}>Showing {currentFiles.length} of {filteredFiles.length} files</p>
+        <div>
+          <section className={`rounded-xl border p-4 ${cardClass}`}>
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className={`text-xl font-bold ${textMain}`}>All Files</h2>
+                <p className={`text-sm ${textSub}`}>Showing {currentFiles.length} of {filteredFiles.length} files</p>
+              </div>
+              <div className="flex items-center gap-3">
+                {activeFilterCount > 0 && <span className="text-xs text-slate-500">{activeFilterCount} filter{activeFilterCount === 1 ? '' : 's'} active</span>}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDestFilter('');
+                    setFileTypeFilter('');
+                    setShowIncompleteCosts(false);
+                    setShowLowCostOnly(false);
+                    setDateFromFilter('');
+                    setDateToFilter('');
+                    setRegisteredByFilter('');
+                    setStatusFilter('');
+                    setSearchTerm('');
+                  }}
+                  disabled={activeFilterCount === 0 && !searchTerm}
+                  className="text-xs font-medium text-blue-600 hover:underline disabled:cursor-not-allowed disabled:text-slate-400 disabled:no-underline"
+                >
+                  Clear filters
+                </button>
+              </div>
             </div>
-            
-            <div className="flex gap-2 w-full sm:w-auto flex-wrap">
-              <div className="relative flex-grow sm:flex-grow-0">
-                <Filter className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+              <div className="relative">
+                <Filter className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
                 <select
                   value={destFilter}
                   onChange={(e) => setDestFilter(e.target.value)}
-                  className={`pl-10 pr-8 py-2 border rounded-lg appearance-none text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full sm:w-48 h-full ${inputClass}`}
+                  className={`h-10 w-full appearance-none rounded-lg border py-2 pl-10 pr-8 text-sm outline-none focus:ring-2 focus:ring-blue-500 ${inputClass}`}
                 >
                   <option value="">All Countries</option>
                   {destinations.map(d => <option key={d} value={d}>{d}</option>)}
                 </select>
               </div>
-
-              <div className="relative flex-grow sm:flex-grow-0">
-                <Filter className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+              <div className="relative">
+                <Filter className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
                 <select
                   value={fileTypeFilter}
                   onChange={(e) => setFileTypeFilter(e.target.value)}
-                  className={`pl-10 pr-8 py-2 border rounded-lg appearance-none text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full sm:w-48 h-full ${inputClass}`}
+                  className={`h-10 w-full appearance-none rounded-lg border py-2 pl-10 pr-8 text-sm outline-none focus:ring-2 focus:ring-blue-500 ${inputClass}`}
                 >
                   <option value="">All Types</option>
                   {Object.values(FILE_TYPES).map(type => <option key={type} value={type}>{type}</option>)}
                 </select>
               </div>
-
               <button
+                type="button"
                 onClick={() => setShowIncompleteCosts(!showIncompleteCosts)}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors whitespace-nowrap ${
+                aria-pressed={showIncompleteCosts}
+                className={`h-10 rounded-lg border px-3 text-sm font-medium transition-colors ${
                   showIncompleteCosts
-                    ? 'bg-red-600 text-white hover:bg-red-700'
+                    ? 'border-red-600 bg-red-600 text-white hover:bg-red-700'
                     : darkMode
-                    ? 'bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700'
-                    : 'bg-slate-200 text-slate-700 hover:bg-slate-300 border border-slate-300'
+                    ? 'border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700'
+                    : 'border-slate-300 bg-slate-200 text-slate-700 hover:bg-slate-300'
                 }`}
               >
                 ⚠️ Incomplete Costs
               </button>
+              <div className="relative sm:col-span-2 xl:col-span-3">
+                <Search className="absolute left-3 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder="Search ID, name, passport..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className={`h-10 w-full rounded-lg border py-2 pl-10 pr-4 text-sm outline-none focus:ring-2 focus:ring-blue-500 ${inputClass}`}
+                />
+              </div>
+            </div>
 
-              {isAdmin && (
-                <>
-                  <div className="relative flex-grow sm:flex-grow-0">
-                    <input
-                      type="date"
-                      value={dateFromFilter}
-                      onChange={(e) => setDateFromFilter(e.target.value)}
-                      className={`px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full sm:w-40 ${inputClass}`}
-                    />
-                  </div>
-
-                  <div className="relative flex-grow sm:flex-grow-0">
-                    <input
-                      type="date"
-                      value={dateToFilter}
-                      onChange={(e) => setDateToFilter(e.target.value)}
-                      className={`px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full sm:w-40 ${inputClass}`}
-                    />
-                  </div>
-
-                  <div className="relative flex-grow sm:flex-grow-0">
+            <details className={`mt-3 border-t pt-3 ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+              <summary className={`cursor-pointer select-none text-sm font-medium ${darkMode ? 'text-slate-300' : 'text-slate-600'}`}>
+                Advanced filters{isAdmin ? ' · dates, registrar, status, low cost' : ' · low cost'}
+              </summary>
+              <div className={`mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 ${isAdmin ? 'xl:grid-cols-3' : ''}`}>
+                {isAdmin && (
+                  <>
+                    <label className="space-y-1 text-xs text-slate-500">
+                      <span>Created from</span>
+                      <input type="date" value={dateFromFilter} onChange={(e) => setDateFromFilter(e.target.value)} className={`h-10 w-full rounded-lg border px-3 text-sm ${inputClass}`} />
+                    </label>
+                    <label className="space-y-1 text-xs text-slate-500">
+                      <span>Created to</span>
+                      <input type="date" value={dateToFilter} onChange={(e) => setDateToFilter(e.target.value)} className={`h-10 w-full rounded-lg border px-3 text-sm ${inputClass}`} />
+                    </label>
                     <select
                       value={registeredByFilter}
                       onChange={(e) => setRegisteredByFilter(e.target.value)}
-                      className={`px-3 py-2 border rounded-lg appearance-none text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full sm:w-48 ${inputClass}`}
+                      aria-label="Filter by registrar"
+                      className={`h-10 w-full rounded-lg border px-3 text-sm ${inputClass}`}
                     >
                       <option value="">All Registrars</option>
                       {registrars.map(name => <option key={name} value={name}>{name}</option>)}
                     </select>
-                  </div>
-
-                  <div className="relative flex-grow sm:flex-grow-0">
                     <select
                       value={statusFilter}
                       onChange={(e) => setStatusFilter(e.target.value)}
-                      className={`px-3 py-2 border rounded-lg appearance-none text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full sm:w-48 ${inputClass}`}
+                      aria-label="Filter by status"
+                      className={`h-10 w-full rounded-lg border px-3 text-sm ${inputClass}`}
                     >
                       <option value="">All Statuses</option>
-                      {fileStatuses.map(status => (
-                        <option key={status} value={status}>{STATUS[status]?.label || status}</option>
-                      ))}
+                      {fileStatuses.map(status => <option key={status} value={status}>{STATUS[status]?.label || status}</option>)}
                     </select>
-                  </div>
-
+                  </>
+                )}
+                {isAdmin && (
                   <button
+                    type="button"
                     onClick={() => setShowLowCostOnly(!showLowCostOnly)}
-                    className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors whitespace-nowrap ${
+                    aria-pressed={showLowCostOnly}
+                    className={`h-10 rounded-lg border px-3 text-sm font-medium transition-colors ${
                       showLowCostOnly
-                        ? 'bg-amber-600 text-white hover:bg-amber-700'
+                        ? 'border-amber-600 bg-amber-600 text-white hover:bg-amber-700'
                         : darkMode
-                        ? 'bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700'
-                        : 'bg-slate-200 text-slate-700 hover:bg-slate-300 border border-slate-300'
+                        ? 'border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700'
+                        : 'border-slate-300 bg-slate-200 text-slate-700 hover:bg-slate-300'
                     }`}
                   >
                     📉 Low Cost
                   </button>
-                </>
-              )}
-
-              <div className="relative flex-grow sm:flex-grow-0">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-5 w-5 text-slate-400" />
-                <input 
-                  type="text" 
-                  placeholder="Search ID, name, passport..." 
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                  className={`pl-10 pr-4 py-2 border rounded-lg w-full sm:w-64 focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
-                />
+                )}
               </div>
-            </div>
-          </div>
+            </details>
+          </section>
 
           <div className="space-y-4">
             {currentFiles.length === 0 ? (
@@ -3078,68 +3462,6 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
           </div>
         </div>
 
-        {/* Sidebar: Tasks, Reminders & Activity */}
-        <div className="space-y-6">
-           {/* Upcoming Reminders */}
-           <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
-              <div className={`px-5 py-3 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
-                 <h3 className={`font-semibold flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}><CalendarDays className="h-4 w-4"/> Upcoming Reminders</h3>
-              </div>
-              <div className={`divide-y max-h-64 overflow-y-auto ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                 {reminders.length === 0 ? (
-                    <p className="p-4 text-sm text-slate-400 text-center">No upcoming reminders.</p>
-                 ) : (
-                    reminders.map(r => (
-                       <div key={r.id} className={`p-4 transition-colors cursor-pointer ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`} onClick={() => onOpenUpdateModal(r, r.status)}>
-                          <div className="flex justify-between items-start">
-                             <span className={`font-medium text-sm ${textMain}`}>{r.applicantName}</span>
-                             <span className={`text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-orange-900/30 text-orange-400' : 'bg-orange-100 text-orange-600'}`}>{formatSimpleDate(r.reminderDate)}</span>
-                          </div>
-                          <p className="text-xs text-slate-500 mt-1">{r.destination}</p>
-                       </div>
-                    ))
-                 )}
-              </div>
-           </div>
-
-           <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
-              <div className={`px-5 py-3 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
-                 <h3 className={`font-semibold flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}><CheckSquare className="h-4 w-4"/> My Active Tasks</h3>
-              </div>
-              <div className={`divide-y max-h-64 overflow-y-auto ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                 {activeTasks.length === 0 ? (
-                    <p className="p-4 text-sm text-slate-400 text-center">No active files assigned to you.</p>
-                 ) : (
-                    activeTasks.map(t => (
-                       <div key={t.id} className={`p-4 transition-colors cursor-pointer ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`} onClick={() => onOpenUpdateModal(t, t.status)}>
-                          <div className="flex justify-between items-start">
-                             <span className={`font-medium text-sm ${textMain}`}>{t.applicantName}</span>
-                             <span className={`text-[10px] px-1.5 py-0.5 rounded ${darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-500'}`}>{t.fileId}</span>
-                          </div>
-                          <p className="text-xs text-slate-500 mt-1">{STATUS[t.status].label}</p>
-                       </div>
-                    ))
-                 )}
-              </div>
-           </div>
-
-           <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
-              <div className={`px-5 py-3 border-b ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
-                 <h3 className={`font-semibold flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}><Clock className="h-4 w-4"/> Recent Activity</h3>
-              </div>
-              <div className={`divide-y ${darkMode ? 'divide-slate-800' : 'divide-slate-100'}`}>
-                 {recentActivity.map((act, idx) => (
-                    <div key={idx} className="p-4">
-                       <p className={`text-sm ${textMain}`}><span className="font-medium">{act.performedBy}</span> {(act.action || act.note || '').split(' - ')[0]}</p>
-                       <div className="flex justify-between items-center mt-1">
-                          <span className="text-xs text-blue-500 font-medium">{act.fileId || 'N/A'} - {act.applicant}</span>
-                          <span className="text-[10px] text-slate-400">{formatDate({seconds: act.timestamp/1000}).split(',')[1]}</span>
-                       </div>
-                    </div>
-                 ))}
-              </div>
-           </div>
-        </div>
         </div>
       </div>
       </div>
@@ -3147,7 +3469,7 @@ function Dashboard({ files, user, destinations, onOpenUpdateModal, onOpenNoteMod
   );
 }
 
-function AddFileForm({ onSubmit, onCancel, destinations, files, darkMode }) {
+function AddFileForm({ onSubmit, onCancel, destinations, files, familyGroups = [], currentUser, darkMode }) {
   const [fileType, setFileType] = useState(FILE_TYPES.VISA);
   const [formData, setFormData] = useState({ 
     applicantName: '', 
@@ -3180,6 +3502,9 @@ function AddFileForm({ onSubmit, onCancel, destinations, files, darkMode }) {
   });
   const [countries, setCountries] = useState([]);
   const [possibleDuplicates, setPossibleDuplicates] = useState(null);
+  const [familyGroupSelection, setFamilyGroupSelection] = useState('');
+  const [familyGroupSearch, setFamilyGroupSearch] = useState('');
+  const [familyGroupLabel, setFamilyGroupLabel] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const pendingCreationRef = useRef(null);
   const submittingRef = useRef(false);
@@ -3215,9 +3540,25 @@ function AddFileForm({ onSubmit, onCancel, destinations, files, darkMode }) {
   const inputClass = darkMode 
     ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
     : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+  const openFamilyGroups = familyGroups.filter(group =>
+    group.status === 'OPEN' &&
+    !group.assignedAgent &&
+    (group.memberFileIds || []).length < MAX_VISA_FAMILY_SIZE
+  );
+  const matchingFamilyGroups = familyGroupSearch.trim().length >= 3
+    ? openFamilyGroups
+      .filter(group => group.id.toLowerCase().includes(familyGroupSearch.trim().toLowerCase()))
+      .slice(0, 5)
+    : [];
+  const selectedFamilyGroup = openFamilyGroups.find(group => group.id === familyGroupSelection);
+  const canManageFamilyGroups = [ROLES.SALES, ROLES.ADMIN].includes(currentUser?.role);
 
   const handleFileTypeChange = (type) => {
     setFileType(type);
+    if (type !== FILE_TYPES.VISA) {
+      setFamilyGroupSelection('');
+      setFamilyGroupSearch('');
+    }
     setFormData({...formData, fileType: type});
   };
 
@@ -3240,6 +3581,15 @@ function AddFileForm({ onSubmit, onCancel, destinations, files, darkMode }) {
     if (submittingRef.current) return;
 
     const currentFormData = { ...formData, fileType };
+    if (
+      fileType === FILE_TYPES.VISA &&
+      familyGroupSearch.trim() &&
+      familyGroupSelection !== 'CREATE' &&
+      !selectedFamilyGroup
+    ) {
+      alert('Search for a valid open Family Group ID and select it, or clear the search to create an individual file.');
+      return;
+    }
     const matches = findPossibleFileDuplicates(currentFormData, files);
     const matchingIds = matches.map(file => file.id).filter(Boolean).sort();
     const approvedIds = reviewedFileIds ? [...reviewedFileIds].sort() : null;
@@ -3261,6 +3611,11 @@ function AddFileForm({ onSubmit, onCancel, destinations, files, darkMode }) {
         fileId: `VT-${Math.floor(10000 + Math.random() * 90000)}`
       };
     }
+    const familyGroupId = fileType !== FILE_TYPES.VISA
+      ? ''
+      : familyGroupSelection === 'CREATE'
+        ? pendingCreationRef.current.familyGroupId || (pendingCreationRef.current.familyGroupId = doc(collection(db, 'artifacts', appId, 'public', 'data', 'visa_family_groups')).id)
+        : familyGroupSelection;
 
     submittingRef.current = true;
     setIsSubmitting(true);
@@ -3268,9 +3623,17 @@ function AddFileForm({ onSubmit, onCancel, destinations, files, darkMode }) {
       const created = await onSubmit({
         ...currentFormData,
         ...pendingCreationRef.current,
+        familyGroupId,
+        familyGroupLabel: familyGroupSelection === 'CREATE' ? familyGroupLabel.trim() || `${formData.applicantName.trim()} family` : (
+          familyGroups.find(group => group.id === familyGroupId)?.label || ''
+        ),
+        createFamilyGroup: familyGroupSelection === 'CREATE',
         reviewedDuplicateFileIds: matchingIds
       });
-      if (created) pendingCreationRef.current = null;
+      if (created) {
+        pendingCreationRef.current = null;
+        if (familyGroupSelection === 'CREATE') setFamilyGroupSelection(familyGroupId);
+      }
     } finally {
       submittingRef.current = false;
       setIsSubmitting(false);
@@ -3348,6 +3711,121 @@ function AddFileForm({ onSubmit, onCancel, destinations, files, darkMode }) {
                    {destinations.map(d => <option key={d} value={d}>{d}</option>)}
                 </select>
               </div>
+              {canManageFamilyGroups && <div className="col-span-1 sm:col-span-2 rounded-lg border border-blue-200 p-4 dark:border-blue-900">
+                <label className={`block text-sm font-medium mb-2 ${labelClass}`}>Family / Group (Optional)</label>
+                <p className="mb-3 text-xs text-slate-500">
+                Each family group gets a unique ID. Enter or paste the ID here to find an open group. Only matching results are shown.
+                </p>
+                {familyGroupSelection !== 'CREATE' && (
+                  <>
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <input
+                        type="search"
+                        value={familyGroupSearch}
+                        onChange={event => {
+                          setFamilyGroupSearch(event.target.value);
+                          setFamilyGroupSelection('');
+                        }}
+                        placeholder="Enter Family Group ID"
+                        className={`min-w-0 flex-1 rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+                        aria-label="Search Family Group ID"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setFamilyGroupSelection('CREATE');
+                          setFamilyGroupSearch('');
+                        }}
+                        className="rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700"
+                      >
+                        Create New Group
+                      </button>
+                      {familyGroupSelection && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setFamilyGroupSelection('');
+                            setFamilyGroupSearch('');
+                          }}
+                          className={`rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                    {familyGroupSearch.trim().length > 0 && familyGroupSearch.trim().length < 3 && (
+                      <p className="mt-2 text-xs text-slate-500">Enter at least 3 characters of the group ID to search.</p>
+                    )}
+                    {familyGroupSearch.trim().length >= 3 && matchingFamilyGroups.length === 0 && (
+                      <p className="mt-2 text-xs text-amber-600">No open family group matches that ID.</p>
+                    )}
+                    {matchingFamilyGroups.length > 0 && !selectedFamilyGroup && (
+                      <div className={`mt-2 divide-y rounded-lg border ${darkMode ? 'divide-slate-800 border-slate-700' : 'divide-slate-200 border-slate-200'}`}>
+                        {matchingFamilyGroups.map(group => (
+                          <button
+                            key={group.id}
+                            type="button"
+                            onClick={() => {
+                              setFamilyGroupSelection(group.id);
+                              setFamilyGroupSearch(group.id);
+                            }}
+                            className={`flex w-full flex-col items-start gap-1 px-3 py-2 text-left text-sm ${darkMode ? 'hover:bg-slate-800' : 'hover:bg-slate-50'}`}
+                          >
+                            <span className="font-mono font-semibold text-indigo-500">{group.id}</span>
+                            <span className="text-xs text-slate-500">
+                              {group.label} · {(group.memberFileIds || []).length} existing {(group.memberFileIds || []).length === 1 ? 'file' : 'files'}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+                {selectedFamilyGroup && (
+                  <div className={`mt-3 rounded-lg border p-3 ${darkMode ? 'border-indigo-800 bg-indigo-950/30' : 'border-indigo-200 bg-indigo-50'}`}>
+                    <p className="text-xs text-slate-500">Selected Family Group ID</p>
+                    <p className="font-mono font-semibold text-indigo-600 dark:text-indigo-300">{selectedFamilyGroup.id}</p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {selectedFamilyGroup.label} · {(selectedFamilyGroup.memberFileIds || []).length} existing {(selectedFamilyGroup.memberFileIds || []).length === 1 ? 'file' : 'files'}
+                    </p>
+                  </div>
+                )}
+                {familyGroupSelection === 'CREATE' && (
+                  <>
+                    <input
+                      type="text"
+                      maxLength={80}
+                      value={familyGroupLabel}
+                      onChange={event => setFamilyGroupLabel(event.target.value)}
+                      placeholder={`${formData.applicantName || 'Family'} family (optional label)`}
+                      className={`mt-3 w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+                    />
+                    <div className="mt-3 flex items-center justify-between gap-3">
+                      <p className="text-xs text-slate-500">The Group ID is generated when you register this file.</p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setFamilyGroupSelection('');
+                          setFamilyGroupLabel('');
+                        }}
+                        className="text-xs text-blue-500 hover:underline"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </>
+                )}
+                {selectedFamilyGroup && (
+                  <p className="mt-2 text-xs text-slate-500">
+                    This file will be linked to the selected unassigned group. The system selects an agent using the first handed-off file’s destination and workload, not the family membership. It must also be eligible for every group destination or the handoff is blocked. You cannot add members after the first handoff.
+                  </p>
+                )}
+                {familyGroupSelection === 'CREATE' && (
+                  <p className="mt-2 text-xs text-slate-500">
+                    Create this group on the first family member’s file, then search for its generated ID for each additional member. Each person keeps a separate VT ID, invoice, and status. Maximum {MAX_VISA_FAMILY_SIZE} files per group.
+                  </p>
+                )}
+              </div>}
             </>
           )}
 
@@ -3725,6 +4203,7 @@ function PipelineView({ files, darkMode, onOpenFile }) {
     const unique = new Set(files.filter(f => !isFileCompleted(f)).map(f => f.status));
     return Array.from(unique).sort();
   }, [files]);
+  const visibleFileCount = Object.values(groupedFiles).reduce((count, userFiles) => count + userFiles.length, 0);
 
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
   const columnClass = darkMode ? 'bg-slate-900/50' : 'bg-slate-100';
@@ -3732,18 +4211,21 @@ function PipelineView({ files, darkMode, onOpenFile }) {
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h2 className={`text-2xl font-bold ${textMain}`}>Work Pipeline</h2>
           <p className="text-slate-500">Current workload distribution by employee</p>
         </div>
+        <p className={`text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+          {visibleFileCount} active files · {Object.keys(groupedFiles).length} assignees
+        </p>
       </div>
 
-      <div className="flex gap-4 flex-wrap">
+      <div className={`flex flex-wrap gap-3 rounded-xl border p-3 ${cardClass}`}>
         <select 
           value={filterCreatedBy}
           onChange={(e) => setFilterCreatedBy(e.target.value)}
-          className={`px-3 py-2 rounded-lg border text-sm font-medium ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-200' : 'bg-white border-slate-300 text-slate-800'}`}
+          className={`min-w-48 flex-1 rounded-lg border px-3 py-2 text-sm font-medium ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-200' : 'bg-white border-slate-300 text-slate-800'}`}
         >
           <option value="ALL">All Users</option>
           {creators.map(creator => (
@@ -3754,7 +4236,7 @@ function PipelineView({ files, darkMode, onOpenFile }) {
         <select 
           value={filterStatus}
           onChange={(e) => setFilterStatus(e.target.value)}
-          className={`px-3 py-2 rounded-lg border text-sm font-medium ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-200' : 'bg-white border-slate-300 text-slate-800'}`}
+          className={`min-w-48 flex-1 rounded-lg border px-3 py-2 text-sm font-medium ${darkMode ? 'bg-slate-800 border-slate-700 text-slate-200' : 'bg-white border-slate-300 text-slate-800'}`}
         >
           <option value="ALL">All Statuses</option>
           {statuses.map(status => (
@@ -3763,13 +4245,13 @@ function PipelineView({ files, darkMode, onOpenFile }) {
         </select>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 overflow-x-auto pb-4">
+      <div className="grid grid-cols-1 gap-4 pb-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
         {Object.entries(groupedFiles).map(([user, userFiles]) => (
-          <div key={user} className={`rounded-xl p-4 min-w-[300px] flex flex-col h-full max-h-[calc(100vh-200px)] ${columnClass}`}>
-             <div className="flex justify-between items-center mb-3 px-1">
-                <h3 className={`font-bold flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
+          <div key={user} className={`flex h-full min-w-0 max-h-[calc(100vh-200px)] flex-col rounded-xl border p-3 ${columnClass} ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+             <div className="mb-3 flex items-center justify-between gap-2 px-1">
+                <h3 className={`flex min-w-0 items-center gap-2 font-bold ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>
                    <div className={`w-8 h-8 rounded-full flex items-center justify-center shadow-sm ${darkMode ? 'bg-slate-800 text-slate-300' : 'bg-white text-slate-500'}`}><User className="h-4 w-4"/></div>
-                   {user}
+                   <span className="truncate">{user}</span>
                 </h3>
                 <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${darkMode ? 'bg-slate-800 text-slate-300' : 'bg-slate-200 text-slate-600'}`}>{userFiles.length}</span>
              </div>
@@ -3860,7 +4342,7 @@ function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAge
   const visibleFiles = trackedFiles.filter(file => {
     if (assigneeFilter && (file.assignedTo || 'Unassigned') !== assigneeFilter) return false;
     if (statusFilter && file.status !== statusFilter) return false;
-    if (normalizedSearch && !`${file.fileId || ''} ${file.applicantName || ''}`.toLowerCase().includes(normalizedSearch)) return false;
+    if (normalizedSearch && !`${file.fileId || ''} ${file.applicantName || ''} ${file.familyGroupLabel || ''} ${file.familyGroupId || ''}`.toLowerCase().includes(normalizedSearch)) return false;
     return true;
   });
   const agentWorkloads = useMemo(
@@ -3884,14 +4366,14 @@ function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAge
         <p className={textSub}>Active files by assignee, status, and time in the current status.</p>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div className={`rounded-xl border p-4 ${cardClass}`}>
-          <p className={`text-sm ${textSub}`}>Files in processing</p>
-          <p className={`text-2xl font-bold ${textMain}`}>{trackedFiles.length}</p>
+          <p className={`text-xs font-semibold uppercase tracking-wide ${textSub}`}>Files in processing</p>
+          <p className={`mt-1 text-2xl font-bold ${textMain}`}>{trackedFiles.length}</p>
         </div>
         <div className={`rounded-xl border p-4 ${cardClass}`}>
-          <p className={`text-sm ${textSub}`}>In current status for 7+ days</p>
-          <p className={`text-2xl font-bold ${stalledCount ? 'text-amber-500' : textMain}`}>{stalledCount}</p>
+          <p className={`text-xs font-semibold uppercase tracking-wide ${textSub}`}>In current status for 7+ days</p>
+          <p className={`mt-1 text-2xl font-bold ${stalledCount ? 'text-amber-500' : textMain}`}>{stalledCount}</p>
         </div>
       </div>
 
@@ -3900,7 +4382,7 @@ function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAge
           <div className={`border-b px-4 py-3 ${darkMode ? 'border-slate-800 bg-slate-800/60' : 'border-slate-100 bg-slate-50'}`}>
             <h3 className={`font-semibold ${textMain}`}>Processing Agent Workload</h3>
             <p className={`mt-1 text-xs ${textSub}`}>
-              Active Visa files and weighted workload points used for automatic assignment (High 3, Moderate 2, Low 1).
+              Active Visa files, including reserved members of locked family groups, and weighted points used for automatic assignment (High 3, Moderate 2, Low 1).
             </p>
           </div>
           {agentWorkloads.length > 0 ? (
@@ -3909,7 +4391,7 @@ function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAge
                 <thead className={darkMode ? 'bg-slate-950/50 text-slate-400' : 'bg-white text-slate-500'}>
                   <tr>
                     <th className="px-4 py-2">Processing Agent</th>
-                    <th className="px-4 py-2 text-right">Active Visa Files</th>
+                    <th className="px-4 py-2 text-right">Assigned Visa Files</th>
                     <th className="px-4 py-2 text-right">Workload Points</th>
                   </tr>
                 </thead>
@@ -3930,11 +4412,11 @@ function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAge
         </section>
       )}
 
-      <div className="flex flex-wrap gap-3">
+      <div className={`grid grid-cols-1 gap-2 rounded-xl border p-3 sm:grid-cols-2 lg:grid-cols-4 ${cardClass}`}>
         <select
           value={assigneeFilter}
           onChange={event => setAssigneeFilter(event.target.value)}
-          className={`rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+          className={`h-10 rounded-lg border px-3 py-2 text-sm ${inputClass}`}
           aria-label="Filter by assignee"
         >
           <option value="">All Assignees</option>
@@ -3943,7 +4425,7 @@ function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAge
         <select
           value={statusFilter}
           onChange={event => setStatusFilter(event.target.value)}
-          className={`rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+          className={`h-10 rounded-lg border px-3 py-2 text-sm ${inputClass}`}
           aria-label="Filter by status"
         >
           <option value="">All Statuses</option>
@@ -3954,14 +4436,15 @@ function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAge
           value={searchTerm}
           onChange={event => setSearchTerm(event.target.value)}
           placeholder="Search file ID or customer"
-          className={`min-w-[220px] rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+          className={`h-10 rounded-lg border px-3 py-2 text-sm sm:col-span-2 ${inputClass}`}
         />
+        <p className={`self-center text-xs ${textSub}`}>Showing {visibleFiles.length} of {trackedFiles.length} files</p>
       </div>
 
       <div className={`overflow-hidden rounded-xl border ${cardClass}`}>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[760px] text-left text-sm">
-            <thead className={darkMode ? 'bg-slate-800 text-slate-300' : 'bg-slate-50 text-slate-600'}>
+            <thead className={`text-xs uppercase tracking-wide ${darkMode ? 'bg-slate-800 text-slate-300' : 'bg-slate-50 text-slate-600'}`}>
               <tr>
                 <th className="px-4 py-3">File</th>
                 <th className="px-4 py-3">Customer</th>
@@ -3974,7 +4457,7 @@ function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAge
             </thead>
             <tbody className={textMain}>
               {visibleFiles.map(file => (
-                <tr key={file.id} className={`border-t ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+                <tr key={file.id} className={`border-t transition-colors ${darkMode ? 'border-slate-800 hover:bg-slate-800/50' : 'border-slate-100 hover:bg-slate-50'}`}>
                   <td className="px-4 py-3">
                     <button
                       onClick={() => onOpenFile?.(file)}
@@ -3986,14 +4469,20 @@ function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAge
                   <td className="px-4 py-3">{file.applicantName || '-'}</td>
                   <td className="px-4 py-3">{file.fileType || FILE_TYPES.VISA}</td>
                   <td className="px-4 py-3">{file.assignedTo || 'Unassigned'}</td>
-                  <td className="px-4 py-3">{STATUS[file.status]?.label || file.status}</td>
+                  <td className="px-4 py-3">
+                    <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${darkMode ? STATUS[file.status]?.darkColor : STATUS[file.status]?.color}`}>
+                      {STATUS[file.status]?.label || file.status}
+                    </span>
+                  </td>
                   <td className="px-4 py-3">{file.statusDate ? file.statusDate.toLocaleDateString() : 'Unknown'}</td>
-                  <td className={`px-4 py-3 font-semibold ${
-                    file.daysInStatus !== null && file.daysInStatus >= 7
-                      ? 'text-amber-500'
-                      : textMain
-                  }`}>
-                    {file.daysInStatus === null ? 'Unknown' : `${file.daysInStatus} ${file.daysInStatus === 1 ? 'day' : 'days'}`}
+                  <td className="px-4 py-3">
+                    <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ${
+                      file.daysInStatus !== null && file.daysInStatus >= 7
+                        ? 'bg-amber-500/15 text-amber-500'
+                        : darkMode ? 'bg-slate-800 text-slate-300' : 'bg-slate-100 text-slate-600'
+                    }`}>
+                      {file.daysInStatus === null ? 'Unknown' : `${file.daysInStatus} ${file.daysInStatus === 1 ? 'day' : 'days'}`}
+                    </span>
                   </td>
                 </tr>
               ))}
@@ -4034,8 +4523,8 @@ function LeavesPanel({ currentUser, leaveRequests, approvedLeaves, allUsers, dar
   };
 
   return (
-    <div className={`rounded-xl border p-8 ${cardClass}`}>
-      <div className="flex justify-between items-center mb-6">
+    <div className="space-y-5">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className={`text-2xl font-bold ${textMain}`}>Leave Management</h2>
           <p className={textSub}>Manage leave requests and approved leaves</p>
@@ -4043,7 +4532,7 @@ function LeavesPanel({ currentUser, leaveRequests, approvedLeaves, allUsers, dar
         {currentUser.role !== ROLES.ADMIN && (
           <button 
             onClick={onRequestLeave}
-            className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-medium"
+            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700"
           >
             Request Leave
           </button>
@@ -4052,34 +4541,35 @@ function LeavesPanel({ currentUser, leaveRequests, approvedLeaves, allUsers, dar
 
       {/* Admin Leave Request Approvals */}
       {currentUser.role === ROLES.ADMIN && (
-        <div className={`mb-8 p-6 rounded-xl border ${darkMode ? 'bg-slate-800/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
-          <h3 className={`text-lg font-bold mb-4 ${textMain}`}>Pending Leave Requests</h3>
+        <div className={`rounded-xl border p-4 ${cardClass}`}>
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <h3 className={`text-base font-bold ${textMain}`}>Pending Leave Requests</h3>
+            <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${pendingRequests.length ? 'bg-amber-500/15 text-amber-500' : darkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-500'}`}>{pendingRequests.length}</span>
+          </div>
           {pendingRequests.length === 0 ? (
             <p className={textSub}>No pending leave requests</p>
           ) : (
             <div className="space-y-3">
               {pendingRequests.map(req => (
-                <div key={req.id} className={`p-4 rounded-lg border ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
-                  <div className="flex justify-between items-start mb-2">
-                    <div>
-                      <p className={`font-bold ${textMain}`}>{req.userName}</p>
-                      <p className={`text-sm ${textSub}`}>{req.startDate} to {req.endDate}</p>
-                      {req.reason && <p className={`text-sm ${textSub} mt-1`}>Reason: {req.reason}</p>}
-                    </div>
-                    <div className="flex gap-2">
+                <div key={req.id} className={`flex flex-wrap items-start justify-between gap-3 rounded-lg border p-4 ${darkMode ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="min-w-0">
+                    <p className={`font-bold ${textMain}`}>{req.userName}</p>
+                    <p className={`text-sm ${textSub}`}>{req.startDate} to {req.endDate}</p>
+                    {req.reason && <p className={`text-sm ${textSub} mt-1`}>Reason: {req.reason}</p>}
+                  </div>
+                  <div className="flex gap-2">
                       <button 
                         onClick={() => onApprove(req.id, req)}
-                        className="px-3 py-1 bg-green-500 text-white rounded text-sm hover:bg-green-600"
+                        className="rounded-lg bg-green-600 px-3 py-2 text-sm font-medium text-white hover:bg-green-700"
                       >
                         Approve
                       </button>
                       <button 
                         onClick={() => onReject(req.id)}
-                        className="px-3 py-1 bg-red-500 text-white rounded text-sm hover:bg-red-600"
+                        className="rounded-lg bg-red-600 px-3 py-2 text-sm font-medium text-white hover:bg-red-700"
                       >
                         Reject
                       </button>
-                    </div>
                   </div>
                 </div>
               ))}
@@ -4090,12 +4580,12 @@ function LeavesPanel({ currentUser, leaveRequests, approvedLeaves, allUsers, dar
 
       {/* Admin Direct Leave Grant */}
       {currentUser.role === ROLES.ADMIN && (
-        <div className={`mb-8 p-6 rounded-xl border ${darkMode ? 'bg-slate-800/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
-          <div className="flex justify-between items-center mb-4">
-            <h3 className={`text-lg font-bold ${textMain}`}>Grant Direct Leave</h3>
+        <div className={`rounded-xl border p-4 ${cardClass}`}>
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <h3 className={`text-base font-bold ${textMain}`}>Grant Direct Leave</h3>
             <button 
               onClick={() => setShowDirectLeaveForm(!showDirectLeaveForm)}
-              className="px-3 py-1 bg-blue-500 text-white rounded text-sm hover:bg-blue-600"
+              className="rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700"
             >
               {showDirectLeaveForm ? 'Cancel' : 'Grant Leave'}
             </button>
@@ -4143,14 +4633,17 @@ function LeavesPanel({ currentUser, leaveRequests, approvedLeaves, allUsers, dar
       )}
 
       {/* Approved Leaves List */}
-      <div className={`p-6 rounded-xl border ${darkMode ? 'bg-slate-800/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
-        <h3 className={`text-lg font-bold mb-4 ${textMain}`}>Approved Leaves</h3>
+      <div className={`rounded-xl border p-4 ${cardClass}`}>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h3 className={`text-base font-bold ${textMain}`}>Approved Leaves</h3>
+          <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${darkMode ? 'bg-slate-800 text-slate-300' : 'bg-slate-100 text-slate-600'}`}>{approvedLeaves.length}</span>
+        </div>
         {approvedLeaves.length === 0 ? (
           <p className={textSub}>No approved leaves</p>
         ) : (
           <div className="space-y-3">
             {approvedLeaves.map(leave => (
-              <div key={leave.id} className={`p-4 rounded-lg border ${darkMode ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'}`}>
+              <div key={leave.id} className={`rounded-lg border p-4 ${darkMode ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
                 <div className="flex justify-between items-start">
                   <div>
                     <p className={`font-bold ${textMain}`}>{leave.userName}</p>
@@ -4211,7 +4704,12 @@ function AdminPanel({
   const [savingVisaWorkRanks, setSavingVisaWorkRanks] = useState(false);
   const [visaDestinationAgentsDraft, setVisaDestinationAgentsDraft] = useState(visaDestinationAgents);
   const [savingVisaDestinationAgents, setSavingVisaDestinationAgents] = useState(false);
+  const [destinationSearch, setDestinationSearch] = useState('');
+  const [expandedDestination, setExpandedDestination] = useState('');
   
+  const filteredDestinations = destinations.filter(destination =>
+    destination.toLowerCase().includes(destinationSearch.trim().toLowerCase())
+  );
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
   const inputClass = darkMode 
@@ -4555,10 +5053,10 @@ function AdminPanel({
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         
         {/* User Management Section */}
-        <div className="lg:col-span-2 space-y-6">
+        <div className="space-y-6">
            <div className={`rounded-xl border overflow-hidden ${cardClass}`}>
              <div className={`px-6 py-4 border-b flex justify-between items-center ${darkMode ? 'border-slate-800 bg-slate-950/30' : 'border-slate-100 bg-slate-50'}`}>
                 <h3 className={`font-bold flex items-center gap-2 ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}><Users className="h-5 w-5"/> Staff Accounts</h3>
@@ -4568,7 +5066,7 @@ function AdminPanel({
              {/* Add User Form */}
              <div className={`p-6 border-b ${darkMode ? 'border-slate-800 bg-slate-900' : 'border-slate-100 bg-slate-50/50'}`}>
                <h4 className="text-xs font-bold text-slate-500 uppercase mb-3">Create New Account</h4>
-               <form onSubmit={handleAddUser} className="grid grid-cols-2 md:grid-cols-4 gap-3">
+               <form onSubmit={handleAddUser} className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                  <input 
                    required
                    className={`px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 outline-none ${inputClass}`}
@@ -4650,9 +5148,26 @@ function AdminPanel({
                <button type="submit" className="bg-blue-600 text-white p-2 rounded-lg hover:bg-blue-700"><Plus className="h-5 w-5"/></button>
              </form>
           </div>
-          <div className="p-2 max-h-[400px] overflow-y-auto">
+          <div className="p-3">
+             <label className="sr-only" htmlFor="destination-settings-search">Search destinations</label>
+             <input
+               id="destination-settings-search"
+               type="search"
+               value={destinationSearch}
+               onChange={event => setDestinationSearch(event.target.value)}
+               placeholder="Search destinations..."
+               className={`mb-3 w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+             />
+             <div className="mb-2 flex items-center justify-between text-xs text-slate-500">
+               <span>{filteredDestinations.length} destinations</span>
+               {destinationSearch && (
+                 <button type="button" onClick={() => setDestinationSearch('')} className="text-blue-500 hover:underline">
+                   Clear search
+                 </button>
+               )}
+             </div>
              <div className="flex flex-wrap gap-2">
-               {destinations.map(d => (
+               {filteredDestinations.map(d => (
                  <span key={d} className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm border ${darkMode ? 'bg-slate-800 text-slate-300 border-slate-700' : 'bg-slate-100 text-slate-700 border-slate-200'}`}>
                     {d}
                     <button onClick={() => handleDeleteDestination(d)} className="hover:text-red-600 text-slate-400 ml-1"><X className="h-3 w-3"/></button>
@@ -4666,23 +5181,44 @@ function AdminPanel({
               <h4 className={`font-semibold text-sm ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>Visa Workload Ranks</h4>
               <p className="mt-1 text-xs text-slate-500">These ranks weight each active Visa file for automatic Processing Agent assignment: High 3, Moderate 2, Low 1.</p>
             </div>
-            {destinations.map(destination => (
-              <div key={destination} className={`mb-3 rounded-lg border p-3 ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
-                <div className="flex items-center justify-between gap-3 text-sm">
-                  <span className={`font-medium ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>{destination}</span>
-                  <select
-                    value={visaWorkRankDraft[destination] || 'Moderate'}
-                    onChange={event => setVisaWorkRankDraft(current => ({ ...current, [destination]: event.target.value }))}
-                    className={`rounded-lg border px-3 py-2 text-sm ${inputClass}`}
-                    aria-label={`${destination} workload rank`}
-                  >
-                    {Object.keys(WORK_RANK_WEIGHTS).map(rank => <option key={rank} value={rank}>{rank} ({WORK_RANK_WEIGHTS[rank]})</option>)}
-                  </select>
-                </div>
-                <div className="mt-3">
+            <div className="space-y-2">
+            {filteredDestinations
+              .map(destination => {
+                const selectedAgents = visaDestinationAgentsDraft[destination] || [];
+                const restricted = selectedAgents.length > 0;
+                const isExpanded = expandedDestination === destination;
+                return (
+              <div key={destination} className={`rounded-lg border ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+                <button
+                  type="button"
+                  aria-expanded={isExpanded}
+                  onClick={() => setExpandedDestination(isExpanded ? '' : destination)}
+                  className={`flex w-full items-center justify-between gap-3 rounded-lg px-3 py-3 text-left ${darkMode ? 'hover:bg-slate-800/60' : 'hover:bg-slate-50'}`}
+                >
+                  <span className="min-w-0">
+                    <span className={`block truncate text-sm font-medium ${textMain}`}>{destination}</span>
+                    <span className="mt-0.5 block text-xs text-slate-500">
+                      {visaWorkRankDraft[destination] || 'Moderate'} · {restricted ? `${selectedAgents.length} eligible agent${selectedAgents.length === 1 ? '' : 's'}` : 'All agents eligible'}
+                    </span>
+                  </span>
+                  <ChevronDown className={`h-4 w-4 shrink-0 text-slate-500 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
+                </button>
+                {isExpanded && <div className={`space-y-4 border-t p-3 ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+                  <label className="flex items-center justify-between gap-3 text-sm">
+                    <span className={darkMode ? 'text-slate-300' : 'text-slate-700'}>Workload rank</span>
+                    <select
+                      value={visaWorkRankDraft[destination] || 'Moderate'}
+                      onChange={event => setVisaWorkRankDraft(current => ({ ...current, [destination]: event.target.value }))}
+                      className={`rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+                      aria-label={`${destination} workload rank`}
+                    >
+                      {Object.keys(WORK_RANK_WEIGHTS).map(rank => <option key={rank} value={rank}>{rank} ({WORK_RANK_WEIGHTS[rank]})</option>)}
+                    </select>
+                  </label>
+                  <div>
                   <div className="mb-2 flex items-center justify-between gap-2">
                     <p className="text-xs text-slate-500">Eligible Processing Agents</p>
-                    {(visaDestinationAgentsDraft[destination] || []).length > 0 && (
+                    {restricted && (
                       <button
                         type="button"
                         onClick={() => setVisaDestinationAgentsDraft(current => ({ ...current, [destination]: [] }))}
@@ -4695,10 +5231,8 @@ function AdminPanel({
                   <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
                     {[...new Set([
                       ...processingAgents.map(agent => agent.fullName || agent.name || agent.username).filter(Boolean),
-                      ...(visaDestinationAgentsDraft[destination] || [])
+                      ...selectedAgents
                     ])].sort((a, b) => a.localeCompare(b)).map(agentName => {
-                      const selectedAgents = visaDestinationAgentsDraft[destination] || [];
-                      const restricted = selectedAgents.length > 0;
                       const checked = restricted && selectedAgents.includes(agentName);
                       const isActiveAgent = processingAgents.some(agent =>
                         (agent.fullName || agent.name || agent.username) === agentName
@@ -4726,9 +5260,15 @@ function AdminPanel({
                   <p className="mt-2 text-[11px] text-slate-500">
                     No agents selected means any Processing Agent can handle this destination.
                   </p>
-                </div>
+                  </div>
+                </div>}
               </div>
-            ))}
+                );
+              })}
+              {filteredDestinations.length === 0 && (
+                <p className="rounded-lg border border-dashed p-4 text-center text-sm text-slate-500">No destinations match your search.</p>
+              )}
+            </div>
             <button
               type="button"
               onClick={saveVisaWorkRanks}
@@ -5152,16 +5692,16 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
   const canViewCosts = user?.role === ROLES.ADMIN;
 
   return (
-    <div className={`rounded-xl border overflow-hidden transition-all hover:shadow-md ${cardClass}`}>
-      <div className="p-5">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="flex items-start gap-4">
-            <div className={`p-3 rounded-full ${iconBg}`}>
-              <StatusIcon className={`h-6 w-6 ${iconColor}`} />
+    <div className={`rounded-xl border overflow-hidden transition-all hover:border-blue-300 hover:shadow-md ${cardClass}`}>
+      <div className="p-4 sm:p-5">
+        <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
+          <div className="flex min-w-0 flex-1 items-start gap-3">
+            <div className={`shrink-0 rounded-xl p-2.5 ${iconBg}`}>
+              <StatusIcon className={`h-5 w-5 ${iconColor}`} />
             </div>
-            <div>
-              <div className="flex items-center gap-2 mb-1">
-                 <h3 className={`text-lg font-bold ${textMain}`}>{file.applicantName}</h3>
+            <div className="min-w-0 flex-1">
+              <div className="mb-1 flex flex-wrap items-center gap-2">
+                 <h3 className={`min-w-0 break-words text-base font-bold sm:text-lg ${textMain}`}>{file.applicantName}</h3>
                  <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${darkMode ? 'bg-slate-800 text-slate-400 border-slate-700' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>{file.fileId || 'NO-ID'}</span>
                  <span className={`text-[10px] px-2 py-0.5 rounded font-semibold ${
                    (file.fileType || FILE_TYPES.VISA) === FILE_TYPES.VISA ? (darkMode ? 'bg-blue-900/30 text-blue-400' : 'bg-blue-100 text-blue-700') :
@@ -5170,6 +5710,11 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
                    (file.fileType || FILE_TYPES.VISA) === FILE_TYPES.PICK_DROP ? (darkMode ? 'bg-orange-900/30 text-orange-400' : 'bg-orange-100 text-orange-700') :
                    ''
                  }`}>{file.fileType || FILE_TYPES.VISA}</span>
+                 {file.familyGroupId && (
+                   <span className={`text-[10px] px-2 py-0.5 rounded border ${darkMode ? 'border-indigo-800 bg-indigo-900/30 text-indigo-300' : 'border-indigo-200 bg-indigo-50 text-indigo-700'}`}>
+                     Family ID: {file.familyGroupId}
+                   </span>
+                 )}
               </div>
               
             <div className={`flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm ${textSub}`}>
@@ -5217,15 +5762,15 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
             </div>
           </div>
 
-          <div className="flex flex-col items-end gap-2">
-            <span className={`px-3 py-1 rounded-full text-sm font-medium ${statusColor}`}>
+          <div className="flex shrink-0 flex-row items-center justify-between gap-3 sm:flex-col sm:items-end">
+            <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${statusColor}`}>
               {STATUS[file.status].label}
             </span>
-            <span className="text-xs text-slate-400">Assigned: {file.assignedTo || 'Unassigned'}</span>
+            <span className="max-w-48 truncate text-xs text-slate-400">Assigned: {file.assignedTo || 'Unassigned'}</span>
           </div>
         </div>
 
-        <div className={`mt-6 pt-4 border-t flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+        <div className={`mt-4 flex flex-col items-start justify-between gap-3 border-t pt-3 sm:flex-row sm:items-center ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
           <div className="flex flex-wrap items-center gap-1 sm:gap-2">
             <button 
                 onClick={() => setExpanded(!expanded)}
@@ -5540,7 +6085,7 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
     };
   
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+      <div className="modal-backdrop">
         <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
           {isSendToProcessing && (
             <>
@@ -5766,7 +6311,7 @@ function PickDropBookedModal({ isOpen, onClose, onConfirm, file, darkMode }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
         <h3 className="text-lg font-bold mb-2">Pick & Drop Booked</h3>
         <p className="text-sm text-slate-500 mb-6">Enter booking details for <b>{file?.applicantName}</b></p>
@@ -5830,8 +6375,7 @@ function PickDropBookedModal({ isOpen, onClose, onConfirm, file, darkMode }) {
   );
 }
 
-// Air Ticket - BOOKED Status Modal
-function AirTicketBookedModal({ isOpen, onClose, onConfirm, file, darkMode, portals }) {
+function AirTicketDetailsModal({ isOpen, onClose, onConfirm, file, darkMode, portals, issued }) {
   const [pnr, setPnr] = useState(file?.pnr || '');
   const [portal, setPortal] = useState(file?.portal || '');
   const [bookingDate, setBookingDate] = useState(file?.bookingValidity?.date || '');
@@ -5848,7 +6392,7 @@ function AirTicketBookedModal({ isOpen, onClose, onConfirm, file, darkMode, port
 
   const handleSubmit = () => {
     if (!pnr || !portal || !bookingDate || !bookingTime) {
-      alert("Please fill in all booking fields");
+      alert(issued ? "Please fill in all fields" : "Please fill in all booking fields");
       return;
     }
     onConfirm({ pnr, portal, bookingValidity: { date: bookingDate, time: bookingTime }, airlineSalePrice: salePrice, airlineCostPrice: costPrice });
@@ -5861,10 +6405,12 @@ function AirTicketBookedModal({ isOpen, onClose, onConfirm, file, darkMode, port
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
-        <h3 className="text-lg font-bold mb-2">Flight Ticket Booked</h3>
-        <p className="text-sm text-slate-500 mb-6">Enter booking details for <b>{file?.applicantName}</b></p>
+        <h3 className="text-lg font-bold mb-2">{issued ? 'Flight Ticket Issued' : 'Flight Ticket Booked'}</h3>
+        <p className="text-sm text-slate-500 mb-6">
+          {issued ? 'Update ticket details for' : 'Enter booking details for'} <b>{file?.applicantName}</b>
+        </p>
         
         <div className="space-y-4">
           <div>
@@ -5939,123 +6485,9 @@ function AirTicketBookedModal({ isOpen, onClose, onConfirm, file, darkMode, port
 
         <div className="flex justify-end gap-3 pt-6">
           <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
-          <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">Save Booking</button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// Air Ticket - ISSUED Status Modal
-function AirTicketIssuedModal({ isOpen, onClose, onConfirm, file, darkMode, portals }) {
-  const [pnr, setPnr] = useState(file?.pnr || '');
-  const [portal, setPortal] = useState(file?.portal || '');
-  const [bookingDate, setBookingDate] = useState(file?.bookingValidity?.date || '');
-  const [bookingTime, setBookingTime] = useState(file?.bookingValidity?.time || '');
-  const [salePrice, setSalePrice] = useState(file?.airlineSalePrice || '');
-  const [costPrice, setCostPrice] = useState(file?.airlineCostPrice || '');
-
-  if (!isOpen) return null;
-
-  const cardClass = darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900';
-  const inputClass = darkMode 
-    ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
-    : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
-
-  const handleSubmit = () => {
-    if (!pnr || !portal || !bookingDate || !bookingTime) {
-      alert("Please fill in all fields");
-      return;
-    }
-    onConfirm({ pnr, portal, bookingValidity: { date: bookingDate, time: bookingTime }, airlineSalePrice: salePrice, airlineCostPrice: costPrice });
-    setPnr('');
-    setPortal('');
-    setBookingDate('');
-    setBookingTime('');
-    setSalePrice('');
-    setCostPrice('');
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
-      <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
-        <h3 className="text-lg font-bold mb-2">Flight Ticket Issued</h3>
-        <p className="text-sm text-slate-500 mb-6">Update ticket details for <b>{file?.applicantName}</b></p>
-        
-        <div className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium mb-2 opacity-80">PNR / Booking Reference</label>
-            <input
-              type="text"
-              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
-              placeholder="e.g., ABC123"
-              value={pnr}
-              onChange={(e) => setPnr(e.target.value)}
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium mb-2 opacity-80">Portal</label>
-            <select
-              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
-              value={portal}
-              onChange={(e) => setPortal(e.target.value)}
-            >
-              <option value="">Select Portal</option>
-              {portals.map(p => <option key={p} value={p}>{p}</option>)}
-            </select>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium mb-2 opacity-80">Booking Validity Date</label>
-            <input
-              type="date"
-              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
-              value={bookingDate}
-              onChange={(e) => setBookingDate(e.target.value)}
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium mb-2 opacity-80">Booking Validity Time</label>
-            <input
-              type="time"
-              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
-              value={bookingTime}
-              onChange={(e) => setBookingTime(e.target.value)}
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium mb-2 opacity-80">Sale Price - ৳</label>
-            <input
-              type="number"
-              min="0"
-              step="0.01"
-              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
-              placeholder="0.00"
-              value={salePrice}
-              onChange={(e) => setSalePrice(e.target.value)}
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium mb-2 opacity-80">Cost Price - ৳</label>
-            <input
-              type="number"
-              min="0"
-              step="0.01"
-              className={`w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm ${inputClass}`}
-              placeholder="0.00"
-              value={costPrice}
-              onChange={(e) => setCostPrice(e.target.value)}
-            />
-          </div>
-        </div>
-
-        <div className="flex justify-end gap-3 pt-6">
-          <button onClick={onClose} className="px-4 py-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-sm font-medium">Cancel</button>
-          <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">Update Ticket</button>
+          <button onClick={handleSubmit} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">
+            {issued ? 'Update Ticket' : 'Save Booking'}
+          </button>
         </div>
       </div>
     </div>
@@ -6089,7 +6521,7 @@ function PackageFlightIssuedModal({ isOpen, onClose, onConfirm, file, darkMode, 
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
         <h3 className="text-lg font-bold mb-2">Flight Issued</h3>
         <p className="text-sm text-slate-500 mb-6">Enter flight details for <b>{file?.applicantName}</b></p>
@@ -6183,7 +6615,7 @@ function PackageHotelsBookedModal({ isOpen, onClose, onConfirm, file, darkMode }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
         <h3 className="text-lg font-bold mb-2">Hotels Booked</h3>
         <p className="text-sm text-slate-500 mb-6">Enter hotel details for <b>{file?.applicantName}</b></p>
@@ -6300,7 +6732,7 @@ function PackagePickupDropoffModal({ isOpen, onClose, onConfirm, file, darkMode 
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 max-h-[90vh] overflow-y-auto ${cardClass}`}>
         <h3 className="text-lg font-bold mb-2">Pick & Drop Details</h3>
         <p className="text-sm text-slate-500 mb-6">Enter pickup & dropoff information for <b>{file?.applicantName}</b></p>
@@ -6405,7 +6837,7 @@ function NoteModal({ isOpen, onClose, onConfirm, file, darkMode }) {
       : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+        <div className="modal-backdrop">
             <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
                 <h3 className="text-lg font-bold mb-4">Add Note to {file.applicantName}</h3>
                 <textarea
@@ -6447,7 +6879,7 @@ function LeaveRequestModal({ isOpen, onClose, onSubmit, leaveFormData, setLeaveF
     };
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+        <div className="modal-backdrop">
             <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
                 <h3 className="text-lg font-bold mb-4">Request Leave</h3>
                 
@@ -6870,7 +7302,7 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
     );
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+        <div className="modal-backdrop">
             <div className={`rounded-2xl shadow-xl w-full max-w-lg p-6 animate-in fade-in zoom-in duration-200 max-h-[90vh] overflow-y-auto ${cardClass}`}>
                 <h3 className="text-lg font-bold mb-6">Edit File Details ({file?.fileType || 'File'})</h3>
                 <div className="space-y-4">
@@ -6933,7 +7365,7 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
 function DeleteConfirmationModal({ isOpen, onClose, onConfirm, darkMode }) {
   if (!isOpen) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+    <div className="modal-backdrop">
         <div className={`rounded-xl shadow-xl p-6 max-w-sm w-full animate-in fade-in zoom-in duration-200 ${darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900'}`}>
             <div className="flex flex-col items-center text-center gap-4">
                 <div className="w-12 h-12 bg-red-100 rounded-full flex items-center justify-center text-red-600">
@@ -6962,7 +7394,7 @@ function ResultModal({ isOpen, onClose, message, darkMode }) {
   }, [isOpen, onClose]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm pointer-events-none">
+    <div className="modal-backdrop pointer-events-none">
         <div className={`rounded-2xl shadow-2xl p-8 max-w-sm w-full animate-in fade-in zoom-in duration-300 text-center ${darkMode ? 'bg-slate-900 text-slate-100' : 'bg-white text-slate-900'}`}>
             <p className="text-4xl mb-4 animate-bounce">{message}</p>
             <p className={`text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>This message will close automatically</p>
@@ -6981,7 +7413,7 @@ function NotificationModal({ isOpen, onClose, tasks, onOpenTask, darkMode }) {
   const itemHover = darkMode ? 'hover:bg-slate-800 hover:border-slate-700' : 'hover:bg-slate-50 hover:border-slate-200';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div className={`rounded-2xl shadow-xl w-full max-w-lg p-0 overflow-hidden animate-in fade-in zoom-in duration-200 ${cardClass}`}>
         <div className={`px-6 py-4 border-b flex justify-between items-center ${headerClass}`}>
            <div>
@@ -8109,7 +8541,7 @@ function CustomReportModal({ isOpen, onClose, files, userFilter, timeRange, dark
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+    <div className="modal-backdrop">
       <div className={`rounded-2xl shadow-xl w-full max-w-md p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
         <h3 className="text-lg font-bold mb-2">Download Report (PDF)</h3>
         <p className={`text-sm mb-4 ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>
@@ -8169,9 +8601,22 @@ function PublicTrackingPage({ fileId, files, loading, darkMode, toggleDarkMode }
       PAYMENT_PENDING: 'Payment is pending for this application.',
       SUBMITTED: 'Your documents have been submitted to the embassy. Please wait for their response.',
       FOLLOW_UP: 'We are following up on your application.',
-      DONE: 'Your application has been completed!'
+      DONE: 'Your application has been completed!',
+      SALE_INITIATED: 'Your ticket or travel package request has been received and is being arranged.',
+      BOOKED: 'Your flight has been booked. We will update you when the ticket is issued.',
+      ISSUED: 'Your flight ticket has been issued.',
+      FLIGHT_ISSUED: 'Your package flight ticket has been issued.',
+      HOTELS_BOOKED: 'Your package hotel accommodation has been booked.',
+      PICKUP_DROPOFF_BOOKED: 'Your package pickup and drop-off service has been booked.',
+      PACKAGE_READY: 'Your travel package arrangements are complete.',
+      PICKUP_DROP_INITIATED: 'Your pickup and drop-off service request has been received.',
+      PICKUP_DROP_BOOKED: 'Your pickup and drop-off service has been booked.',
+      PICKUP_DROP_CONFIRMED: 'Your pickup and drop-off service has been confirmed.',
+      PICKUP_DROP_COMPLETED: 'Your pickup and drop-off service has been completed.'
     };
-    return messages[status] || 'Status unknown';
+    return messages[status] || (STATUS[status]
+      ? `Your current status is ${STATUS[status].label}. Please contact us if you need assistance.`
+      : 'Please contact us for an update on your application.');
   };
 
   const containerClass = darkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-900';
@@ -8579,8 +9024,8 @@ function InvoiceModal({ isOpen, onClose, file, paymentMethods = [], cashPaymentN
   const selectedMethod = paymentMethods.find(method => method.id === paymentMethodId);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className={`${bgClass} rounded-xl border max-w-md w-full mx-4 overflow-hidden`}>
+    <div className="modal-backdrop">
+      <div className={`${bgClass} rounded-xl border max-w-md w-full overflow-hidden`}>
         {/* Header */}
         <div className={`px-6 py-4 border-b ${darkMode ? 'border-slate-800 bg-slate-800/50' : 'border-slate-100 bg-slate-50'}`}>
           <h3 className={`text-lg font-bold ${textMain} flex items-center gap-2`}>
@@ -8823,7 +9268,7 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
     }
     const duplicate = findDuplicatePaymentReference(files, paymentTransactionRef);
     if (duplicate) {
-      alert(`This transaction reference was already used on file ${duplicate.file.fileId || duplicate.file.id}. Enter a unique reference.`);
+      alert(getDuplicatePaymentReferenceMessage(duplicate));
       return;
     }
     const enteredAmount = Number(paymentAmount);
@@ -9330,7 +9775,7 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
 
           {/* Invoice Detail Modal */}
           {invoiceModalOpen && selectedInvoice && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50">
+            <div className="modal-backdrop">
               <div className={`rounded-2xl shadow-xl w-full max-w-lg p-6 animate-in fade-in zoom-in duration-200 ${cardClass}`}>
                 <div className="flex justify-between items-center mb-4">
                   <h3 className={`text-lg font-bold ${textMain}`}>Invoice: {selectedInvoice.invoiceNo || selectedInvoice.invoice?.invoiceNo || selectedInvoice.fileId}</h3>

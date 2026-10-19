@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
-import { calculateProcessingAgentWorkloads, chooseProcessingAgent } from '../src/utils/assignmentRouting.js';
+import {
+  calculateProcessingAgentWorkloads,
+  chooseProcessingAgent,
+  isProcessingAgentEligibleForDestinations
+} from '../src/utils/assignmentRouting.js';
 
 const agents = [
   { role: 'Processing Agent', fullName: 'Alice' },
@@ -73,9 +77,57 @@ assert.equal(
   chooseProcessingAgent([], agents, {}, '', 'China', { China: ['Unavailable Agent'] }),
   null
 );
+const firstDestinationAgent = chooseProcessingAgent(
+  [{ fileType: 'Visa', status: 'PROCESSING', destination: 'Canada', assignedTo: 'Alice' }],
+  agents,
+  {},
+  '',
+  'China',
+  { China: ['Alice', 'Ben'], Singapore: ['Alice'] }
+);
+assert.equal(firstDestinationAgent, 'Ben');
+assert.equal(
+  isProcessingAgentEligibleForDestinations(firstDestinationAgent, ['China', 'Singapore'], {
+    China: ['Alice', 'Ben'],
+    Singapore: ['Alice']
+  }),
+  false
+);
+assert.equal(
+  isProcessingAgentEligibleForDestinations('Alice', ['China', 'Singapore'], {
+    China: ['Alice', 'Ben'],
+    Singapore: ['Alice']
+  }),
+  true
+);
 assert.equal(
   chooseProcessingAgent([], agents, {}, '', 'China', { China: [] }),
   'Alice'
+);
+assert.equal(
+  chooseProcessingAgent(
+    [],
+    agents,
+    {},
+    '',
+    ['China', 'Singapore'],
+    { China: ['Ben'], Singapore: ['Alice'] }
+  ),
+  null
+);
+assert.deepEqual(
+  calculateProcessingAgentWorkloads(
+    [
+      { fileType: 'Visa', status: 'RECEIVED_SALES', destination: 'China', assignedTo: 'Sales Rep', familyGroupId: 'family-1', familyGroupAssignedTo: 'Alice' },
+      { fileType: 'Visa', status: 'RECEIVED_SALES', destination: 'Singapore', assignedTo: 'Sales Rep' }
+    ],
+    agents,
+    { China: 'High', Singapore: 'Moderate' }
+  ),
+  [
+    { name: 'Alice', points: 3, activeFiles: 1 },
+    { name: 'Ben', points: 0, activeFiles: 0 }
+  ]
 );
 
 assert.deepEqual(

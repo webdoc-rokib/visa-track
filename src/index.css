@@ -1,3 +1,48 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer components {
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: max(0.75rem, env(safe-area-inset-top)) 0.75rem max(0.75rem, env(safe-area-inset-bottom));
+    background: rgb(2 6 23 / 0.68);
+    backdrop-filter: blur(4px);
+  }
+}
+
+.modal-backdrop > div {
+  width: 100%;
+  max-height: calc(100vh - 1.5rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  box-shadow: 0 24px 64px rgb(2 6 23 / 0.32);
+}
+
+@supports (height: 100dvh) {
+  .modal-backdrop > div {
+    max-height: calc(100dvh - 1.5rem);
+  }
+}
+
+@media (min-width: 640px) {
+  .modal-backdrop {
+    align-items: center;
+    padding: 1.5rem;
+  }
+}
+
+@supports (height: 100dvh) {
+  @media (min-width: 640px) {
+    .modal-backdrop > div {
+      max-height: calc(100dvh - 3rem);
+    }
+  }
+}

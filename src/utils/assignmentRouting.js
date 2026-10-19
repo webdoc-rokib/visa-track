@@ -4,6 +4,8 @@ export const WORK_RANK_WEIGHTS = {
   Low: 1
 };
 
+export const MAX_VISA_FAMILY_SIZE = 100;
+
 export const calculateProcessingAgentWorkloads = (files, agents, workRanks = {}) => {
   const eligibleAgents = (agents || [])
     .filter(agent => agent?.role === 'Processing Agent')
@@ -13,9 +15,12 @@ export const calculateProcessingAgentWorkloads = (files, agents, workRanks = {})
 
   const workloads = new Map(uniqueAgents.map(name => [name, { points: 0, activeFiles: 0 }]));
   for (const file of files || []) {
-    const assignee = file?.assignedTo;
+    const reservedFamilyAssignee = file?.familyGroupId ? file.familyGroupAssignedTo : '';
+    const assignee = reservedFamilyAssignee || file?.assignedTo;
     const workload = workloads.get(assignee);
-    if (!workload || (file.fileType && file.fileType !== 'Visa') || file.status === 'DONE' || file.status === 'RECEIVED_SALES') continue;
+    if (!workload || (file.fileType && file.fileType !== 'Visa') || file.status === 'DONE' || (
+      file.status === 'RECEIVED_SALES' && !reservedFamilyAssignee
+    )) continue;
 
     const rank = workRanks[file.destination] || 'Moderate';
     workload.points += WORK_RANK_WEIGHTS[rank] || WORK_RANK_WEIGHTS.Moderate;
@@ -28,18 +33,27 @@ export const calculateProcessingAgentWorkloads = (files, agents, workRanks = {})
   }));
 };
 
+export const isProcessingAgentEligibleForDestinations = (agentName, destinations, destinationAgents = {}) => {
+  const destinationList = Array.isArray(destinations) ? destinations : [destinations];
+  return destinationList.every(destination => {
+    const configuredAgents = destinationAgents[destination];
+    return !Array.isArray(configuredAgents) || configuredAgents.length === 0 || configuredAgents.includes(agentName);
+  });
+};
+
 export const chooseProcessingAgent = (
   files,
   agents,
   workRanks = {},
   lastAssignedAgent = '',
-  destination = '',
+  destinations = '',
   destinationAgents = {}
 ) => {
-  const configuredAgents = destinationAgents[destination];
-  const eligibleAgents = Array.isArray(configuredAgents) && configuredAgents.length > 0
-    ? (agents || []).filter(agent => configuredAgents.includes(agent.fullName || agent.name || agent.username))
-    : agents || [];
+  const destinationList = Array.isArray(destinations) ? destinations : [destinations];
+  const eligibleAgents = (agents || []).filter(agent => {
+    const name = agent.fullName || agent.name || agent.username;
+    return isProcessingAgentEligibleForDestinations(name, destinationList, destinationAgents);
+  });
   const workloads = calculateProcessingAgentWorkloads(files, eligibleAgents, workRanks);
   if (workloads.length === 0) return null;
 
