@@ -7,6 +7,7 @@ import { storeSecureUserSession, getSecureUserSession, clearUserSession, logoutU
 import { sanitizeInput, validateFileData, validateNote } from './utils/sanitization';
 import { getDhakaDate, getStartOf, getEndOf, getDhakaTodayString, toDhakaTime, getDateKey } from './utils/timezoneUtils';
 import { findPossibleFileDuplicates, findPossibleFileDuplicatePairs } from './utils/duplicateDetection';
+import { calculateProcessingAgentWorkloads, chooseProcessingAgent, WORK_RANK_WEIGHTS } from './utils/assignmentRouting';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
@@ -734,6 +735,8 @@ export default function VisaTrackApp() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [files, setFiles] = useState([]);
   const [destinations, setDestinations] = useState([]); 
+  const [visaWorkRanks, setVisaWorkRanks] = useState({});
+  const [visaDestinationAgents, setVisaDestinationAgents] = useState({});
   const [paymentMethods, setPaymentMethods] = useState([]);
   const [cashPaymentNotificationEmails, setCashPaymentNotificationEmails] = useState([]);
   const [allPortals, setAllPortals] = useState(AIR_TICKET_PORTALS);
@@ -831,6 +834,20 @@ export default function VisaTrackApp() {
       if (docSnap.exists()) setDestinations(docSnap.data().items || []);
       else setDestinations(['Canada', 'UK', 'USA', 'Schengen Area', 'Australia', 'Dubai']);
     });
+    const visaWorkRanksRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'visa_work_ranks');
+    const unsubVisaWorkRanks = onSnapshot(visaWorkRanksRef, snapshot => {
+      setVisaWorkRanks(snapshot.exists() ? snapshot.data().ranks || {} : {});
+    }, error => {
+      console.error('Error loading Visa work ranks:', error);
+      alert('Unable to load Visa workload rankings. New handoffs will use Moderate until this is resolved.');
+    });
+    const visaDestinationAgentsRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'visa_destination_agents');
+    const unsubVisaDestinationAgents = onSnapshot(visaDestinationAgentsRef, snapshot => {
+      setVisaDestinationAgents(snapshot.exists() ? snapshot.data().agentsByDestination || {} : {});
+    }, error => {
+      console.error('Error loading Visa destination agent assignments:', error);
+      alert('Unable to load Visa destination routing rules. Please refresh before handing off a Visa file.');
+    });
     const paymentMethodsRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'payment_methods');
     const unsubPaymentMethods = onSnapshot(paymentMethodsRef, (docSnap) => {
       setPaymentMethods(docSnap.exists() ? docSnap.data().items || [] : []);
@@ -881,7 +898,7 @@ export default function VisaTrackApp() {
       setApprovedLeaves(leaves);
     });
 
-    return () => { unsubFiles(); unsubDest(); unsubPaymentMethods(); unsubCashPaymentNotifications(); unsubPortals(); unsubUsers(); unsubLeaveRequests(); unsubApprovedLeaves(); };
+    return () => { unsubFiles(); unsubDest(); unsubVisaWorkRanks(); unsubVisaDestinationAgents(); unsubPaymentMethods(); unsubCashPaymentNotifications(); unsubPortals(); unsubUsers(); unsubLeaveRequests(); unsubApprovedLeaves(); };
   }, [user, cleanupComplete]);
 
   useEffect(() => {
@@ -1429,6 +1446,9 @@ export default function VisaTrackApp() {
 
   const handleStatusUpdate = async (note, result = null, newAssignee = null, reminderDate = null, cost = null, acknowledgeProcessing = false, specializedData = null, trackingData = null) => {
     if (!appUser || !selectedFile) return;
+    const isVisaFile = (selectedFile.fileType || FILE_TYPES.VISA) === FILE_TYPES.VISA;
+    let routedProcessingAgent = '';
+    let routedWorkRank = '';
     
     let updateData = {
       updatedAt: serverTimestamp(),
@@ -1436,7 +1456,86 @@ export default function VisaTrackApp() {
     };
 
     // Handle "Send to Processing" action
-    if (selectedAction === 'SEND_TO_PROCESSING' && newAssignee) {
+    if (selectedAction === 'SEND_TO_PROCESSING' && isVisaFile) {
+      const assignmentStateRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'visa_assignment_dispatch');
+      const destinationAgentsRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'visa_destination_agents');
+      try {
+        await runTransaction(db, async transaction => {
+          const [fileSnapshot, assignmentStateSnapshot, destinationAgentsSnapshot] = await Promise.all([
+            transaction.get(doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', selectedFile.id)),
+            transaction.get(assignmentStateRef),
+            transaction.get(destinationAgentsRef)
+          ]);
+          if (!fileSnapshot.exists()) throw new Error('This file no longer exists.');
+          const currentFile = { id: fileSnapshot.id, ...fileSnapshot.data() };
+          if (currentFile.status !== 'RECEIVED_SALES') {
+            throw new Error('This Visa file has already been handed off or updated. Refresh the file and try again.');
+          }
+          const assignmentState = assignmentStateSnapshot.exists() ? assignmentStateSnapshot.data() : {};
+          const agentsByDestination = destinationAgentsSnapshot.exists()
+            ? destinationAgentsSnapshot.data().agentsByDestination || {}
+            : {};
+          const processingAgent = chooseProcessingAgent(
+            files,
+            allUsers,
+            visaWorkRanks,
+            assignmentState.lastAssignedAgent || '',
+            currentFile.destination,
+            agentsByDestination
+          );
+          if (!processingAgent) {
+            const destinationRule = agentsByDestination[currentFile.destination];
+            if (Array.isArray(destinationRule) && destinationRule.length > 0) {
+              throw new Error(`No active Processing Agent is configured for ${currentFile.destination}. Ask an admin to update destination routing.`);
+            }
+            throw new Error('No Processing Agents are available. Ask an admin to add or reactivate a Processing Agent.');
+          }
+
+          routedProcessingAgent = processingAgent;
+          routedWorkRank = visaWorkRanks[currentFile.destination] || 'Moderate';
+          const docsProvided = Boolean(trackingData?.documentsProvidedToProcessing);
+          const nextStatus = docsProvided ? 'HANDOVER_PROCESSING' : 'DOCS_PENDING';
+          const historyItem = {
+            action: `File Sent to Processing - System assigned to: ${processingAgent} (${routedWorkRank} workload) - Required documents provided: ${docsProvided ? 'Yes' : 'No'}${note ? ` - Note: ${note}` : ''}`,
+            status: nextStatus,
+            performedBy: appUser.name,
+            timestamp: Date.now()
+          };
+
+          transaction.update(fileSnapshot.ref, {
+            status: nextStatus,
+            assignedTo: processingAgent,
+            assignmentMode: 'automatic',
+            assignmentWorkRank: routedWorkRank,
+            acknowledgedByProcessingAgent: false,
+            salesRepDocumentsProvided: docsProvided,
+            documentsProvidedToProcessing: docsProvided,
+            updatedAt: serverTimestamp(),
+            statusChangedAt: serverTimestamp(),
+            history: [historyItem, ...(currentFile.history || [])]
+          });
+          transaction.set(assignmentStateRef, {
+            lastAssignedAgent: processingAgent,
+            lastAssignedAt: serverTimestamp(),
+            totalAssignments: (Number(assignmentState.totalAssignments) || 0) + 1
+          });
+        });
+      } catch (error) {
+        console.error('Failed to route Visa file to Processing:', error);
+        alert(`Could not hand off this file: ${error.message || 'Please try again.'}`);
+        return;
+      }
+      setResultMessage(`File assigned to ${routedProcessingAgent} (${routedWorkRank} workload).`);
+      setResultModalOpen(true);
+      setModalOpen(false);
+      return;
+    }
+
+    if (selectedAction === 'SEND_TO_PROCESSING') {
+      if (!newAssignee) {
+        alert('Select a Processing Agent to continue.');
+        return;
+      }
       const docsProvided = Boolean(trackingData?.documentsProvidedToProcessing);
       const newHistoryItem = {
         action: `File Sent to Processing - Assigned to: ${newAssignee} - Required documents provided to processing agent: ${docsProvided ? 'Yes' : 'No'}${note ? ` - Note: ${note}` : ''}`,
@@ -1467,7 +1566,7 @@ export default function VisaTrackApp() {
       updateData = {
         ...updateData,
         status: nextStatus,
-        assignedTo: appUser.name,
+        assignedTo: isVisaFile ? selectedFile.assignedTo : appUser.name,
         acknowledgedByProcessingAgent: docsReceived,
         documentsReceivedFromSalesRep: docsReceived,
         processingDocumentsReceived: docsReceived,
@@ -1565,7 +1664,7 @@ export default function VisaTrackApp() {
     else if (selectedAction) {
       let actionText = `Updated status to ${STATUS[selectedAction].label}`;
       if (result) actionText = `Result Received: ${RESULTS[result].label}`;
-      if (newAssignee) actionText += ` (Assigned to: ${newAssignee})`;
+      if (!isVisaFile && newAssignee) actionText += ` (Assigned to: ${newAssignee})`;
       if (reminderDate) actionText += ` (Reminder set: ${reminderDate})`;
       if (cost) actionText += ` (Cost Updated: ${cost})`;
 
@@ -1578,8 +1677,8 @@ export default function VisaTrackApp() {
       };
 
       let nextAssignee = selectedFile.assignedTo;
-      if (newAssignee) nextAssignee = newAssignee;
-      else if (selectedAction === 'HANDOVER_PROCESSING' && (!selectedFile.assignedTo || selectedFile.assignedTo === appUser.name)) nextAssignee = 'Processing Team'; 
+      if (!isVisaFile && newAssignee) nextAssignee = newAssignee;
+      else if (!isVisaFile && selectedAction === 'HANDOVER_PROCESSING' && (!selectedFile.assignedTo || selectedFile.assignedTo === appUser.name)) nextAssignee = 'Processing Team';
 
       updateData = {
         ...updateData,
@@ -1666,6 +1765,19 @@ export default function VisaTrackApp() {
       const oldAssignee = selectedFile.assignedTo || '';
       const newAssignee = data.assignedTo || '';
       const historyEntries = [];
+
+      if ((selectedFile.fileType || FILE_TYPES.VISA) === FILE_TYPES.VISA && oldAssignee !== newAssignee) {
+        const newAssigneeIsProcessingAgent = allUsers.some(user =>
+          user.role === ROLES.PROCESSING &&
+          (user.fullName || user.name || user.username) === newAssignee
+        );
+        if (!newAssigneeIsProcessingAgent) {
+          alert('Visa files can only be assigned to a Processing Agent. Choose an agent from the list.');
+          return;
+        }
+        updateData.assignmentMode = 'admin';
+        updateData.assignmentWorkRank = visaWorkRanks[selectedFile.destination] || 'Moderate';
+      }
 
       if (newCreatedBy && oldCreatedBy !== newCreatedBy) {
         historyEntries.push({
@@ -1961,6 +2073,9 @@ export default function VisaTrackApp() {
           <ProcessingTracker
             files={files}
             darkMode={darkMode}
+            isAdmin={appUser.role === ROLES.ADMIN}
+            processingAgents={allUsers.filter(user => user.role === ROLES.PROCESSING)}
+            visaWorkRanks={visaWorkRanks}
             onOpenFile={(file) => {
               if (file?.fileId) {
                 setSearchTerm(file.fileId);
@@ -1986,7 +2101,7 @@ export default function VisaTrackApp() {
           <LeavesPanel currentUser={appUser} leaveRequests={leaveRequests} approvedLeaves={approvedLeaves} allUsers={allUsers} darkMode={darkMode} onApprove={approveLeaveRequest} onReject={rejectLeaveRequest} onGrantDirect={grantDirectLeave} onDeleteLeave={deleteApprovedLeave} onRequestLeave={() => setShowLeaveRequestModal(true)} />
         )}
         {activeTab === 'admin' && appUser.role === ROLES.ADMIN && (
-          <AdminPanel currentUser={appUser} destinations={destinations} paymentMethods={paymentMethods} darkMode={darkMode} />
+          <AdminPanel currentUser={appUser} destinations={destinations} visaWorkRanks={visaWorkRanks} visaDestinationAgents={visaDestinationAgents} processingAgents={allUsers.filter(agent => agent.role === ROLES.PROCESSING)} paymentMethods={paymentMethods} darkMode={darkMode} />
         )}
         {activeTab === 'duplicates' && appUser.role === ROLES.ADMIN && (
           <DuplicateReviewPanel
@@ -3697,7 +3812,7 @@ function PipelineView({ files, darkMode, onOpenFile }) {
   );
 }
 
-function ProcessingTracker({ files, darkMode, onOpenFile }) {
+function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAgents, visaWorkRanks }) {
   const [assigneeFilter, setAssigneeFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
@@ -3748,6 +3863,12 @@ function ProcessingTracker({ files, darkMode, onOpenFile }) {
     if (normalizedSearch && !`${file.fileId || ''} ${file.applicantName || ''}`.toLowerCase().includes(normalizedSearch)) return false;
     return true;
   });
+  const agentWorkloads = useMemo(
+    () => isAdmin
+      ? calculateProcessingAgentWorkloads(files, processingAgents, visaWorkRanks)
+      : [],
+    [files, isAdmin, processingAgents, visaWorkRanks]
+  );
   const stalledCount = trackedFiles.filter(file => file.daysInStatus !== null && file.daysInStatus >= 7).length;
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
   const textSub = darkMode ? 'text-slate-400' : 'text-slate-500';
@@ -3773,6 +3894,41 @@ function ProcessingTracker({ files, darkMode, onOpenFile }) {
           <p className={`text-2xl font-bold ${stalledCount ? 'text-amber-500' : textMain}`}>{stalledCount}</p>
         </div>
       </div>
+
+      {isAdmin && (
+        <section className={`overflow-hidden rounded-xl border ${cardClass}`}>
+          <div className={`border-b px-4 py-3 ${darkMode ? 'border-slate-800 bg-slate-800/60' : 'border-slate-100 bg-slate-50'}`}>
+            <h3 className={`font-semibold ${textMain}`}>Processing Agent Workload</h3>
+            <p className={`mt-1 text-xs ${textSub}`}>
+              Active Visa files and weighted workload points used for automatic assignment (High 3, Moderate 2, Low 1).
+            </p>
+          </div>
+          {agentWorkloads.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[480px] text-left text-sm">
+                <thead className={darkMode ? 'bg-slate-950/50 text-slate-400' : 'bg-white text-slate-500'}>
+                  <tr>
+                    <th className="px-4 py-2">Processing Agent</th>
+                    <th className="px-4 py-2 text-right">Active Visa Files</th>
+                    <th className="px-4 py-2 text-right">Workload Points</th>
+                  </tr>
+                </thead>
+                <tbody className={textMain}>
+                  {agentWorkloads.map(agent => (
+                    <tr key={agent.name} className={`border-t ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+                      <td className="px-4 py-3 font-medium">{agent.name}</td>
+                      <td className="px-4 py-3 text-right">{agent.activeFiles}</td>
+                      <td className="px-4 py-3 text-right font-semibold">{agent.points}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className={`px-4 py-5 text-sm ${textSub}`}>No Processing Agents are currently listed.</p>
+          )}
+        </section>
+      )}
 
       <div className="flex flex-wrap gap-3">
         <select
@@ -4026,7 +4182,15 @@ function LeavesPanel({ currentUser, leaveRequests, approvedLeaves, allUsers, dar
   );
 }
 
-function AdminPanel({ currentUser, destinations, paymentMethods = [], darkMode }) {
+function AdminPanel({
+  currentUser,
+  destinations,
+  visaWorkRanks = {},
+  visaDestinationAgents = {},
+  processingAgents = [],
+  paymentMethods = [],
+  darkMode
+}) {
   const [users, setUsers] = useState([]);
   const [userForm, setUserForm] = useState({ fullName: '', username: '', password: '', role: ROLES.SALES });
   const [newDest, setNewDest] = useState('');
@@ -4043,12 +4207,65 @@ function AdminPanel({ currentUser, destinations, paymentMethods = [], darkMode }
   const [selectedIncentiveUser, setSelectedIncentiveUser] = useState('');
   const [incentiveTarget, setIncentiveTarget] = useState('');
   const [incentiveTiers, setIncentiveTiers] = useState([{ amount: '', percent: '' }]);
+  const [visaWorkRankDraft, setVisaWorkRankDraft] = useState(visaWorkRanks);
+  const [savingVisaWorkRanks, setSavingVisaWorkRanks] = useState(false);
+  const [visaDestinationAgentsDraft, setVisaDestinationAgentsDraft] = useState(visaDestinationAgents);
+  const [savingVisaDestinationAgents, setSavingVisaDestinationAgents] = useState(false);
   
   const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
   const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
   const inputClass = darkMode 
     ? 'bg-slate-950 border-slate-700 text-slate-100 focus:ring-blue-500' 
     : 'bg-white border-slate-300 text-slate-900 focus:ring-blue-500';
+
+  useEffect(() => {
+    setVisaWorkRankDraft(visaWorkRanks);
+  }, [visaWorkRanks]);
+
+  useEffect(() => {
+    setVisaDestinationAgentsDraft(visaDestinationAgents);
+  }, [visaDestinationAgents]);
+
+  const saveVisaWorkRanks = async () => {
+    setSavingVisaWorkRanks(true);
+    try {
+      const ranks = Object.fromEntries(
+        destinations.map(destination => [destination, visaWorkRankDraft[destination] || 'Moderate'])
+      );
+      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'visa_work_ranks'), {
+        ranks,
+        updatedBy: currentUser.name,
+        updatedAt: serverTimestamp()
+      });
+    } catch (error) {
+      console.error('Failed to save Visa workload ranks:', error);
+      alert(`Failed to save Visa workload ranks: ${error.message || 'Check Firestore access and try again.'}`);
+    } finally {
+      setSavingVisaWorkRanks(false);
+    }
+  };
+
+  const saveVisaDestinationAgents = async () => {
+    setSavingVisaDestinationAgents(true);
+    try {
+      const agentsByDestination = Object.fromEntries(
+        destinations.map(destination => [
+          destination,
+          [...new Set(visaDestinationAgentsDraft[destination] || [])]
+        ])
+      );
+      await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'visa_destination_agents'), {
+        agentsByDestination,
+        updatedBy: currentUser.name,
+        updatedAt: serverTimestamp()
+      });
+    } catch (error) {
+      console.error('Failed to save Visa destination routing:', error);
+      alert(`Failed to save Visa destination routing: ${error.message || 'Check Firestore access and try again.'}`);
+    } finally {
+      setSavingVisaDestinationAgents(false);
+    }
+  };
 
   useEffect(() => {
     const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'agency_settings', 'cash_payment_notifications');
@@ -4444,6 +4661,91 @@ function AdminPanel({ currentUser, destinations, paymentMethods = [], darkMode }
                {destinations.length === 0 && <span className="text-slate-400 text-sm p-2">No destinations set.</span>}
              </div>
           </div>
+          <div className={`border-t p-4 ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+            <div className="mb-3">
+              <h4 className={`font-semibold text-sm ${darkMode ? 'text-slate-200' : 'text-slate-700'}`}>Visa Workload Ranks</h4>
+              <p className="mt-1 text-xs text-slate-500">These ranks weight each active Visa file for automatic Processing Agent assignment: High 3, Moderate 2, Low 1.</p>
+            </div>
+            {destinations.map(destination => (
+              <div key={destination} className={`mb-3 rounded-lg border p-3 ${darkMode ? 'border-slate-800' : 'border-slate-200'}`}>
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className={`font-medium ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>{destination}</span>
+                  <select
+                    value={visaWorkRankDraft[destination] || 'Moderate'}
+                    onChange={event => setVisaWorkRankDraft(current => ({ ...current, [destination]: event.target.value }))}
+                    className={`rounded-lg border px-3 py-2 text-sm ${inputClass}`}
+                    aria-label={`${destination} workload rank`}
+                  >
+                    {Object.keys(WORK_RANK_WEIGHTS).map(rank => <option key={rank} value={rank}>{rank} ({WORK_RANK_WEIGHTS[rank]})</option>)}
+                  </select>
+                </div>
+                <div className="mt-3">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <p className="text-xs text-slate-500">Eligible Processing Agents</p>
+                    {(visaDestinationAgentsDraft[destination] || []).length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setVisaDestinationAgentsDraft(current => ({ ...current, [destination]: [] }))}
+                        className="text-xs text-blue-500 hover:underline"
+                      >
+                        Allow all agents
+                      </button>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-1 gap-1 sm:grid-cols-2">
+                    {[...new Set([
+                      ...processingAgents.map(agent => agent.fullName || agent.name || agent.username).filter(Boolean),
+                      ...(visaDestinationAgentsDraft[destination] || [])
+                    ])].sort((a, b) => a.localeCompare(b)).map(agentName => {
+                      const selectedAgents = visaDestinationAgentsDraft[destination] || [];
+                      const restricted = selectedAgents.length > 0;
+                      const checked = restricted && selectedAgents.includes(agentName);
+                      const isActiveAgent = processingAgents.some(agent =>
+                        (agent.fullName || agent.name || agent.username) === agentName
+                      );
+                      return (
+                        <label key={agentName} className={`flex items-center gap-2 text-xs ${isActiveAgent ? textMain : 'text-amber-500'}`}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => {
+                              const nextAgents = checked
+                                ? selectedAgents.filter(name => name !== agentName)
+                                : [...selectedAgents, agentName];
+                              setVisaDestinationAgentsDraft(current => ({ ...current, [destination]: nextAgents }));
+                            }}
+                          />
+                          <span>{agentName}{isActiveAgent ? '' : ' (inactive/unavailable)'}</span>
+                        </label>
+                      );
+                    })}
+                    {processingAgents.length === 0 && (visaDestinationAgentsDraft[destination] || []).length === 0 && (
+                      <span className="text-xs text-amber-500">No Processing Agents available yet.</span>
+                    )}
+                  </div>
+                  <p className="mt-2 text-[11px] text-slate-500">
+                    No agents selected means any Processing Agent can handle this destination.
+                  </p>
+                </div>
+              </div>
+            ))}
+            <button
+              type="button"
+              onClick={saveVisaWorkRanks}
+              disabled={savingVisaWorkRanks}
+              className="mt-2 w-full rounded-lg bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+            >
+              {savingVisaWorkRanks ? 'Saving…' : 'Save Visa Work Ranks'}
+            </button>
+            <button
+              type="button"
+              onClick={saveVisaDestinationAgents}
+              disabled={savingVisaDestinationAgents}
+              className="mt-2 w-full rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+            >
+              {savingVisaDestinationAgents ? 'Saving…' : 'Save Destination Agent Rules'}
+            </button>
+          </div>
         </div>
 
         {/* Payment Account Settings */}
@@ -4807,7 +5109,6 @@ function FileCard({ file, user, onOpenUpdateModal, onOpenNoteModal, onOpenEditMo
       actions.push({ key: 'ACKNOWLEDGE_PROCESSING', label: 'In Processing', isSpecial: true });
     }
     
-    if (file.status === 'RECEIVED_SALES') actions.push({ key: 'HANDOVER_PROCESSING', label: STATUS['HANDOVER_PROCESSING'].label });
     if (file.status === 'HANDOVER_PROCESSING') actions.push({ key: 'HANDOVER_PROCESSING', label: STATUS['HANDOVER_PROCESSING'].label });
     
     // Logic Update: keep In Processing available for Docs Pending
@@ -5214,7 +5515,7 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
          return;
        }
        
-       if (isSendToProcessing && !assignee) {
+       if (isSendToProcessing && !isVisaFile && !assignee) {
          alert("Please select a processing agent to assign this file");
          return;
        }
@@ -5230,7 +5531,7 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
        }
        
        if (isSendToProcessing) {
-         onConfirm(note, null, assignee, null, null, false, null, { documentsProvidedToProcessing: salesDocsProvided });
+         onConfirm(note, null, isVisaFile ? null : assignee, null, null, false, null, { documentsProvidedToProcessing: salesDocsProvided });
        } else if (isAcknowledgeProcessing) {
          onConfirm(note, null, null, null, null, true, null, { documentsReceivedFromSales: processingDocsReceived });
        } else {
@@ -5288,8 +5589,35 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
                 </div>
              )}
 
-             {/* Send to Processing - Show only Processing Agents dropdown */}
-             {isSendToProcessing && (
+             {/* Visa handoffs are routed automatically; other service types retain manual assignment. */}
+             {isSendToProcessing && isVisaFile && (
+                <>
+                  <p className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-200">
+                    The system will assign this Visa file to the Processing Agent with the lowest weighted active workload.
+                  </p>
+                  <div>
+                    <label className="mb-2 block text-sm font-medium opacity-80">Have all required documents been provided to the processing agent?</label>
+                    <div className="grid grid-cols-2 gap-3">
+                      <button
+                        type="button"
+                        onClick={() => setSalesDocsProvided(true)}
+                        className={`rounded-lg border p-2 ${salesDocsProvided === true ? 'border-emerald-500 bg-emerald-500/10 text-emerald-600' : ''}`}
+                      >
+                        Yes
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSalesDocsProvided(false)}
+                        className={`rounded-lg border p-2 ${salesDocsProvided === false ? 'border-red-500 bg-red-500/10 text-red-600' : ''}`}
+                      >
+                        No / Docs pending
+                      </button>
+                    </div>
+                  </div>
+                </>
+             )}
+
+             {isSendToProcessing && !isVisaFile && (
                 <div className="space-y-4">
                    <div>
                      <label className="block text-sm font-medium mb-2 opacity-80">Assign to Processing Agent</label>
@@ -5310,15 +5638,6 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
                      </div>
                    </div>
 
-                   {isVisaFile && (
-                     <div>
-                       <label className="block text-sm font-medium mb-2 opacity-80">Have all required documents been provided to the processing agent?</label>
-                       <div className="grid grid-cols-2 gap-3">
-                         <button type="button" onClick={() => setSalesDocsProvided(true)} className={`p-2 rounded-lg border ${salesDocsProvided === true ? 'border-emerald-500 bg-emerald-500/10 text-emerald-600' : ''}`}>Yes</button>
-                         <button type="button" onClick={() => setSalesDocsProvided(false)} className={`p-2 rounded-lg border ${salesDocsProvided === false ? 'border-red-500 bg-red-500/10 text-red-600' : ''}`}>No / Docs pending</button>
-                       </div>
-                     </div>
-                   )}
                 </div>
              )}
 
@@ -5350,7 +5669,7 @@ function StatusUpdateModal({ isOpen, onClose, onConfirm, file, newStatus, allUse
              )}
 
              {/* Assign To Dropdown - Only for non-special actions */}
-             {!isSendToProcessing && !isAcknowledgeProcessing && (
+             {!isSendToProcessing && !isAcknowledgeProcessing && !isVisaFile && (
                 <div>
                    <label className="block text-sm font-medium mb-2 opacity-80">Assign To (Optional)</label>
                    <div className="relative">
@@ -6286,7 +6605,12 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
     const assignees = (allUsers || [])
       .map(user => ({ name: user.fullName || user.name || user.username, role: user.role, id: user.id }))
       .filter(user => user.name && user.name !== 'Processing Team');
+    const isVisaFile = (file?.fileType || FILE_TYPES.VISA) === FILE_TYPES.VISA;
+    const selectableAssignees = isVisaFile
+      ? assignees.filter(user => user.role === ROLES.PROCESSING)
+      : assignees;
     const currentAssigneeIsListed = assignees.some(user => user.name === editData.assignedTo);
+    const currentVisaAssigneeIsListed = selectableAssignees.some(user => user.name === editData.assignedTo);
 
     const renderVISAFields = () => (
         <>
@@ -6573,15 +6897,21 @@ function EditFileModal({ isOpen, onClose, onConfirm, file, destinations, darkMod
                                     value={editData.assignedTo}
                                     onChange={e => setEditData({...editData, assignedTo: e.target.value})}
                                 >
-                                    <option value="">Unassigned</option>
-                                    <option value="Processing Team">Processing Team</option>
-                                    {!currentAssigneeIsListed && editData.assignedTo && (
+                                    {!isVisaFile && <option value="">Unassigned</option>}
+                                    {!isVisaFile && <option value="Processing Team">Processing Team</option>}
+                                    {isVisaFile && !currentVisaAssigneeIsListed && editData.assignedTo && (
                                         <option value={editData.assignedTo}>{editData.assignedTo} (current assignment)</option>
                                     )}
-                                    {assignees.map(user => (
+                                    {!isVisaFile && !currentAssigneeIsListed && editData.assignedTo && (
+                                        <option value={editData.assignedTo}>{editData.assignedTo} (current assignment)</option>
+                                    )}
+                                    {selectableAssignees.map(user => (
                                         <option key={user.id} value={user.name}>{user.name} ({user.role})</option>
                                     ))}
                                 </select>
+                                {isVisaFile && (
+                                  <p className="mt-1 text-xs opacity-70">Visa files are assigned to Processing Agents. Only admins can change this assignment.</p>
+                                )}
                             </div>
                         </>
                     )}

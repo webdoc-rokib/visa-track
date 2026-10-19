@@ -26,7 +26,7 @@ Create and manage four file types:
 - **Package** — countries, nights, travelers, included services, flight/hotel progress, and package pricing.
 - **Pick & Drop** — pickup and drop-off locations, passenger count, booking details, and sale/cost values.
 
-Files include a human-readable file ID, creator, current assignee, current status, and activity history. Staff can add notes and follow status changes. Administrators can edit file details and reassign a file to a staff member, Processing Team, or Unassigned; reassignment is recorded in the file history.
+Files include a human-readable file ID, creator, current assignee, current status, and activity history. Staff can add notes and follow status changes. For Visa files, the system assigns a Processing Agent when Sales hands the file off; the assignment is locked during subsequent status updates. Administrators can reassign Visa files to another Processing Agent from **Edit File**, with the change recorded in file history. Other file types retain their existing assignment workflow.
 
 When registering a file, VisaTrack warns about likely existing matches: Visa files by passport and destination; Package files by main passenger passport and the same set of countries; Air Ticket and Pick & Drop files by applicant, normalized phone, and matching route/locations. Staff can review the existing records and either cancel or proceed if this is a legitimate new service. Proceeding is recorded in the new file's history. These are review warnings, not a guarantee that every duplicate will be detected.
 
@@ -61,7 +61,9 @@ Email delivery requires the Firebase **Trigger Email from Firestore** extension 
 
 ### Reporting and administration
 
-Statistical reports provide operational and financial summaries. Role-aware dashboards include sales and processing activity. Admin tools cover staff accounts, destinations, ticket portals, payment methods, cash notification recipients, incentive settings, and holiday periods. Leave workflows support staff requests and administrator review.
+Statistical reports provide operational and financial summaries. Role-aware dashboards include sales and processing activity. Admin tools cover staff accounts, destinations, Visa workload ranks and destination-specific Processing Agent eligibility, ticket portals, payment methods, cash notification recipients, incentive settings, and holiday periods. Leave workflows support staff requests and administrator review.
+
+Visa handoffs are automatically routed to the eligible Processing Agent with the lowest active weighted workload. Under **Admin → Destinations**, administrators can configure both destination workload ranks and which Processing Agents are eligible for each destination. If no agents are selected for a destination, all Processing Agents are eligible. If a restricted destination has no active eligible agent, handoff is blocked with an explanation rather than assigning the file to someone unqualified. **High** counts as 3 workload points, **Moderate** as 2, and **Low** as 1; unranked destinations default to Moderate. Ties are resolved using active Visa file count and rotating agent order. Administrators can change an assignment only through **Edit File**; staff status updates preserve the existing assignee.
 
 ### Public file tracking
 
