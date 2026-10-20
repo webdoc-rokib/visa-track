@@ -301,7 +301,9 @@ const COMPANY_INFO = {
 };
 
 // Invoice helpers (fresh implementation)
-const getInvoiceAmount = (file) => {
+const AUTO_APPROVE_DISCOUNT_PERCENT = 5;
+
+const getBaseInvoiceAmount = (file) => {
   if (!file) return 0;
   if (file.fileType === FILE_TYPES.AIR_TICKET) {
     return Number(file.airlineSalePrice || file.serviceCharge || 0) || 0;
@@ -313,6 +315,20 @@ const getInvoiceAmount = (file) => {
     return Number(file.salePrice || file.serviceCharge || 0) || 0;
   }
   return Number(file.serviceCharge || 0) || 0;
+};
+
+const getInvoiceAdjustments = (file) => (Array.isArray(file?.priceAdjustments) ? file.priceAdjustments : []);
+
+const getInvoiceAmount = (file) => {
+  if (!file) return 0;
+  const adjustmentTotal = getInvoiceAdjustments(file).reduce((sum, item) => sum + (Number(item.delta) || 0), 0);
+  return Math.max(Math.round((getBaseInvoiceAmount(file) + adjustmentTotal) * 100) / 100, 0);
+};
+
+const isAutoApprovableDiscount = (file, newAmount) => {
+  const current = getInvoiceAmount(file);
+  const base = getBaseInvoiceAmount(file);
+  return newAmount > 0 && newAmount < current && newAmount >= base * (1 - AUTO_APPROVE_DISCOUNT_PERCENT / 100);
 };
 
 const getInvoiceDescription = (file) => {
@@ -483,6 +499,7 @@ const buildCashPaymentMail = (file, payment, recipients) => {
 
 const buildInvoicePrintHtml = (file, invoice) => {
   const trackingId = file?.fileId || '';
+  const adjustments = getInvoiceAdjustments(file);
   const trackingUrl = `${window.location.origin}/?track=${encodeURIComponent(trackingId)}`;
   const amount = Number(invoice?.amount || getInvoiceAmount(file) || 0);
   const paidAmount = Number(invoice?.paidAmount || 0);
@@ -642,8 +659,12 @@ const buildInvoicePrintHtml = (file, invoice) => {
             <tbody>
               <tr>
                 <td>${invoiceDescription}</td>
-                <td style="text-align:right;">৳${amount.toFixed(2)}</td>
+                <td style="text-align:right;">৳${(amount - adjustments.reduce((sum, item) => sum + (Number(item.delta) || 0), 0)).toFixed(2)}</td>
               </tr>
+              ${adjustments.map(item => `<tr>
+                <td style="color:#475569;">${Number(item.delta) < 0 ? 'Discount' : 'Price adjustment'}</td>
+                <td style="text-align:right;">${Number(item.delta) < 0 ? '-' : '+'}৳${Math.abs(Number(item.delta) || 0).toFixed(2)}</td>
+              </tr>`).join('')}
             </tbody>
             <tfoot>
               <tr class="total-row">
@@ -931,33 +952,130 @@ export default function VisaTrackApp() {
     }, (error) => console.error('Error loading requests:', error));
   }, [user, appUser?.id, appUser?.role]);
 
-  const submitFileRequest = async ({ type, fileId, details }) => {
+  const applyPriceAdjustment = async ({ fileDocId, newAmount, expectedAmount, reason, ticketNo, requestedBy, auto }) => {
+    const fileDoc = doc(db, 'artifacts', appId, 'public', 'data', 'visa_files', fileDocId);
+    return runTransaction(db, async transaction => {
+      const snapshot = await transaction.get(fileDoc);
+      if (!snapshot.exists()) throw new Error('File no longer exists.');
+      const current = { id: snapshot.id, ...snapshot.data() };
+      const oldAmount = getInvoiceAmount(current);
+      if (Math.abs(oldAmount - expectedAmount) > 0.005) {
+        throw new Error('The invoice amount changed after this request was made. Please submit a new request.');
+      }
+      if (!(newAmount > 0) || Math.abs(newAmount - oldAmount) < 0.005) throw new Error('Invalid new amount.');
+      const summary = getInvoiceSummary(current);
+      const hasInvoice = Boolean(current.invoiceNo || current.invoice?.invoiceNo);
+      if (hasInvoice && newAmount < summary.paidAmount) {
+        throw new Error('The new amount is lower than what has already been paid on this invoice.');
+      }
+      const adjustment = {
+        id: `adj-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        ticketNo: ticketNo || '',
+        type: newAmount < oldAmount ? 'DISCOUNT' : 'INCREASE',
+        oldAmount,
+        newAmount,
+        delta: Math.round((newAmount - oldAmount) * 100) / 100,
+        reason: reason || '',
+        requestedBy: requestedBy || '',
+        approvedBy: auto ? 'Auto-approved (within limit)' : appUser.name,
+        auto: Boolean(auto),
+        at: Date.now()
+      };
+      const update = { priceAdjustments: [...getInvoiceAdjustments(current), adjustment] };
+      if (hasInvoice) {
+        const paid = summary.paidAmount;
+        update.invoiceAmount = newAmount;
+        update.invoicePaidAmount = paid;
+        update.invoicePaymentStatus = paid >= newAmount ? 'Paid' : paid > 0 ? 'Partially Paid' : 'Unpaid';
+        update.invoiceUpdatedAt = serverTimestamp();
+      }
+      transaction.update(fileDoc, update);
+      return adjustment;
+    });
+  };
+
+  const submitFileRequest = async ({ type, fileId, details, requestedAmount }) => {
     const matchedFile = files.find(f => f.fileId === fileId);
     const cleanDetails = sanitizeInput(details || '', { maxLength: 1000 }).trim();
     if (!matchedFile || !cleanDetails) return false;
+    const ticketNo = `REQ-${Date.now().toString(36).toUpperCase().slice(-6)}`;
+    const isPrice = type === 'PRICE';
+    const newAmount = Math.round((Number(requestedAmount) || 0) * 100) / 100;
+    const currentAmount = getInvoiceAmount(matchedFile);
+    if (isPrice && (appUser.role !== ROLES.SALES || !(newAmount > 0) || Math.abs(newAmount - currentAmount) < 0.005)) {
+      alert('Enter a valid new amount that differs from the current invoice amount.');
+      return false;
+    }
     try {
+      const autoApprove = isPrice && isAutoApprovableDiscount(matchedFile, newAmount);
+      if (autoApprove) {
+        await applyPriceAdjustment({
+          fileDocId: matchedFile.id,
+          newAmount,
+          expectedAmount: currentAmount,
+          reason: cleanDetails,
+          ticketNo,
+          requestedBy: appUser.name,
+          auto: true
+        });
+      }
       await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'file_requests'), {
-        ticketNo: `REQ-${Date.now().toString(36).toUpperCase().slice(-6)}`,
+        ticketNo,
         type,
         fileId: matchedFile.fileId,
         fileDocId: matchedFile.id,
         applicantName: matchedFile.applicantName || '',
         details: cleanDetails,
-        status: 'OPEN',
+        ...(isPrice ? { currentAmount, requestedAmount: newAmount, priceApplied: autoApprove, autoApproved: autoApprove } : {}),
+        status: autoApprove ? 'COMPLETED' : 'OPEN',
         createdBy: appUser.name,
         createdById: appUser.id,
         createdAt: serverTimestamp(),
         adminNote: '',
-        resolvedBy: null,
-        resolvedAt: null,
+        resolvedBy: autoApprove ? 'System (auto-approved)' : null,
+        resolvedAt: autoApprove ? serverTimestamp() : null,
         requesterSeen: true
       });
+      if (autoApprove) alert(`Discount applied automatically (within ${AUTO_APPROVE_DISCOUNT_PERCENT}%) and logged on the invoice.`);
       return true;
     } catch (e) {
       console.error('Error submitting request:', e);
-      alert('Failed to submit request');
+      alert(`Failed to submit request: ${e.message || ''}`);
       return false;
     }
+  };
+
+  const approvePriceRequest = async (request, message) => {
+    if (appUser?.role !== ROLES.ADMIN || request.type !== 'PRICE' || request.priceApplied) return false;
+    try {
+      await applyPriceAdjustment({
+        fileDocId: request.fileDocId,
+        newAmount: request.requestedAmount,
+        expectedAmount: request.currentAmount,
+        reason: request.details,
+        ticketNo: request.ticketNo,
+        requestedBy: request.createdBy,
+        auto: false
+      });
+    } catch (e) {
+      alert(e.message || 'Failed to apply the price change.');
+      return false;
+    }
+    const text = sanitizeInput(message || '', { maxLength: 500 }).trim();
+    try {
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'file_requests', request.id), {
+        status: 'COMPLETED',
+        priceApplied: true,
+        requesterSeen: false,
+        resolvedBy: appUser.name,
+        resolvedAt: serverTimestamp(),
+        ...(text ? { messages: arrayUnion({ by: appUser.name, role: appUser.role, text, at: Date.now() }) } : {})
+      });
+    } catch (e) {
+      console.error('Price applied but ticket update failed:', e);
+      alert('The price change was applied, but the ticket could not be updated. Please mark it completed manually.');
+    }
+    return true;
   };
 
   const updateFileRequestStatus = async (requestId, status, message) => {
@@ -2462,7 +2580,7 @@ export default function VisaTrackApp() {
           <LeavesPanel currentUser={appUser} leaveRequests={leaveRequests} approvedLeaves={approvedLeaves} allUsers={allUsers} darkMode={darkMode} onApprove={approveLeaveRequest} onReject={rejectLeaveRequest} onGrantDirect={grantDirectLeave} onDeleteLeave={deleteApprovedLeave} onRequestLeave={() => setShowLeaveRequestModal(true)} />
         )}
         {activeTab === 'requests' && (
-          <RequestsPanel currentUser={appUser} requests={fileRequests} files={files} darkMode={darkMode} onSubmit={submitFileRequest} onUpdateStatus={updateFileRequestStatus} onOpenFile={fileId => { setSearchTerm(fileId || ''); setActiveTab('dashboard'); }} />
+          <RequestsPanel currentUser={appUser} requests={fileRequests} files={files} darkMode={darkMode} onSubmit={submitFileRequest} onUpdateStatus={updateFileRequestStatus} onApprovePrice={approvePriceRequest} onOpenFile={fileId => { setSearchTerm(fileId || ''); setActiveTab('dashboard'); }} />
         )}
         {activeTab === 'admin' && appUser.role === ROLES.ADMIN && (
           <AdminPanel currentUser={appUser} destinations={destinations} visaWorkRanks={visaWorkRanks} visaDestinationAgents={visaDestinationAgents} processingAgents={allUsers.filter(agent => agent.role === ROLES.PROCESSING)} paymentMethods={paymentMethods} darkMode={darkMode} />
@@ -4589,6 +4707,7 @@ function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAge
 const REQUEST_TYPES = {
   EDIT: 'Edit file details',
   DELETE: 'Delete file',
+  PRICE: 'Invoice price change',
   OTHER: 'Other'
 };
 
@@ -4600,9 +4719,11 @@ const REQUEST_STATUSES = {
   REJECTED: { label: 'Rejected', badge: 'bg-red-500/15 text-red-500' }
 };
 
-function RequestsPanel({ currentUser, requests, files, darkMode, onSubmit, onUpdateStatus, onOpenFile }) {
+function RequestsPanel({ currentUser, requests, files, darkMode, onSubmit, onUpdateStatus, onApprovePrice, onOpenFile }) {
   const isAdmin = currentUser.role === ROLES.ADMIN;
-  const [form, setForm] = useState({ type: 'EDIT', fileId: '', details: '' });
+  const canRequestPrice = currentUser.role === ROLES.SALES;
+  const requestTypeEntries = Object.entries(REQUEST_TYPES).filter(([key]) => key !== 'PRICE' || canRequestPrice);
+  const [form, setForm] = useState({ type: 'EDIT', fileId: '', details: '', requestedAmount: '' });
   const [formError, setFormError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [statusFilter, setStatusFilter] = useState('ALL');
@@ -4632,6 +4753,11 @@ function RequestsPanel({ currentUser, requests, files, darkMode, onSubmit, onUpd
     if (ok) setNotes(prev => ({ ...prev, [req.id]: '' }));
   };
 
+  const formFile = files.find(f => f.fileId === form.fileId.trim().toUpperCase());
+  const formCurrentAmount = formFile ? getInvoiceAmount(formFile) : 0;
+  const formNewAmount = Number(form.requestedAmount) || 0;
+  const formAutoApproved = form.type === 'PRICE' && formFile && isAutoApprovableDiscount(formFile, formNewAmount);
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     const fileId = form.fileId.trim().toUpperCase();
@@ -4639,15 +4765,19 @@ function RequestsPanel({ currentUser, requests, files, darkMode, onSubmit, onUpd
       setFormError('No file found with that VT ID.');
       return;
     }
+    if (form.type === 'PRICE' && (!(formNewAmount > 0) || Math.abs(formNewAmount - formCurrentAmount) < 0.005)) {
+      setFormError('Enter a new amount that differs from the current invoice amount.');
+      return;
+    }
     if (!form.details.trim()) {
-      setFormError('Please describe the change you need.');
+      setFormError(form.type === 'PRICE' ? 'A reason is required for price changes.' : 'Please describe the change you need.');
       return;
     }
     setFormError('');
     setSubmitting(true);
     const ok = await onSubmit({ ...form, fileId });
     setSubmitting(false);
-    if (ok) setForm({ type: 'EDIT', fileId: '', details: '' });
+    if (ok) setForm({ type: 'EDIT', fileId: '', details: '', requestedAmount: '' });
   };
 
   const filters = [['ACTIVE', 'Active'], ['OPEN', 'Open'], ['NEEDS_INFO', 'Needs Info'], ['IN_PROGRESS', 'In Progress'], ['COMPLETED', 'Completed'], ['REJECTED', 'Rejected'], ['ALL', 'All']];
@@ -4665,7 +4795,7 @@ function RequestsPanel({ currentUser, requests, files, darkMode, onSubmit, onUpd
           <div>
             <label className={`mb-1 block text-xs font-medium ${textSub}`}>Request type</label>
             <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} className={`w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`}>
-              {Object.entries(REQUEST_TYPES).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+              {requestTypeEntries.map(([key, label]) => <option key={key} value={key}>{label}</option>)}
             </select>
           </div>
           <div>
@@ -4675,8 +4805,23 @@ function RequestsPanel({ currentUser, requests, files, darkMode, onSubmit, onUpd
               {files.slice(0, 500).map(f => <option key={f.id} value={f.fileId}>{f.applicantName}</option>)}
             </datalist>
           </div>
+          {form.type === 'PRICE' && (
+            <div>
+              <label className={`mb-1 block text-xs font-medium ${textSub}`}>New invoice amount (৳)</label>
+              <input type="number" min="0" step="0.01" value={form.requestedAmount} onChange={e => setForm({ ...form, requestedAmount: e.target.value })} className={`w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`} />
+              {formFile && (
+                <p className={`mt-1 text-xs ${textSub}`}>
+                  Current: {formatCurrency(formCurrentAmount)}
+                  {formNewAmount > 0 && formCurrentAmount > 0 && ` · ${formNewAmount < formCurrentAmount ? 'Discount' : 'Increase'} ${formatCurrency(Math.abs(formNewAmount - formCurrentAmount))} (${(Math.abs(formNewAmount - formCurrentAmount) / formCurrentAmount * 100).toFixed(1)}%)`}
+                </p>
+              )}
+              {formAutoApproved ? (
+                <p className="mt-1 text-xs text-emerald-500">Within the {AUTO_APPROVE_DISCOUNT_PERCENT}% limit: applies immediately and is logged.</p>
+              ) : formNewAmount > 0 && formFile && <p className="mt-1 text-xs text-amber-500">Needs admin approval before it applies.</p>}
+            </div>
+          )}
           <div>
-            <label className={`mb-1 block text-xs font-medium ${textSub}`}>Details</label>
+            <label className={`mb-1 block text-xs font-medium ${textSub}`}>{form.type === 'PRICE' ? 'Reason (required)' : 'Details'}</label>
             <textarea rows={4} maxLength={1000} value={form.details} onChange={e => setForm({ ...form, details: e.target.value })} placeholder="What should be changed, and why?" className={`w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`} />
           </div>
           {formError && <p className="text-xs text-red-500">{formError}</p>}
@@ -4698,6 +4843,9 @@ function RequestsPanel({ currentUser, requests, files, darkMode, onSubmit, onUpd
           ) : visibleRequests.map(req => {
             const status = REQUEST_STATUSES[req.status] || REQUEST_STATUSES.OPEN;
             const closed = req.status === 'COMPLETED' || req.status === 'REJECTED';
+            const liveFile = req.type === 'PRICE' ? files.find(f => f.id === req.fileDocId) : null;
+            const liveAmount = liveFile ? getInvoiceAmount(liveFile) : 0;
+            const priceOutdated = Boolean(liveFile) && Math.abs(liveAmount - req.currentAmount) > 0.005;
             return (
               <div key={req.id} className={`rounded-xl border p-4 ${cardClass}`}>
                 <div className="flex flex-wrap items-start justify-between gap-2">
@@ -4713,6 +4861,17 @@ function RequestsPanel({ currentUser, requests, files, darkMode, onSubmit, onUpd
                   <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${status.badge}`}>{status.label}</span>
                 </div>
                 <p className={`mt-3 whitespace-pre-wrap rounded-lg border p-3 text-sm ${innerClass} ${textMain}`}>{req.details}</p>
+                {req.type === 'PRICE' && (
+                  <div className={`mt-2 rounded-lg border p-3 text-sm ${innerClass}`}>
+                    <p className={textMain}>
+                      <span className="font-semibold">{formatCurrency(req.currentAmount)}</span> → <span className="font-semibold">{formatCurrency(req.requestedAmount)}</span>
+                      {' '}({req.requestedAmount < req.currentAmount ? 'discount' : 'increase'} {formatCurrency(Math.abs(req.requestedAmount - req.currentAmount))}
+                      {req.currentAmount > 0 ? `, ${(Math.abs(req.requestedAmount - req.currentAmount) / req.currentAmount * 100).toFixed(1)}%` : ''})
+                      {req.autoApproved && <span className="ml-2 rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-500">Auto-approved</span>}
+                    </p>
+                    {isAdmin && !closed && priceOutdated && <p className="mt-1 text-xs text-red-500">The invoice is now {formatCurrency(liveAmount)}. This request is outdated; reject it and ask for a new one.</p>}
+                  </div>
+                )}
                 {(req.messages || []).length > 0 && (
                   <div className="mt-3 space-y-2">
                     {req.messages.map((m, i) => (
@@ -4736,9 +4895,10 @@ function RequestsPanel({ currentUser, requests, files, darkMode, onSubmit, onUpd
                     <div className="flex flex-wrap gap-2">
                       {req.status === 'OPEN' && <button type="button" onClick={() => sendNote(req, 'IN_PROGRESS')} className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700">Start</button>}
                       {!closed && <button type="button" disabled={!(notes[req.id] || '').trim()} onClick={() => sendNote(req, 'NEEDS_INFO')} className="rounded-lg bg-purple-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-purple-700 disabled:opacity-50">Ask for Info</button>}
-                      {!closed && <button type="button" onClick={() => sendNote(req, 'COMPLETED')} className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700">Mark Completed</button>}
+                      {!closed && req.type !== 'PRICE' && <button type="button" onClick={() => sendNote(req, 'COMPLETED')} className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700">Mark Completed</button>}
+                      {!closed && req.type === 'PRICE' && <button type="button" disabled={priceOutdated} title={priceOutdated ? 'Invoice amount changed since the request' : ''} onClick={async () => { const ok = await onApprovePrice(req, notes[req.id] ?? ''); if (ok) setNotes(prev => ({ ...prev, [req.id]: '' })); }} className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50">Approve & Apply</button>}
                       {!closed && <button type="button" disabled={!(notes[req.id] || '').trim()} title="A reason is required" onClick={() => sendNote(req, 'REJECTED')} className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50">Reject (reason required)</button>}
-                      {closed && <button type="button" onClick={() => sendNote(req, 'OPEN')} className={`rounded-lg px-3 py-1.5 text-xs font-medium ${darkMode ? 'bg-slate-800 text-slate-200 hover:bg-slate-700' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>Reopen</button>}
+                      {closed && !req.priceApplied && <button type="button" onClick={() => sendNote(req, 'OPEN')} className={`rounded-lg px-3 py-1.5 text-xs font-medium ${darkMode ? 'bg-slate-800 text-slate-200 hover:bg-slate-700' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>Reopen</button>}
                     </div>
                   </div>
                 )}
@@ -10055,6 +10215,23 @@ function AccountingPanel({ currentUser, files, miscCosts, paymentMethods = [], c
                       <div className={`font-medium ${textMain}`}>{selectedInvoice.invoiceCreatedBy || selectedInvoice.invoice?.invoiceCreatedBy || '-'}</div>
                     </div>
                   </div>
+
+                  {getInvoiceAdjustments(selectedInvoice).length > 0 && (
+                    <div className={`p-4 rounded border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+                      <div className={`text-sm font-medium mb-2 ${textMain}`}>Price Adjustments</div>
+                      <div className="space-y-2 max-h-40 overflow-y-auto">
+                        {getInvoiceAdjustments(selectedInvoice).map((item, index) => (
+                          <div key={item.id || index} className={`text-xs ${textSub}`}>
+                            <div className="flex justify-between gap-2">
+                              <span>{new Date(item.at).toLocaleString()} · {item.ticketNo || 'No ticket'} · {item.type === 'DISCOUNT' ? 'Discount' : 'Increase'}</span>
+                              <span className={`font-semibold ${item.delta < 0 ? 'text-red-500' : 'text-emerald-500'}`}>{formatCurrency(item.oldAmount)} → {formatCurrency(item.newAmount)}</span>
+                            </div>
+                            <div>By {item.requestedBy || '-'} · Approved: {item.approvedBy || '-'}{item.reason ? ` · ${item.reason}` : ''}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   <div className={`p-4 rounded border ${darkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
                     <div className={`text-sm font-medium mb-2 ${textMain}`}>Payment History</div>
