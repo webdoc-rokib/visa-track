@@ -18,6 +18,7 @@ assert.equal(
   chooseProcessingAgent(
     [
       { fileType: 'Visa', status: 'SUBMITTED', destination: 'Canada', assignedTo: 'Alice' },
+      { fileType: 'Visa', status: 'HANDOVER_PROCESSING', destination: 'Canada', assignedTo: 'Ben' },
       { fileType: 'Visa', status: 'RECEIVED_SALES', destination: 'Canada', assignedTo: 'Ben' },
       { fileType: 'Visa', status: 'DONE', destination: 'Canada', assignedTo: 'Ben' },
       { fileType: 'Air Ticket', status: 'SUBMITTED', destination: 'Canada', assignedTo: 'Ben' }
@@ -25,7 +26,7 @@ assert.equal(
     agents,
     { Canada: 'High' }
   ),
-  'Ben'
+  'Alice'
 );
 
 const rankedWorkload = [

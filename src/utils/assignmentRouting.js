@@ -18,7 +18,7 @@ export const calculateProcessingAgentWorkloads = (files, agents, workRanks = {})
     const reservedFamilyAssignee = file?.familyGroupId ? file.familyGroupAssignedTo : '';
     const assignee = reservedFamilyAssignee || file?.assignedTo;
     const workload = workloads.get(assignee);
-    if (!workload || (file.fileType && file.fileType !== 'Visa') || file.status === 'DONE' || (
+    if (!workload || (file.fileType && file.fileType !== 'Visa') || file.status === 'DONE' || file.status === 'SUBMITTED' || (
       file.status === 'RECEIVED_SALES' && !reservedFamilyAssignee
     )) continue;
 

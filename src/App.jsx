@@ -753,6 +753,7 @@ export default function VisaTrackApp() {
   const [duplicateReviews, setDuplicateReviews] = useState([]);
   const [leaveRequests, setLeaveRequests] = useState([]);
   const [approvedLeaves, setApprovedLeaves] = useState([]);
+  const [fileRequests, setFileRequests] = useState([]);
   const [cleanupComplete, setCleanupComplete] = useState(false);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
@@ -919,6 +920,69 @@ export default function VisaTrackApp() {
   }, [user, cleanupComplete]);
 
   useEffect(() => {
+    if (!user || !appUser?.id) {
+      setFileRequests([]);
+      return;
+    }
+    const requestsRef = collection(db, 'artifacts', appId, 'public', 'data', 'file_requests');
+    const requestsQuery = appUser.role === ROLES.ADMIN ? requestsRef : query(requestsRef, where('createdById', '==', appUser.id));
+    return onSnapshot(requestsQuery, (snapshot) => {
+      setFileRequests(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+    }, (error) => console.error('Error loading requests:', error));
+  }, [user, appUser?.id, appUser?.role]);
+
+  const submitFileRequest = async ({ type, fileId, details }) => {
+    const matchedFile = files.find(f => f.fileId === fileId);
+    const cleanDetails = sanitizeInput(details || '', { maxLength: 1000 }).trim();
+    if (!matchedFile || !cleanDetails) return false;
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'file_requests'), {
+        ticketNo: `REQ-${Date.now().toString(36).toUpperCase().slice(-6)}`,
+        type,
+        fileId: matchedFile.fileId,
+        fileDocId: matchedFile.id,
+        applicantName: matchedFile.applicantName || '',
+        details: cleanDetails,
+        status: 'OPEN',
+        createdBy: appUser.name,
+        createdById: appUser.id,
+        createdAt: serverTimestamp(),
+        adminNote: '',
+        resolvedBy: null,
+        resolvedAt: null,
+        requesterSeen: true
+      });
+      return true;
+    } catch (e) {
+      console.error('Error submitting request:', e);
+      alert('Failed to submit request');
+      return false;
+    }
+  };
+
+  const updateFileRequestStatus = async (requestId, status, message) => {
+    try {
+      const closed = status === 'COMPLETED' || status === 'REJECTED';
+      const text = sanitizeInput(message || '', { maxLength: 500 }).trim();
+      const update = {
+        status,
+        requesterSeen: appUser.role !== ROLES.ADMIN,
+        resolvedBy: closed ? appUser.name : null,
+        resolvedAt: closed ? serverTimestamp() : null
+      };
+      if (text) {
+        update.messages = arrayUnion({ by: appUser.name, role: appUser.role, text, at: Date.now() });
+      }
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'file_requests', requestId), update);
+      return true;
+    } catch (e) {
+      console.error('Error updating request:', e);
+      alert('Failed to update request');
+      return false;
+    }
+  };
+
+  useEffect(() => {
     if (!user || appUser?.role !== ROLES.ADMIN) {
       setDuplicateReviews([]);
       return;
@@ -951,6 +1015,24 @@ export default function VisaTrackApp() {
     return files.filter(isVisibleTask);
   }, [files, appUser]);
   const possibleDuplicatePairs = useMemo(() => findPossibleFileDuplicatePairs(files), [files]);
+  const openRequestCount = appUser?.role === ROLES.ADMIN
+    ? fileRequests.filter(r => r.status === 'OPEN').length
+    : fileRequests.filter(r => r.status === 'NEEDS_INFO' || r.requesterSeen === false).length;
+
+  useEffect(() => {
+    if (activeTab !== 'requests' || !appUser || appUser.role === ROLES.ADMIN) return;
+    fileRequests
+      .filter(r => r.requesterSeen === false && r.status !== 'NEEDS_INFO')
+      .forEach(r => {
+        updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'file_requests', r.id), { requesterSeen: true })
+          .catch(e => console.error('Error marking request seen:', e));
+      });
+  }, [activeTab, fileRequests, appUser]);
+  const moreBadgeCount = appUser?.role === ROLES.ADMIN
+    ? leaveRequests.filter(request => request.status === 'PENDING').length +
+      possibleDuplicatePairs.filter(pair => !duplicateReviews.some(review => review.id === pair.reviewId)).length +
+      openRequestCount
+    : openRequestCount;
 
   useEffect(() => {
     if (appUser && !loading && !hasCheckedIn) {
@@ -2201,20 +2283,15 @@ export default function VisaTrackApp() {
                      onClick={() => setMoreMenuOpen(open => !open)}
                      aria-expanded={moreMenuOpen}
                      className={`relative flex items-center gap-1 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
-                       moreMenuOpen || ['reports', 'accounting', 'leaves', 'duplicates', 'admin'].includes(activeTab)
+                       moreMenuOpen || ['reports', 'accounting', 'leaves', 'requests', 'duplicates', 'admin'].includes(activeTab)
                          ? (darkMode ? 'bg-slate-800 text-blue-400' : 'bg-slate-100 text-blue-600')
                          : (darkMode ? 'text-slate-400 hover:bg-slate-800 hover:text-slate-200' : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900')
                      }`}
                    >
                      More <ChevronDown className={`h-4 w-4 transition-transform ${moreMenuOpen ? 'rotate-180' : ''}`} />
-                     {leaveRequests.filter(request => request.status === 'PENDING').length +
-                       possibleDuplicatePairs.filter(pair => !duplicateReviews.some(review => review.id === pair.reviewId)).length > 0 && (
+                     {moreBadgeCount > 0 && (
                        <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white">
-                         {leaveRequests.filter(request => request.status === 'PENDING').length +
-                           possibleDuplicatePairs.filter(pair => !duplicateReviews.some(review => review.id === pair.reviewId)).length > 99
-                           ? '99+'
-                           : leaveRequests.filter(request => request.status === 'PENDING').length +
-                             possibleDuplicatePairs.filter(pair => !duplicateReviews.some(review => review.id === pair.reviewId)).length}
+                         {moreBadgeCount > 99 ? '99+' : moreBadgeCount}
                        </span>
                      )}
                    </button>
@@ -2234,6 +2311,7 @@ export default function VisaTrackApp() {
                            <NavMenuItem id="accounting" icon={DollarSign} label="Accounting" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('accounting'); setMoreMenuOpen(false); }} />
                          )}
                          <NavMenuItem id="leaves" icon={Calendar} label="Leaves" badge={appUser.role === ROLES.ADMIN ? leaveRequests.filter(request => request.status === 'PENDING').length : 0} activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('leaves'); setMoreMenuOpen(false); }} />
+                         <NavMenuItem id="requests" icon={MessageSquare} label="Requests" badge={openRequestCount} activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('requests'); setMoreMenuOpen(false); }} />
                          {appUser.role === ROLES.ADMIN && (
                            <>
                              <NavMenuItem id="duplicates" icon={Copy} label="Duplicates" badge={possibleDuplicatePairs.filter(pair => !duplicateReviews.some(review => review.id === pair.reviewId)).length} activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('duplicates'); setMoreMenuOpen(false); }} />
@@ -2293,6 +2371,7 @@ export default function VisaTrackApp() {
                   </>
                 )}
                 <NavItem id="leaves" icon={Calendar} label="Leaves" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('leaves'); setMobileMenuOpen(false); }} />
+                <NavItem id="requests" icon={MessageSquare} label="Requests" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('requests'); setMobileMenuOpen(false); }} />
                 {(appUser.role === ROLES.ADMIN || appUser.role === ROLES.ACCOUNTS) && (
                   <NavItem id="accounting" icon={DollarSign} label="Accounting" activeTab={activeTab} darkMode={darkMode} onSelect={() => { setActiveTab('accounting'); setMobileMenuOpen(false); }} />
                 )}
@@ -2381,6 +2460,9 @@ export default function VisaTrackApp() {
         )}
         {activeTab === 'leaves' && (
           <LeavesPanel currentUser={appUser} leaveRequests={leaveRequests} approvedLeaves={approvedLeaves} allUsers={allUsers} darkMode={darkMode} onApprove={approveLeaveRequest} onReject={rejectLeaveRequest} onGrantDirect={grantDirectLeave} onDeleteLeave={deleteApprovedLeave} onRequestLeave={() => setShowLeaveRequestModal(true)} />
+        )}
+        {activeTab === 'requests' && (
+          <RequestsPanel currentUser={appUser} requests={fileRequests} files={files} darkMode={darkMode} onSubmit={submitFileRequest} onUpdateStatus={updateFileRequestStatus} onOpenFile={fileId => { setSearchTerm(fileId || ''); setActiveTab('dashboard'); }} />
         )}
         {activeTab === 'admin' && appUser.role === ROLES.ADMIN && (
           <AdminPanel currentUser={appUser} destinations={destinations} visaWorkRanks={visaWorkRanks} visaDestinationAgents={visaDestinationAgents} processingAgents={allUsers.filter(agent => agent.role === ROLES.PROCESSING)} paymentMethods={paymentMethods} darkMode={darkMode} />
@@ -4498,6 +4580,171 @@ function ProcessingTracker({ files, darkMode, onOpenFile, isAdmin, processingAge
         </div>
         <div className={`border-t px-4 py-3 text-xs ${textSub}`}>
           Showing {visibleFiles.length} of {trackedFiles.length} processing files
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const REQUEST_TYPES = {
+  EDIT: 'Edit file details',
+  DELETE: 'Delete file',
+  OTHER: 'Other'
+};
+
+const REQUEST_STATUSES = {
+  OPEN: { label: 'Open', badge: 'bg-amber-500/15 text-amber-500' },
+  IN_PROGRESS: { label: 'In Progress', badge: 'bg-blue-500/15 text-blue-500' },
+  NEEDS_INFO: { label: 'Needs Info', badge: 'bg-purple-500/15 text-purple-500' },
+  COMPLETED: { label: 'Completed', badge: 'bg-emerald-500/15 text-emerald-500' },
+  REJECTED: { label: 'Rejected', badge: 'bg-red-500/15 text-red-500' }
+};
+
+function RequestsPanel({ currentUser, requests, files, darkMode, onSubmit, onUpdateStatus, onOpenFile }) {
+  const isAdmin = currentUser.role === ROLES.ADMIN;
+  const [form, setForm] = useState({ type: 'EDIT', fileId: '', details: '' });
+  const [formError, setFormError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [statusFilter, setStatusFilter] = useState('ALL');
+  const [searchText, setSearchText] = useState('');
+  const [notes, setNotes] = useState({});
+
+  const cardClass = darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm';
+  const textMain = darkMode ? 'text-slate-100' : 'text-slate-900';
+  const textSub = darkMode ? 'text-slate-400' : 'text-slate-500';
+  const inputClass = darkMode ? 'bg-slate-800 border-slate-700 text-slate-100' : 'bg-white border-slate-300 text-slate-900';
+  const innerClass = darkMode ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200';
+
+  const getTime = (request) => getTimestampDate(request.createdAt)?.getTime() || Number.MAX_SAFE_INTEGER;
+  const sortedRequests = useMemo(() => [...requests].sort((a, b) => getTime(b) - getTime(a)), [requests]);
+  const visibleRequests = sortedRequests.filter(r => {
+    const query = searchText.trim().toLowerCase();
+    if (query) {
+      return [r.ticketNo, r.fileId, r.applicantName, r.createdBy].some(value => String(value || '').toLowerCase().includes(query));
+    }
+    if (statusFilter === 'ACTIVE') return r.status === 'OPEN' || r.status === 'IN_PROGRESS' || r.status === 'NEEDS_INFO';
+    if (statusFilter === 'ALL') return true;
+    return r.status === statusFilter;
+  });
+
+  const sendNote = async (req, status) => {
+    const ok = await onUpdateStatus(req.id, status, notes[req.id] ?? '');
+    if (ok) setNotes(prev => ({ ...prev, [req.id]: '' }));
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    const fileId = form.fileId.trim().toUpperCase();
+    if (!files.some(f => f.fileId === fileId)) {
+      setFormError('No file found with that VT ID.');
+      return;
+    }
+    if (!form.details.trim()) {
+      setFormError('Please describe the change you need.');
+      return;
+    }
+    setFormError('');
+    setSubmitting(true);
+    const ok = await onSubmit({ ...form, fileId });
+    setSubmitting(false);
+    if (ok) setForm({ type: 'EDIT', fileId: '', details: '' });
+  };
+
+  const filters = [['ACTIVE', 'Active'], ['OPEN', 'Open'], ['NEEDS_INFO', 'Needs Info'], ['IN_PROGRESS', 'In Progress'], ['COMPLETED', 'Completed'], ['REJECTED', 'Rejected'], ['ALL', 'All']];
+
+  return (
+    <div className="space-y-5">
+      <div>
+        <h2 className={`text-2xl font-bold ${textMain}`}>Requests</h2>
+        <p className={textSub}>{isAdmin ? 'Review file change and delete requests from the team' : 'Ask an admin to edit or delete a file and track the outcome'}</p>
+      </div>
+
+      <div className="grid gap-5 lg:grid-cols-3">
+        <form onSubmit={handleSubmit} className={`rounded-xl border p-4 space-y-3 lg:col-span-1 self-start ${cardClass}`}>
+          <h3 className={`text-base font-bold ${textMain}`}>New Request</h3>
+          <div>
+            <label className={`mb-1 block text-xs font-medium ${textSub}`}>Request type</label>
+            <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} className={`w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`}>
+              {Object.entries(REQUEST_TYPES).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className={`mb-1 block text-xs font-medium ${textSub}`}>File VT ID</label>
+            <input list="request-file-ids" value={form.fileId} onChange={e => setForm({ ...form, fileId: e.target.value })} placeholder="e.g. VT-12345" className={`w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`} />
+            <datalist id="request-file-ids">
+              {files.slice(0, 500).map(f => <option key={f.id} value={f.fileId}>{f.applicantName}</option>)}
+            </datalist>
+          </div>
+          <div>
+            <label className={`mb-1 block text-xs font-medium ${textSub}`}>Details</label>
+            <textarea rows={4} maxLength={1000} value={form.details} onChange={e => setForm({ ...form, details: e.target.value })} placeholder="What should be changed, and why?" className={`w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`} />
+          </div>
+          {formError && <p className="text-xs text-red-500">{formError}</p>}
+          <button type="submit" disabled={submitting} className="w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-60">
+            {submitting ? 'Submitting...' : 'Submit Request'}
+          </button>
+        </form>
+
+        <div className="space-y-3 lg:col-span-2">
+          <input type="search" value={searchText} onChange={e => setSearchText(e.target.value)} placeholder="Search by ticket ID (REQ-…), VT ID, applicant or requester" className={`w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`} />
+          <div className="flex flex-wrap gap-2">
+            {filters.map(([key, label]) => (
+              <button key={key} type="button" onClick={() => setStatusFilter(key)} className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${statusFilter === key ? 'bg-blue-600 text-white' : darkMode ? 'bg-slate-800 text-slate-300 hover:bg-slate-700' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}>{label}</button>
+            ))}
+          </div>
+
+          {visibleRequests.length === 0 ? (
+            <div className={`rounded-xl border p-6 text-center text-sm ${cardClass} ${textSub}`}>No requests to show</div>
+          ) : visibleRequests.map(req => {
+            const status = REQUEST_STATUSES[req.status] || REQUEST_STATUSES.OPEN;
+            const closed = req.status === 'COMPLETED' || req.status === 'REJECTED';
+            return (
+              <div key={req.id} className={`rounded-xl border p-4 ${cardClass}`}>
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className={`text-sm font-bold ${textMain}`}>{req.ticketNo} · {REQUEST_TYPES[req.type] || req.type}</p>
+                    <p className={`text-xs ${textSub}`}>
+                      {isAdmin ? (
+                        <button type="button" onClick={() => onOpenFile(req.fileId)} title="Open this file" className="font-semibold text-blue-500 underline-offset-2 hover:underline">{req.fileId}</button>
+                      ) : req.fileId}
+                      {req.applicantName ? ` · ${req.applicantName}` : ''} · by {req.createdBy} · {formatDate(req.createdAt)}
+                    </p>
+                  </div>
+                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${status.badge}`}>{status.label}</span>
+                </div>
+                <p className={`mt-3 whitespace-pre-wrap rounded-lg border p-3 text-sm ${innerClass} ${textMain}`}>{req.details}</p>
+                {(req.messages || []).length > 0 && (
+                  <div className="mt-3 space-y-2">
+                    {req.messages.map((m, i) => (
+                      <div key={i} className={`rounded-lg border px-3 py-2 text-sm ${m.role === ROLES.ADMIN ? (darkMode ? 'border-purple-500/30 bg-purple-500/10' : 'border-purple-200 bg-purple-50') : innerClass}`}>
+                        <p className={`text-xs font-semibold ${textSub}`}>{m.by}{m.role === ROLES.ADMIN ? ' (Admin)' : ''} · {formatDate(new Date(m.at))}</p>
+                        <p className={`whitespace-pre-wrap ${textMain}`}>{m.text}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {closed && req.resolvedBy && <p className={`mt-2 text-xs ${textSub}`}>{status.label} by {req.resolvedBy} · {formatDate(req.resolvedAt)}</p>}
+                {!isAdmin && req.status === 'NEEDS_INFO' && (
+                  <div className="mt-3 space-y-2">
+                    <textarea rows={2} maxLength={500} value={notes[req.id] ?? ''} onChange={e => setNotes({ ...notes, [req.id]: e.target.value })} placeholder="Reply to the admin's question" className={`w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`} />
+                    <button type="button" disabled={!(notes[req.id] || '').trim()} onClick={() => sendNote(req, 'OPEN')} className="rounded-lg bg-purple-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-purple-700 disabled:opacity-50">Send Reply</button>
+                  </div>
+                )}
+                {isAdmin && (
+                  <div className="mt-3 space-y-2">
+                    <input value={notes[req.id] ?? ''} onChange={e => setNotes({ ...notes, [req.id]: e.target.value })} placeholder="Message to the requester (required to ask for info)" className={`w-full rounded-lg border px-3 py-2 text-sm ${inputClass}`} />
+                    <div className="flex flex-wrap gap-2">
+                      {req.status === 'OPEN' && <button type="button" onClick={() => sendNote(req, 'IN_PROGRESS')} className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700">Start</button>}
+                      {!closed && <button type="button" disabled={!(notes[req.id] || '').trim()} onClick={() => sendNote(req, 'NEEDS_INFO')} className="rounded-lg bg-purple-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-purple-700 disabled:opacity-50">Ask for Info</button>}
+                      {!closed && <button type="button" onClick={() => sendNote(req, 'COMPLETED')} className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700">Mark Completed</button>}
+                      {!closed && <button type="button" disabled={!(notes[req.id] || '').trim()} title="A reason is required" onClick={() => sendNote(req, 'REJECTED')} className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50">Reject (reason required)</button>}
+                      {closed && <button type="button" onClick={() => sendNote(req, 'OPEN')} className={`rounded-lg px-3 py-1.5 text-xs font-medium ${darkMode ? 'bg-slate-800 text-slate-200 hover:bg-slate-700' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>Reopen</button>}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>
